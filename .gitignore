@@ -1,0 +1,13 @@
+node_modules
+dist
+out
+release
+build/bin
+.DS_Store
+*.log
+.env
+.vscode
+.idea
+*.local
+*.tsbuildinfo
+.icon-venv

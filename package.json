@@ -1,0 +1,123 @@
+{
+  "name": "labelu-video",
+  "version": "1.0.0",
+  "description": "视频裁剪打标桌面应用",
+  "main": "out/main/index.js",
+  "author": "labelu",
+  "license": "MIT",
+  "scripts": {
+    "dev": "node scripts/run-electron-vite.js dev",
+    "build": "node scripts/check-whats-new.js && electron-vite build",
+    "preview": "node scripts/run-electron-vite.js preview",
+    "postinstall": "node scripts/fix-binaries.js",
+    "icons": ".icon-venv/bin/python scripts/make-icons.py",
+    "check:whats-new": "node scripts/check-whats-new.js",
+    "prepare:bin:win": "node scripts/prepare-binaries.js win32 x64",
+    "prepare:bin:mac": "node scripts/prepare-binaries.js darwin arm64",
+    "dist": "npm run dist:mac",
+    "dist:mac": "npm run check:whats-new && npm run prepare:bin:mac && ELECTRON_MIRROR=https://npmmirror.com/mirrors/electron/ ELECTRON_BUILDER_BINARIES_MIRROR=https://npmmirror.com/mirrors/electron-builder-binaries/ npm run build && CSC_IDENTITY_AUTO_DISCOVERY=false ELECTRON_MIRROR=https://npmmirror.com/mirrors/electron/ ELECTRON_BUILDER_BINARIES_MIRROR=https://npmmirror.com/mirrors/electron-builder-binaries/ electron-builder --mac --arm64",
+    "dist:win": "npm run check:whats-new && npm run prepare:bin:win && ELECTRON_MIRROR=https://npmmirror.com/mirrors/electron/ ELECTRON_BUILDER_BINARIES_MIRROR=https://npmmirror.com/mirrors/electron-builder-binaries/ npm run build && ELECTRON_MIRROR=https://npmmirror.com/mirrors/electron/ ELECTRON_BUILDER_BINARIES_MIRROR=https://npmmirror.com/mirrors/electron-builder-binaries/ electron-builder --win --x64",
+    "release": "echo \"请分别在 Windows / macOS 上执行 release:win 与 release:mac（同 version），用户端只会下载本平台安装包\"",
+    "release:win": "npm run check:whats-new && npm run prepare:bin:win && ELECTRON_MIRROR=https://npmmirror.com/mirrors/electron/ ELECTRON_BUILDER_BINARIES_MIRROR=https://npmmirror.com/mirrors/electron-builder-binaries/ npm run build && ELECTRON_MIRROR=https://npmmirror.com/mirrors/electron/ ELECTRON_BUILDER_BINARIES_MIRROR=https://npmmirror.com/mirrors/electron-builder-binaries/ electron-builder --win --x64 --publish always",
+    "release:mac": "npm run check:whats-new && npm run prepare:bin:mac && ELECTRON_MIRROR=https://npmmirror.com/mirrors/electron/ ELECTRON_BUILDER_BINARIES_MIRROR=https://npmmirror.com/mirrors/electron-builder-binaries/ npm run build && CSC_IDENTITY_AUTO_DISCOVERY=false ELECTRON_MIRROR=https://npmmirror.com/mirrors/electron/ ELECTRON_BUILDER_BINARIES_MIRROR=https://npmmirror.com/mirrors/electron-builder-binaries/ electron-builder --mac --arm64 --publish always"
+  },
+  "dependencies": {
+    "electron-updater": "^6.3.9"
+  },
+  "devDependencies": {
+    "@fontsource-variable/inter": "^5.3.0",
+    "@fontsource/noto-sans-sc": "^5.3.0",
+    "@types/react": "^19.0.10",
+    "@types/react-dom": "^19.0.4",
+    "@vitejs/plugin-react": "^4.3.4",
+    "electron": "^34.2.0",
+    "electron-builder": "^25.1.8",
+    "electron-vite": "^3.0.0",
+    "ffmpeg-static": "^5.2.0",
+    "ffprobe-static": "^3.1.0",
+    "react": "^19.0.0",
+    "react-dom": "^19.0.0",
+    "typescript": "^5.7.3",
+    "vite": "^6.1.0"
+  },
+  "build": {
+    "appId": "com.labelu.video",
+    "productName": "LabelU Video",
+    "directories": {
+      "output": "release"
+    },
+    "files": [
+      "out/**/*",
+      "package.json",
+      "!**/*.tsbuildinfo",
+      "!**/node_modules/@fontsource/**",
+      "!**/node_modules/@fontsource-variable/**",
+      "!**/node_modules/ffmpeg-static/**",
+      "!**/node_modules/ffprobe-static/**"
+    ],
+    "extraResources": [
+      {
+        "from": "build/icon.png",
+        "to": "icon.png"
+      }
+    ],
+    "mac": {
+      "icon": "build/icon.icns",
+      "category": "public.app-category.video",
+      "target": [
+        "dmg"
+      ],
+      "identity": null,
+      "hardenedRuntime": false,
+      "gatekeeperAssess": false,
+      "extraResources": [
+        {
+          "from": "build/bin/darwin-arm64",
+          "to": "bin"
+        }
+      ]
+    },
+    "win": {
+      "icon": "build/icon.ico",
+      "target": [
+        {
+          "target": "nsis",
+          "arch": [
+            "x64"
+          ]
+        }
+      ],
+      "extraResources": [
+        {
+          "from": "build/bin/win32-x64",
+          "to": "bin"
+        }
+      ]
+    },
+    "nsis": {
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true,
+      "allowElevation": true,
+      "perMachine": false,
+      "createDesktopShortcut": true,
+      "createStartMenuShortcut": true,
+      "unicode": true,
+      "installerLanguages": [
+        "zh_CN",
+        "en_US"
+      ],
+      "language": "2052",
+      "artifactName": "LabelU-Video-Setup-${version}.${ext}"
+    },
+    "portable": {
+      "artifactName": "LabelU-Video-Portable-${version}.${ext}"
+    },
+    "publish": [
+      {
+        "provider": "github",
+        "owner": "Zhangy-Zoey",
+        "repo": "LabelU"
+      }
+    ]
+  }
+}
