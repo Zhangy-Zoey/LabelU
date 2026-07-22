@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import type { CropRect, ExportRecord, SessionState, TimeRange, VideoItem } from '../../shared/types'
 import { IMAGE_TIMELINE_SECONDS, MIN_SELECTION_SECONDS, isImagePath } from '../../shared/types'
-import { clamp, computeRemainingFromExports, formatTime, formatTimecode, formatTimelineTime, frameDuration, frameIndex, isMeaningfulCrop, minSelectionGap, resolveClipSelection, selectionTolerance, snapToFrame, stepByFrames, totalDuration } from '../../shared/utils'
+import { clamp, computeRemainingFromExports, formatTime, formatTimecode, formatTimelineTime, frameDuration, frameIndex, isMeaningfulCrop, minSelectionGap, resolveClipSelection, selectionTolerance, snapToFrame, stepByFrames, totalDuration, sanitizeName, compareMediaPaths, joinMediaDir, mediaDirname, mediaBasename } from '../../shared/utils'
 import { isPresetCategory, applyCustomCategoryTags, getCustomCategoryTags, loadCustomCategoryTags, saveCustomCategoryTags, categoryShadeStyle, tryRemoveCustomCategoryTag, isBuiltinCategoryTag, findCustomCategoryGroup } from '../../shared/categories'
 import { filmstripOrder, seekAndCaptureFrame, seekVideo } from './frameCapture'
 import { CategoryChips } from './CategoryChips'
@@ -12,6 +12,24 @@ import appIcon from './assets/app-icon.png'
 function defaultCategoryFromDir(dirName: string | undefined | null): string {
   const name = (dirName || '').trim()
   return isPresetCategory(name) ? name : ''
+}
+
+/** 默认类别源目录：未归类 → 源文件所在目录；已归类 → 导出根目录 */
+function defaultSaveRootDir(sourcePath: string): string {
+  const parent = mediaDirname(sourcePath)
+  if (isPresetCategory(mediaBasename(parent))) {
+    return mediaDirname(parent)
+  }
+  return parent
+}
+
+/** 实际类别文件夹 = 源目录/类别名 */
+function categoryDirUnderRoot(rootDir: string, category: string): string {
+  const root = rootDir.trim()
+  const cat = sanitizeName(category.trim())
+  if (!root) return cat && cat !== 'unnamed' ? cat : ''
+  if (!cat || cat === 'unnamed') return root
+  return joinMediaDir(root, cat)
 }
 
 const THUMB_SIZE_MIN = 64
@@ -33,6 +51,9 @@ const VIEW_ZOOM_MAX = 5
 const PLAYBACK_RATES = [0.5, 1, 2, 4] as const
 /** 快捷键修饰键文案：macOS 用 ⌘，Windows/Linux 用 Ctrl（逻辑已同时认 metaKey/ctrlKey） */
 const MOD_KEY = /Mac|Macintosh/i.test(navigator.userAgent) ? '⌘' : 'Ctrl'
+const IS_WIN = /Windows/i.test(navigator.userAgent)
+/** Windows 上杀毒/索引常更久占用句柄；松开媒体后多等一会再 rename */
+const MEDIA_RELEASE_MS = IS_WIN ? 280 : 60
 const LS_THUMB = 'labelu.thumbSize'
 const LS_SIDEBAR = 'labelu.sidebarWidth'
 const LS_STEP_FPS = 'labelu.stepFps'
@@ -312,9 +333,10 @@ type BatchResultModal = {
   cancelled?: boolean
 }
 
-type ReclassifyDestMode = 'originalRoot' | 'underCurrent' | 'custom'
+type ReclassifyDestMode = 'originalRoot' | 'underCurrent' | 'custom' | 'customRoot'
 
 type ReclassifyDestModal = {
+  purpose: 'batch'
   category: string
   paths: string[]
   categorizedCount: number
@@ -323,6 +345,14 @@ type ReclassifyDestModal = {
 type ClassifyDestOpts = {
   reclassifyMode?: ReclassifyDestMode
   customDestDir?: string
+}
+
+type PendingSaveClip = {
+  category: string
+  saveModal: SaveModal
+  isImage: boolean
+  sourcePath: string
+  duration: number
 }
 
 function loadReclassifyMode(): ReclassifyDestMode {
@@ -461,6 +491,10 @@ export default function App(): React.JSX.Element {
   const [savePreviewLocal, setSavePreviewLocal] = useState(0)
   const [savePreviewPlaying, setSavePreviewPlaying] = useState(false)
   const [categoryInput, setCategoryInput] = useState('')
+  /** 类别文件夹的源目录（实际写入 源目录/类别名/） */
+  const [saveDestRoot, setSaveDestRoot] = useState('')
+  /** 本次运行内用户自定义的源目录；重启失效 */
+  const sessionCustomSaveRootRef = useRef<string | null>(null)
   const [confirmModal, setConfirmModal] = useState<ConfirmModal | null>(null)
   const [recoverModal, setRecoverModal] = useState<RecoverModal | null>(null)
   const [deleteCategoryTagModal, setDeleteCategoryTagModal] = useState<DeleteCategoryTagModal | null>(
@@ -485,6 +519,8 @@ export default function App(): React.JSX.Element {
   const [paneBodyW, setPaneBodyW] = useState(0)
   const appBodyRef = useRef<HTMLDivElement>(null)
   const [selectedIds, setSelectedIds] = useState<Set<string>>(() => new Set())
+  /** 缩略图小窗预览中的视频 id（多选同播时含多个） */
+  const [thumbPreviewIds, setThumbPreviewIds] = useState<Set<string>>(() => new Set())
   const [batchModal, setBatchModal] = useState(false)
   const [batchCategory, setBatchCategory] = useState('')
   /** 最近一次批量移动的列表项，供 UI 一次撤回 */
@@ -504,6 +540,10 @@ export default function App(): React.JSX.Element {
   const pendingRecoverSessionsRef = useRef<SessionState[] | null>(null)
   /** 合并并发的 clearCompleted，避免拖动手柄连点竞态 */
   const clearCompletedInflightRef = useRef<Promise<string | null> | null>(null)
+  const finishCurrentRef = useRef<(opts?: { silent?: boolean }) => Promise<boolean>>(
+    async () => true
+  )
+  const goRelativeRef = useRef<(dir: -1 | 1) => Promise<void>>(async () => {})
   const [uiUndoStack, setUiUndoStack] = useState<UiUndoEntry[]>([])
   const selectAnchorRef = useRef<number | null>(null)
   /** 路径 → 剩余可剪秒数；用于「只看未完成」筛掉已全部打标但未点完成的项 */
@@ -527,6 +567,9 @@ export default function App(): React.JSX.Element {
   saveModalOpenRef.current = Boolean(saveModal)
 
   const videoRef = useRef<HTMLVideoElement>(null)
+  /** 当前主预览对应的源路径；HEVC 代理失败重试用 */
+  const playSourcePathRef = useRef('')
+  const previewProxyTriedRef = useRef(false)
   const imageRef = useRef<HTMLImageElement>(null)
   const cropRef = useRef<CropRect>(FULL_CROP)
   cropRef.current = crop
@@ -602,6 +645,12 @@ export default function App(): React.JSX.Element {
 
   useEffect(() => {
     loadCustomCategoryTags()
+    try {
+      // 旧版按类别持久化源目录；现改为仅本次运行有效
+      localStorage.removeItem('labelu.categorySaveDirs')
+    } catch {
+      /* ignore */
+    }
     void window.api.getCustomCategories().then((map) => {
       const hasMain = Object.values(map || {}).some((a) => Array.isArray(a) && a.length > 0)
       if (hasMain) {
@@ -1800,9 +1849,23 @@ export default function App(): React.JSX.Element {
           setStatus('')
         }
 
-        const url = await window.api.getMediaUrl(item.path)
+        playSourcePathRef.current = item.path
+        previewProxyTriedRef.current = false
+        let playPath = item.path
+        if (!isImage && probe.needsPreviewProxy) {
+          setStatus('正在生成兼容预览…')
+          const proxy = await window.api.ensurePreviewProxy(item.path)
+          if (gen !== loadGenRef.current) return
+          playPath = proxy.path
+          previewProxyTriedRef.current = true
+          if (proxy.proxied) {
+            showToast('已使用兼容预览（原片为 HEVC）')
+          }
+        }
+        const url = await window.api.getMediaUrl(playPath)
         if (gen !== loadGenRef.current) return
         setMediaUrl(url)
+        if (!isImage && probe.needsPreviewProxy) setStatus('')
       } catch (err: unknown) {
         if (gen !== loadGenRef.current) return
         setMediaUrl('')
@@ -1837,7 +1900,7 @@ export default function App(): React.JSX.Element {
           added++
         }
       }
-      const merged = Array.from(byPath.values()).sort((a, b) => a.path.localeCompare(b.path, 'zh'))
+      const merged = Array.from(byPath.values()).sort((a, b) => compareMediaPaths(a.path, b.path))
       setVideos(merged)
 
       if (added > 0) {
@@ -1969,6 +2032,14 @@ export default function App(): React.JSX.Element {
       else next.add(id)
       return next
     })
+    setThumbPreviewIds((prev) => {
+      if (!prev.has(id)) return prev
+      // 取消选中时停掉该条小窗预览
+      if (prev.size === 1) return new Set()
+      const next = new Set(prev)
+      next.delete(id)
+      return next
+    })
   }, [])
 
   /** Shift+单击：从锚点连选到当前项（含中间全部）。锚点不随二次 Shift 点击移动。 */
@@ -1996,9 +2067,47 @@ export default function App(): React.JSX.Element {
     [videos, index]
   )
 
+  /** 松开主预览 / 缩略图预览句柄，避免 Windows rename/move EBUSY */
+  const releaseMediaHandles = useCallback(async (): Promise<void> => {
+    setThumbPreviewIds(new Set())
+    setExportPreviewUrl(null)
+    setStillFrameUrl(null)
+    setMediaUrl('')
+    for (const el of [videoRef.current, scrubVideoRef.current]) {
+      if (!el) continue
+      try {
+        el.pause()
+        el.removeAttribute('src')
+        el.load()
+      } catch {
+        /* ignore */
+      }
+    }
+    await new Promise<void>((r) => window.setTimeout(r, MEDIA_RELEASE_MS))
+  }, [])
+
+  /** 完成/撤销完成后重新挂可播 URL（Win HEVC 走代理） */
+  const reloadPlayableMedia = useCallback(async (sourcePath: string): Promise<void> => {
+    playSourcePathRef.current = sourcePath
+    previewProxyTriedRef.current = false
+    try {
+      const probe = await window.api.probe(sourcePath)
+      if (probe.needsPreviewProxy) {
+        previewProxyTriedRef.current = true
+        const proxy = await window.api.ensurePreviewProxy(sourcePath, false, true)
+        setMediaUrl(proxy.url)
+        return
+      }
+    } catch {
+      /* fall through to raw url */
+    }
+    const url = await window.api.getMediaUrl(sourcePath)
+    setMediaUrl(url)
+  }, [])
+
   const openBatchModal = useCallback(async () => {
     if (selectedVideos.length === 0) {
-      showToast(`请先多选视频（勾选或 ${MOD_KEY}+单击）`)
+      showToast(`请先多选视频（${MOD_KEY}+单击或 Shift+单击）`)
       return
     }
     const first = selectedVideos[0]
@@ -2012,23 +2121,13 @@ export default function App(): React.JSX.Element {
       lastClassifyOptsRef.current = opts
       setStatus(`正在批量分类 ${paths.length} 个视频…`)
       try {
-        // 若当前项在批量列表中，先松开播放句柄，避免 Windows rename/move 失败
+        // 松开主预览与缩略图小窗，避免 Windows rename/move 失败
         const currentPath = videos[index]?.path
-        if (currentPath && paths.some((p) => normMediaPath(p) === normMediaPath(currentPath))) {
-          setExportPreviewUrl(null)
-          setStillFrameUrl(null)
-          setMediaUrl('')
-          for (const el of [videoRef.current, scrubVideoRef.current]) {
-            if (!el) continue
-            try {
-              el.pause()
-              el.removeAttribute('src')
-              el.load()
-            } catch {
-              /* ignore */
-            }
-          }
-          await new Promise<void>((r) => window.setTimeout(r, 60))
+        const touchesCurrent =
+          Boolean(currentPath) &&
+          paths.some((p) => normMediaPath(p) === normMediaPath(currentPath!))
+        if (touchesCurrent || thumbPreviewIds.size > 0) {
+          await releaseMediaHandles()
         }
 
         const pathSet = new Set(paths.map((p) => normMediaPath(p)))
@@ -2098,7 +2197,7 @@ export default function App(): React.JSX.Element {
         setStatus('批量分类失败')
       }
     },
-    [busy, videos, index, loadVideoAt, showToast]
+    [busy, videos, index, loadVideoAt, showToast, releaseMediaHandles, thumbPreviewIds.size]
   )
 
   const confirmBatchClassify = useCallback(async () => {
@@ -2126,12 +2225,92 @@ export default function App(): React.JSX.Element {
       setReclassifyMode(savedMode)
       setReclassifyCustomDir(savedDir)
       setReclassifyDontAsk(false)
-      setReclassifyDestModal({ category, paths, categorizedCount })
+      setReclassifyDestModal({ purpose: 'batch', category, paths, categorizedCount })
       return
     }
 
     await runBatchClassify(paths, category)
   }, [batchCategory, busy, selectedVideos, showToast, runBatchClassify])
+
+  const runSaveClipExport = useCallback(
+    async (payload: PendingSaveClip, opts?: ClassifyDestOpts): Promise<void> => {
+      if (savingRef.current || busy) {
+        showToast('正在保存，请稍候…')
+        return
+      }
+      savingRef.current = true
+      const { category, isImage, saveModal: modal, sourcePath, duration: mediaDuration } = payload
+      ignoreEnterOpenUntilRef.current = performance.now() + 600
+      setSaveModal(null)
+      setStatus(isImage ? '正在保存图片…' : '正在导出片段…')
+      try {
+        const classifyFields = opts
+          ? {
+              reclassifyMode: opts.reclassifyMode,
+              customDestDir: opts.customDestDir
+            }
+          : {}
+        const result = isImage
+          ? await window.api.exportImage({
+              sourcePath,
+              category,
+              crop: modal.crop,
+              cropActive: modal.cropActive,
+              ...classifyFields
+            })
+          : await window.api.exportClip({
+              sourcePath,
+              start: modal.start,
+              end: modal.end,
+              category,
+              crop: modal.crop,
+              cropActive: modal.cropActive,
+              duration: mediaDuration,
+              ...classifyFields
+            })
+        const session = result.session
+        const precise = session.exports.filter((e) => !e.approx)
+        const rem = isImage
+          ? [{ start: 0, end: session.duration || IMAGE_TIMELINE_SECONDS }]
+          : session.duration > 0
+            ? computeRemainingFromExports(session.duration, precise)
+            : session.remainingRanges
+        setRemaining(rem)
+        syncRemainingHint(sourcePath, totalDuration(rem))
+        setClipExports(session.exports)
+        setSelectedExportPath(null)
+        setExportPreviewUrl(null)
+        setUndoCount(session.undoStack.length)
+        dirtyRef.current = true
+        if (result.message) showToast(result.message)
+        else showToast(`已保存：${result.outputPath}`)
+        setStatus('导出完成')
+        clearTimelineFocus()
+
+        if (!isImage && totalDuration(rem) <= 0.05) {
+          const ok = await finishCurrentRef.current()
+          if (ok) await goRelativeRef.current(1)
+        } else {
+          const span = selectionSpanFromRemaining(rem)
+          setSelStart(span.start)
+          setSelEnd(span.end)
+          setCrop(FULL_CROP)
+          setCropActive(false)
+          setCropCommitted(false)
+        }
+      } catch (err) {
+        reportClientError(isImage ? 'exportImage' : 'exportClip', err, {
+          path: sourcePath,
+          category
+        })
+        showToast(errText(err))
+        setStatus('导出失败')
+      } finally {
+        savingRef.current = false
+      }
+    },
+    [busy, showToast, syncRemainingHint, clearTimelineFocus]
+  )
 
   const confirmReclassifyDest = useCallback(async () => {
     const modal = reclassifyDestModal
@@ -2139,6 +2318,10 @@ export default function App(): React.JSX.Element {
     if (reclassifyMode === 'custom' && !reclassifyCustomDir.trim()) {
       showToast('请先选择目标文件夹')
       return
+    }
+    const opts: ClassifyDestOpts = {
+      reclassifyMode,
+      customDestDir: reclassifyMode === 'custom' ? reclassifyCustomDir.trim() : undefined
     }
     try {
       localStorage.setItem(LS_RECLASSIFY_MODE, reclassifyMode)
@@ -2153,10 +2336,7 @@ export default function App(): React.JSX.Element {
       /* ignore */
     }
     setReclassifyDestModal(null)
-    await runBatchClassify(modal.paths, modal.category, {
-      reclassifyMode,
-      customDestDir: reclassifyMode === 'custom' ? reclassifyCustomDir.trim() : undefined
-    })
+    await runBatchClassify(modal.paths, modal.category, opts)
   }, [
     reclassifyDestModal,
     busy,
@@ -2199,13 +2379,26 @@ export default function App(): React.JSX.Element {
       setBatchResultModal(null)
       setStatus(`正在重试 ${failedPaths.length} 个失败项…`)
       try {
+        const currentPath = videos[index]?.path
+        const touchesCurrent =
+          Boolean(currentPath) &&
+          failedPaths.some((p) => normMediaPath(p) === normMediaPath(currentPath!))
+        if (touchesCurrent || thumbPreviewIds.size > 0) {
+          await releaseMediaHandles()
+        }
+
         const { results, canUndo, cancelled } = await window.api.batchClassify(
           failedPaths,
           category,
           lastClassifyOptsRef.current
         )
-        const okPaths = new Set(results.filter((r) => r.ok).map((r) => r.path))
-        const okItems = videos.filter((v) => okPaths.has(v.path))
+        const okPaths = new Set(
+          results.filter((r) => r.ok).map((r) => normMediaPath(r.path))
+        )
+        const okItems = videos.filter((v) => okPaths.has(normMediaPath(v.path)))
+        const currentMoved = currentPath
+          ? okPaths.has(normMediaPath(currentPath))
+          : false
         if (canUndo) {
           setBatchUndoItems((prev) => {
             const map = new Map((prev || []).map((v) => [v.path, v]))
@@ -2215,20 +2408,39 @@ export default function App(): React.JSX.Element {
         } else {
           setBatchUndoItems(null)
         }
-        setVideos((prev) => prev.filter((v) => !okPaths.has(v.path)))
+        const nextList = videos.filter((v) => !okPaths.has(normMediaPath(v.path)))
+        setVideos(nextList)
         setBatchResultModal({
           category,
           results,
           canUndo,
           cancelled
         })
+        if (currentMoved) {
+          dirtyRef.current = false
+          const nextIdx = nextList.findIndex((v) => !v.completed)
+          if (nextIdx >= 0) await loadVideoAt(nextIdx, nextList)
+          else if (nextList.length > 0) await loadVideoAt(0, nextList)
+          else {
+            setMediaUrl('')
+            setIndex(0)
+          }
+        }
         setStatus('重试完成')
       } catch (err) {
         showToast(String(err))
         setStatus('重试失败')
       }
     },
-    [busy, videos, showToast]
+    [
+      busy,
+      videos,
+      index,
+      showToast,
+      releaseMediaHandles,
+      thumbPreviewIds.size,
+      loadVideoAt
+    ]
   )
   const undoBatchClassify = useCallback(async () => {
     if (busy || batchUndoItems === null) {
@@ -2242,9 +2454,11 @@ export default function App(): React.JSX.Element {
       setBatchUndoItems(null)
       if (restored > 0 && items.length > 0) {
         setVideos((prev) => {
-          const have = new Set(prev.map((v) => v.path))
-          const add = items.filter((v) => !have.has(v.path)).map((v) => ({ ...v, completed: false }))
-          return [...prev, ...add].sort((a, b) => a.path.localeCompare(b.path, 'zh'))
+          const have = new Set(prev.map((v) => normMediaPath(v.path)))
+          const add = items
+            .filter((v) => !have.has(normMediaPath(v.path)))
+            .map((v) => ({ ...v, completed: false }))
+          return [...prev, ...add].sort((a, b) => compareMediaPaths(a.path, b.path))
         })
       } else if (restored > 0 && items.length === 0) {
         showToast(`已撤回 ${restored} 个到原目录，请重新打开文件夹以刷新列表`)
@@ -2323,21 +2537,8 @@ export default function App(): React.JSX.Element {
       const oldPath = current.path
       const gen = loadGenRef.current
       try {
-        // Windows：播放中占用文件句柄会导致 rename 失败；先松开媒体
-        setExportPreviewUrl(null)
-        setStillFrameUrl(null)
-        setMediaUrl('')
-        for (const el of [videoRef.current, scrubVideoRef.current]) {
-          if (!el) continue
-          try {
-            el.pause()
-            el.removeAttribute('src')
-            el.load()
-          } catch {
-            /* ignore */
-          }
-        }
-        await new Promise<void>((r) => window.setTimeout(r, 60))
+        // Windows：播放中占用文件句柄会导致 rename 失败；先松开媒体（含缩略图小窗）
+        await releaseMediaHandles()
 
         const result = await window.api.finishVideo({
           sourcePath: oldPath,
@@ -2373,21 +2574,12 @@ export default function App(): React.JSX.Element {
           })
         }
         if (hasExports) syncRemainingHint(newPath, 0)
-        if (newPath !== oldPath) {
-          try {
-            const url = await window.api.getMediaUrl(newPath)
-            if (gen === loadGenRef.current) setMediaUrl(url)
-          } catch {
-            /* ignore */
-          }
-        } else {
-          try {
-            const url = await window.api.getMediaUrl(oldPath)
-            if (gen === loadGenRef.current) setMediaUrl(url)
-          } catch {
-            /* ignore */
-          }
+        try {
+          await reloadPlayableMedia(newPath)
+        } catch {
+          /* ignore */
         }
+        if (gen !== loadGenRef.current) return true
         const n = clipExports.length
         setStatus(n > 0 ? `已完成 · 已分类 ${n}` : '已完成')
         if (!opts?.silent) {
@@ -2403,15 +2595,22 @@ export default function App(): React.JSX.Element {
         showToast(String(err))
         // 失败时尽量恢复预览
         try {
-          const url = await window.api.getMediaUrl(oldPath)
-          if (gen === loadGenRef.current) setMediaUrl(url)
+          await reloadPlayableMedia(oldPath)
         } catch {
           /* ignore */
         }
         return false
       }
     },
-    [current, index, clipExports.length, showToast, syncRemainingHint]
+    [
+      current,
+      index,
+      clipExports.length,
+      showToast,
+      syncRemainingHint,
+      releaseMediaHandles,
+      reloadPlayableMedia
+    ]
   )
 
   /**
@@ -2429,20 +2628,7 @@ export default function App(): React.JSX.Element {
       const oldPath = current.path
       const gen = loadGenRef.current
       try {
-        setExportPreviewUrl(null)
-        setStillFrameUrl(null)
-        setMediaUrl('')
-        for (const el of [videoRef.current, scrubVideoRef.current]) {
-          if (!el) continue
-          try {
-            el.pause()
-            el.removeAttribute('src')
-            el.load()
-          } catch {
-            /* ignore */
-          }
-        }
-        await new Promise<void>((r) => window.setTimeout(r, 60))
+        await releaseMediaHandles()
 
         const res = await window.api.clearCompleted(oldPath)
         const newPath = res?.path || oldPath
@@ -2468,8 +2654,7 @@ export default function App(): React.JSX.Element {
           })
         }
         try {
-          const url = await window.api.getMediaUrl(newPath)
-          if (gen === loadGenRef.current) setMediaUrl(url)
+          if (gen === loadGenRef.current) await reloadPlayableMedia(newPath)
         } catch {
           /* ignore */
         }
@@ -2480,8 +2665,7 @@ export default function App(): React.JSX.Element {
       } catch (err) {
         reportClientError('clearCompleted', err, { path: oldPath })
         try {
-          const url = await window.api.getMediaUrl(oldPath)
-          if (gen === loadGenRef.current) setMediaUrl(url)
+          if (gen === loadGenRef.current) await reloadPlayableMedia(oldPath)
         } catch {
           /* ignore */
         }
@@ -2495,7 +2679,7 @@ export default function App(): React.JSX.Element {
     })
     clearCompletedInflightRef.current = p
     return p
-  }, [current])
+  }, [current, releaseMediaHandles, reloadPlayableMedia])
 
   const dismissWhatsNew = useCallback(() => {
     const modal = whatsNewModal
@@ -2568,6 +2752,49 @@ export default function App(): React.JSX.Element {
       showToast(dir === 1 ? '没有更多未完成视频' : '没有上一个视频')
     },
     [videos, index, onlyIncomplete, goToIndex, showToast]
+  )
+
+  finishCurrentRef.current = finishCurrent
+  goRelativeRef.current = goRelative
+
+  /** 单击缩略图：单选并切换当前项 */
+  const selectOnlyAndOpen = useCallback(
+    (id: string, listIndex: number) => {
+      selectAnchorRef.current = listIndex
+      setSelectedIds(new Set([id]))
+      setThumbPreviewIds(new Set())
+      void goToIndex(listIndex)
+    },
+    [goToIndex]
+  )
+
+  /** 缩略图播放键：多选且点中已选项 → 同播；否则只播/停这一个 */
+  const handleThumbPlay = useCallback(
+    (id: string) => {
+      const item = videos.find((v) => v.id === id)
+      if (!item || item.mediaKind === 'image' || isImagePath(item.path)) return
+
+      setThumbPreviewIds((prev) => {
+        const multi = selectedIds.size > 1 && selectedIds.has(id)
+        if (multi) {
+          const targetIds = videos
+            .filter(
+              (v) =>
+                selectedIds.has(v.id) &&
+                v.mediaKind !== 'image' &&
+                !isImagePath(v.path)
+            )
+            .map((v) => v.id)
+          if (targetIds.length === 0) return prev
+          const allPlaying = targetIds.every((t) => prev.has(t))
+          if (allPlaying) return new Set()
+          return new Set(targetIds)
+        }
+        if (prev.has(id) && prev.size === 1) return new Set()
+        return new Set([id])
+      })
+    },
+    [videos, selectedIds]
   )
 
   /** 点击左上角图标：保存并标记所有操作过的视频为已完成，退回主界面 */
@@ -2682,7 +2909,11 @@ export default function App(): React.JSX.Element {
         setSelEnd(end)
       }
     }
-    setCategoryInput(defaultCategoryFromDir(current.parentDirName))
+    const initialCat = defaultCategoryFromDir(current.parentDirName)
+    setCategoryInput(initialCat)
+    setSaveDestRoot(
+      sessionCustomSaveRootRef.current?.trim() || defaultSaveRootDir(current.path)
+    )
     try {
       videoRef.current?.pause()
     } catch {
@@ -2798,74 +3029,74 @@ export default function App(): React.JSX.Element {
     }
     const category = (categoryOverride ?? categoryInput).trim()
     if (!category) {
-      showToast('请输入类别')
+      showToast('请选择类别')
+      return
+    }
+    const root = (
+      saveDestRoot.trim() ||
+      sessionCustomSaveRootRef.current?.trim() ||
+      defaultSaveRootDir(current.path)
+    ).trim()
+    if (!root) {
+      showToast('请填写或选择保存路径')
       return
     }
     if (categoryOverride) setCategoryInput(category)
-    savingRef.current = true
+    setSaveDestRoot(root)
     const isImage = current.mediaKind === 'image' || isImagePath(current.path)
-    ignoreEnterOpenUntilRef.current = performance.now() + 600
-    setSaveModal(null)
-    setStatus(isImage ? '正在保存图片…' : '正在导出片段…')
-    try {
-      const result = isImage
-        ? await window.api.exportImage({
-            sourcePath: current.path,
-            category,
-            crop: saveModal.crop,
-            cropActive: saveModal.cropActive
-          })
-        : await window.api.exportClip({
-            sourcePath: current.path,
-            start: saveModal.start,
-            end: saveModal.end,
-            category,
-            crop: saveModal.crop,
-            cropActive: saveModal.cropActive,
-            duration
-          })
-      const session = result.session
-      const precise = session.exports.filter((e) => !e.approx)
-      const rem = isImage
-        ? [{ start: 0, end: session.duration || IMAGE_TIMELINE_SECONDS }]
-        : session.duration > 0
-          ? computeRemainingFromExports(session.duration, precise)
-          : session.remainingRanges
-      setRemaining(rem)
-      syncRemainingHint(current.path, totalDuration(rem))
-      setClipExports(session.exports)
-      setSelectedExportPath(null)
-      setExportPreviewUrl(null)
-      setUndoCount(session.undoStack.length)
-      dirtyRef.current = true
-      if (result.message) showToast(result.message)
-      else showToast(`已保存：${result.outputPath}`)
-      setStatus('导出完成')
-      clearTimelineFocus()
-
-      if (!isImage && totalDuration(rem) <= 0.05) {
-        const ok = await finishCurrent()
-        if (ok) await goRelative(1)
-      } else {
-        const span = selectionSpanFromRemaining(rem)
-        setSelStart(span.start)
-        setSelEnd(span.end)
-        setCrop(FULL_CROP)
-        setCropActive(false)
-        setCropCommitted(false)
-      }
-    } catch (err) {
-      reportClientError(isImage ? 'exportImage' : 'exportClip', err, {
-        path: current.path,
-        category
-      })
-      showToast(errText(err))
-      setStatus('导出失败')
-    } finally {
-      savingRef.current = false
+    const pending: PendingSaveClip = {
+      category,
+      isImage,
+      saveModal,
+      sourcePath: current.path,
+      duration
     }
+    await runSaveClipExport(pending, {
+      reclassifyMode: 'customRoot',
+      customDestDir: root
+    })
   }
   confirmSaveRef.current = confirmSave
+
+  const pickSaveDestDir = useCallback(async () => {
+    if (!current) return
+    const defaultPath =
+      saveDestRoot.trim() ||
+      sessionCustomSaveRootRef.current?.trim() ||
+      dialogDefaultPathFor(current, videos) ||
+      undefined
+    try {
+      const dir = await window.api.pickDirectory({
+        title: '选择类别文件夹的源目录',
+        defaultPath
+      })
+      if (dir) {
+        sessionCustomSaveRootRef.current = dir
+        setSaveDestRoot(dir)
+      }
+    } catch (err) {
+      showToast(String(err))
+    }
+  }, [current, saveDestRoot, videos, showToast])
+
+  const onSaveCategorySelect = useCallback((tag: string) => {
+    setCategoryInput(tag)
+  }, [])
+
+  const onSaveDestRootChange = useCallback((raw: string) => {
+    const cat = categoryInput.trim()
+    const san = cat ? sanitizeName(cat) : ''
+    let root = raw
+    if (san && san !== 'unnamed' && (mediaBasename(raw) === san || mediaBasename(raw) === cat)) {
+      root = mediaDirname(raw) || raw
+    }
+    sessionCustomSaveRootRef.current = root.trim() || null
+    setSaveDestRoot(root)
+  }, [categoryInput])
+
+  const savePathDisplay = categoryInput.trim()
+    ? categoryDirUnderRoot(saveDestRoot, categoryInput)
+    : saveDestRoot
 
   const undo = async (): Promise<void> => {
     if (!current || busy) return
@@ -3945,8 +4176,27 @@ export default function App(): React.JSX.Element {
             className="primary"
             style={{ marginLeft: 8 }}
             onClick={() => {
-              if (updateBanner.includes('已下载')) window.api.installUpdate()
-              else void window.api.downloadUpdate().then(() => showToast('开始下载更新'))
+              if (updateBanner.includes('已下载')) {
+                try {
+                  window.api.installUpdate()
+                } catch (err) {
+                  showToast(err instanceof Error ? err.message : '安装更新失败')
+                }
+                return
+              }
+              setUpdateBanner((prev) => (prev ? `${prev.replace(/（下载中…）$/, '')}（下载中…）` : prev))
+              void window.api
+                .downloadUpdate()
+                .then(() => showToast('开始下载更新'))
+                .catch((err: unknown) => {
+                  const msg = err instanceof Error ? err.message : String(err)
+                  setUpdateBanner((prev) => (prev || '发现新版本').replace(/（下载中…）$/, ''))
+                  if (/ZIP file not provided|zip/i.test(msg)) {
+                    showToast('该版本缺少 macOS 自动更新包，请到 GitHub Releases 手动下载安装')
+                  } else {
+                    showToast(msg ? `下载更新失败：${msg}` : '下载更新失败')
+                  }
+                })
             }}
           >
             {updateBanner.includes('已下载') ? '重启安装' : '下载更新'}
@@ -3996,6 +4246,7 @@ export default function App(): React.JSX.Element {
             onClick={() => {
               setSelectedIds(new Set())
               selectAnchorRef.current = null
+              setThumbPreviewIds(new Set())
             }}
           >
             清除选择
@@ -4131,13 +4382,12 @@ export default function App(): React.JSX.Element {
                       mediaKind={v.mediaKind}
                       active={videoIndex === index}
                       selected={selectedIds.has(v.id)}
+                      previewActive={thumbPreviewIds.has(v.id)}
                       disabled={busy}
-                      onOpen={() => {
-                        selectAnchorRef.current = videoIndex
-                        void goToIndex(videoIndex)
-                      }}
+                      onOpen={() => selectOnlyAndOpen(v.id, videoIndex)}
                       onToggleSelect={() => toggleSelect(v.id, videoIndex)}
                       onRangeSelect={() => rangeSelect(videoIndex)}
+                      onPlayClick={() => handleThumbPlay(v.id)}
                     />
                   )
                 })}
@@ -4370,6 +4620,33 @@ export default function App(): React.JSX.Element {
                           const v = videoRef.current
                           const src = v?.currentSrc || v?.src || ''
                           if (src && src !== active) return
+                          // 导出片段预览失败不走源片代理
+                          if (exportPreviewUrlRef.current) {
+                            const err = v?.error
+                            showToast(
+                              `片段无法播放: ${err?.message || '未知错误'}`
+                            )
+                            setStatus('视频加载失败')
+                            return
+                          }
+                          const sourcePath = playSourcePathRef.current
+                          if (sourcePath && !previewProxyTriedRef.current) {
+                            previewProxyTriedRef.current = true
+                            setStatus('正在生成兼容预览…')
+                            void (async () => {
+                              try {
+                                const proxy = await window.api.ensurePreviewProxy(sourcePath, true)
+                                const url = await window.api.getMediaUrl(proxy.path)
+                                setMediaUrl(url)
+                                showToast('已切换为兼容预览')
+                                setStatus('')
+                              } catch (err) {
+                                showToast(`视频无法播放：${String(err)}`)
+                                setStatus('视频加载失败')
+                              }
+                            })()
+                            return
+                          }
                           const err = v?.error
                           showToast(
                             `视频无法播放（可能是编码不被支持）: ${err?.message || '未知错误'}`
@@ -5004,79 +5281,66 @@ export default function App(): React.JSX.Element {
                       />
                       )}
                     </div>
+                    {!currentIsImage && (
+                      <div className="save-clip-controls">
+                        <input
+                          className="save-clip-scrub"
+                          type="range"
+                          min={0}
+                          max={Math.max(0.05, saveModal.end - saveModal.start)}
+                          step={0.05}
+                          value={clamp(
+                            savePreviewLocal,
+                            0,
+                            Math.max(0.05, saveModal.end - saveModal.start)
+                          )}
+                          onChange={(e) => {
+                            const v = savePreviewRef.current
+                            const len = Math.max(0.05, saveModal.end - saveModal.start)
+                            const local = clamp(Number(e.target.value), 0, len)
+                            setSavePreviewLocal(local)
+                            if (v) v.currentTime = saveModal.start + local
+                          }}
+                        />
+                        <span className="save-clip-time">
+                          {formatTime(savePreviewLocal)} /{' '}
+                          {formatTime(Math.max(0, saveModal.end - saveModal.start))}
+                        </span>
+                      </div>
+                    )}
                   </div>
                 )
               })()}
-              {!currentIsImage && (
-              <div className="save-clip-controls">
-                <button
-                  type="button"
-                  className="save-clip-play"
-                  title={savePreviewPlaying ? '暂停' : '播放'}
-                  onClick={() => {
-                    const v = savePreviewRef.current
-                    if (!v) return
-                    if (v.paused) {
-                      void v.play().then(() => setSavePreviewPlaying(true)).catch(() => undefined)
-                    } else {
-                      v.pause()
-                      setSavePreviewPlaying(false)
-                    }
-                  }}
-                >
-                  {savePreviewPlaying ? '暂停' : '播放'}
-                </button>
-                <input
-                  className="save-clip-scrub"
-                  type="range"
-                  min={0}
-                  max={Math.max(0.05, saveModal.end - saveModal.start)}
-                  step={0.05}
-                  value={clamp(
-                    savePreviewLocal,
-                    0,
-                    Math.max(0.05, saveModal.end - saveModal.start)
-                  )}
-                  onChange={(e) => {
-                    const v = savePreviewRef.current
-                    const len = Math.max(0.05, saveModal.end - saveModal.start)
-                    const local = clamp(Number(e.target.value), 0, len)
-                    setSavePreviewLocal(local)
-                    if (v) v.currentTime = saveModal.start + local
-                  }}
-                />
-                <span className="save-clip-time">
-                  {formatTime(savePreviewLocal)} /{' '}
-                  {formatTime(Math.max(0, saveModal.end - saveModal.start))}
-                </span>
-              </div>
-              )}
             </div>
-            <input
-              value={categoryInput}
-              onChange={(e) => setCategoryInput(e.target.value)}
-              placeholder="点击下方标签，或自定义名称"
-              autoFocus
-              onKeyDown={(e) => {
-                if (e.key === 'Enter') {
-                  e.preventDefault()
-                  e.stopPropagation()
-                  void confirmSave()
-                }
-                if (e.key === 'Escape') {
-                  e.preventDefault()
-                  e.stopPropagation()
-                  setSaveModal(null)
-                }
-              }}
-            />
             <CategoryChips
               value={categoryInput}
-              onSelect={setCategoryInput}
+              onSelect={onSaveCategorySelect}
               onConfirm={(tag) => void confirmSave(tag)}
               onRequestDelete={requestDeleteCategoryTag}
               refreshKey={categoryTagsRevision}
             />
+            <label className="save-dest-label">保存路径</label>
+            <div className="reclassify-custom-row save-dest-row">
+              <input
+                value={savePathDisplay}
+                onChange={(e) => onSaveDestRootChange(e.target.value)}
+                placeholder="选择类别后显示；可改源目录或点右侧选择"
+                title={savePathDisplay || undefined}
+                onKeyDown={(e) => {
+                  if (e.key === 'Enter') {
+                    e.preventDefault()
+                    e.stopPropagation()
+                    void confirmSave()
+                  }
+                }}
+              />
+              <button type="button" onClick={() => void pickSaveDestDir()}>
+                选择…
+              </button>
+            </div>
+            <p className="save-dest-hint">
+              自定义的是类别文件夹的源目录，实际保存到「源目录/类别名/」。自定义后本次运行内一直沿用，重启后恢复默认
+            </p>
             <div className="modal-actions">
               <button type="button" onClick={() => setSaveModal(null)}>
                 取消
@@ -5114,7 +5378,7 @@ export default function App(): React.JSX.Element {
                 </>
               ) : null}
             </p>
-            <label>重命名</label>
+            <label>类别</label>
             <input
               value={batchCategory}
               onChange={(e) => setBatchCategory(e.target.value)}
@@ -5146,7 +5410,7 @@ export default function App(): React.JSX.Element {
 
       {reclassifyDestModal && (
         <div className="modal-backdrop">
-          <div className="modal modal-save">
+          <div className="modal modal-reclassify">
             <h2>二次分类落点</h2>
             <p>
               选中项中有 {reclassifyDestModal.categorizedCount} 个已在类别文件夹内。
@@ -5163,9 +5427,8 @@ export default function App(): React.JSX.Element {
                 />
                 <span>
                   <strong>原目录对应类别</strong>
-                  <br />
                   <span className="muted">
-                    例：/素材库/走路/a.mp4 → /素材库/{reclassifyDestModal.category}/a.mp4
+                    例：/素材库/走路/… → /素材库/{reclassifyDestModal.category}/…
                   </span>
                 </span>
               </label>
@@ -5178,9 +5441,8 @@ export default function App(): React.JSX.Element {
                 />
                 <span>
                   <strong>当前目录下新建类别</strong>
-                  <br />
                   <span className="muted">
-                    例：/素材库/走路/a.mp4 → /素材库/走路/{reclassifyDestModal.category}/a.mp4
+                    例：/素材库/走路/… → /素材库/走路/{reclassifyDestModal.category}/…
                   </span>
                 </span>
               </label>
@@ -5193,8 +5455,7 @@ export default function App(): React.JSX.Element {
                 />
                 <span>
                   <strong>自选目标文件夹</strong>
-                  <br />
-                  <span className="muted">直接移入所选目录，不再套一层类别名</span>
+                  <span className="muted">直接写入所选目录，不再套一层类别名</span>
                 </span>
               </label>
             </div>

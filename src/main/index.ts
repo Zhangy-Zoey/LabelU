@@ -20,7 +20,8 @@ import {
   generateThumbnail,
   toMediaUrl,
   setFfmpegCancelChecker,
-  killActiveFfmpeg
+  killActiveFfmpeg,
+  ensurePreviewProxy
 } from './ffmpeg'
 import {
   saveSession,
@@ -47,6 +48,9 @@ import {
   beginCategoryScanCache,
   endCategoryScanCache,
   listCategoryDirectories,
+  saveExportCatalog,
+  listAllExportCatalogPaths,
+  clearExportCatalog,
   type BatchClassifyMove,
   type ClassifyDestOptions
 } from './session'
@@ -169,6 +173,28 @@ let mainWindow: BrowserWindow | null = null
 let allowQuit = false
 /** 上次向渲染进程请求关闭的时间；短时间内再关则强制退出 */
 let closeAskAt = 0
+
+/** 单实例：第二开聚焦已有窗口，避免 Windows 双开抢文件锁 */
+const gotSingleInstanceLock = app.requestSingleInstanceLock()
+if (!gotSingleInstanceLock) {
+  app.quit()
+  process.exit(0)
+}
+app.on('second-instance', () => {
+  if (!mainWindow) {
+    const existing = BrowserWindow.getAllWindows()[0]
+    if (existing) {
+      if (existing.isMinimized()) existing.restore()
+      existing.show()
+      existing.focus()
+    }
+    return
+  }
+  if (mainWindow.isMinimized()) mainWindow.restore()
+  mainWindow.show()
+  mainWindow.focus()
+})
+
 /**
  * 用户明确选过的媒体根路径（系统对话框 / 拖放 / 启动时会话恢复）。
  * 普通 scan-paths 只读已允许范围，不得靠渲染进程随便传路径扩权。
@@ -274,6 +300,8 @@ function isPathAllowed(filePath: string): boolean {
   try {
     const thumbRoot = path.join(app.getPath('userData'), 'thumbnails')
     if (isUnderAllowedRoot(abs, thumbRoot)) return true
+    const proxyRoot = path.join(app.getPath('userData'), 'preview-proxy')
+    if (isUnderAllowedRoot(abs, proxyRoot)) return true
   } catch {
     /* ignore */
   }
@@ -296,9 +324,15 @@ function seedAllowedRootsFromDisk(): void {
   } catch {
     /* ignore */
   }
-  // 缩略图缓存目录
+  try {
+    for (const p of listAllExportCatalogPaths()) rememberAllowedPath(p)
+  } catch {
+    /* ignore */
+  }
+  // 缩略图 / 预览代理缓存目录
   try {
     rememberAllowedPath(path.join(app.getPath('userData'), 'thumbnails'))
+    rememberAllowedPath(path.join(app.getPath('userData'), 'preview-proxy'))
   } catch {
     /* ignore */
   }
@@ -889,7 +923,6 @@ function setupIpc(): void {
     setBusy(true)
     let outputPath = ''
     try {
-      console.log('[labelu] export-image', req.category)
       if (!fs.existsSync(req.sourcePath)) throw new Error('源图片不存在')
       assertAllowedPath(req.sourcePath, '源图片')
       if (!isImagePath(req.sourcePath)) throw new Error('不是图片文件')
@@ -904,7 +937,21 @@ function setupIpc(): void {
       const ext = preferredImageExportExt(req.sourcePath)
       // 图片用固定虚拟时段写入文件名，便于与视频导出命名一致；剩余区间保持全幅以支持多次裁切
       const range = { start: 0, end: duration }
-      outputPath = await nextExportPath(req.sourcePath, req.category, range, cropForName, ext)
+      const classifyOpts =
+        req.reclassifyMode || req.customDestDir
+          ? {
+              reclassifyMode: req.reclassifyMode,
+              customDestDir: req.customDestDir
+            }
+          : undefined
+      outputPath = await nextExportPath(
+        req.sourcePath,
+        req.category,
+        range,
+        cropForName,
+        ext,
+        classifyOpts
+      )
       const result = await exportImageCrop({
         sourcePath: req.sourcePath,
         outputPath,
@@ -915,6 +962,8 @@ function setupIpc(): void {
       if (!fs.existsSync(outputPath) || fs.statSync(outputPath).size < 32) {
         throw new Error('导出失败：输出文件无效')
       }
+      rememberAllowedPath(outputPath)
+      if (req.customDestDir) rememberAllowedPath(req.customDestDir)
 
       const undoEntry: UndoEntry = {
         exportPath: outputPath,
@@ -942,7 +991,6 @@ function setupIpc(): void {
         undoStack
       }
       saveSession(state)
-      console.log('[labelu] export-image done', outputPath)
       return { ...result, outputPath, session: state }
     } catch (err) {
       console.error('[labelu] export-image failed', err)
@@ -965,7 +1013,6 @@ function setupIpc(): void {
     setBusy(true)
     let outputPath = ''
     try {
-      console.log('[labelu] export-clip', req.start, req.end, req.category)
       if (!fs.existsSync(req.sourcePath)) throw new Error('源视频不存在')
       assertAllowedPath(req.sourcePath, '源视频')
       if (!req.category || !String(req.category).trim()) throw new Error('请输入类别')
@@ -993,11 +1040,20 @@ function setupIpc(): void {
 
       const cropForName =
         req.cropActive && req.crop && isMeaningfulCrop(req.crop) ? req.crop : null
+      const classifyOpts =
+        req.reclassifyMode || req.customDestDir
+          ? {
+              reclassifyMode: req.reclassifyMode,
+              customDestDir: req.customDestDir
+            }
+          : undefined
       outputPath = await nextExportPath(
         req.sourcePath,
         req.category,
         { start: cutStart, end: cutEnd },
-        cropForName
+        cropForName,
+        '.mp4',
+        classifyOpts
       )
       const result = await exportClip({
         sourcePath: req.sourcePath,
@@ -1011,6 +1067,8 @@ function setupIpc(): void {
       if (!fs.existsSync(outputPath) || fs.statSync(outputPath).size < 1024) {
         throw new Error('导出失败：输出文件无效')
       }
+      rememberAllowedPath(outputPath)
+      if (req.customDestDir) rememberAllowedPath(req.customDestDir)
 
       const undoEntry: UndoEntry = {
         exportPath: outputPath,
@@ -1039,7 +1097,6 @@ function setupIpc(): void {
         undoStack
       }
       saveSession(state)
-      console.log('[labelu] export-clip done', outputPath)
       return { ...result, outputPath, session: state }
     } catch (err) {
       console.error('[labelu] export-clip failed', err)
@@ -1097,6 +1154,7 @@ function setupIpc(): void {
       if (exports.length === 0) {
         clearSession(sourcePath)
         clearSidecar(sourcePath)
+        clearExportCatalog(sourcePath)
       } else {
         saveSession(next)
       }
@@ -1138,6 +1196,7 @@ function setupIpc(): void {
       if (exports.length === 0) {
         clearSession(sourcePath)
         clearSidecar(sourcePath)
+        clearExportCatalog(sourcePath)
         return {
           ...next,
           exports: [],
@@ -1180,6 +1239,7 @@ function setupIpc(): void {
           if (markDone) {
             emitProgress('标记完成…')
             clearSidecar(sourcePath)
+            clearExportCatalog(sourcePath)
             const donePath = await markCompleted(sourcePath)
             rememberAllowedPath(donePath)
             clearSession(sourcePath)
@@ -1195,8 +1255,10 @@ function setupIpc(): void {
           throw new Error('找不到剪辑会话记录，请重新打开该视频后再完成')
         }
 
-        // 分类信息已写在导出文件名中；清掉旧旁路 JSON；完成态写在源文件名 `_done` 上
+        // 分类信息已写在导出文件名 / 导出目录索引中；清掉旧旁路与工作区会话
         emitProgress('标记完成…')
+        saveExportCatalog(sourcePath, precise)
+        for (const e of precise) rememberAllowedPath(e.path)
         clearSidecar(sourcePath)
         const donePath = await markCompleted(sourcePath)
         rememberAllowedPath(donePath)
@@ -1416,18 +1478,62 @@ function setupIpc(): void {
   })
 
   ipcMain.handle('download-update', async () => {
-    await autoUpdater.downloadUpdate()
-    return true
+    try {
+      await autoUpdater.downloadUpdate()
+      return { ok: true as const }
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err)
+      // ZIP missing / 签名等问题：告知用户，便于改手动下载
+      logError('updater.downloadUpdate', err)
+      mainWindow?.webContents.send('update-error', message)
+      throw err instanceof Error ? err : new Error(message)
+    }
   })
 
   ipcMain.handle('install-update', () => {
-    autoUpdater.quitAndInstall()
+    try {
+      // isSilent=false：未签名包在 mac 上更稳；isForceRunAfter=true 装完重启
+      autoUpdater.quitAndInstall(false, true)
+      return { ok: true as const }
+    } catch (err) {
+      logError('updater.installUpdate', err)
+      throw err instanceof Error ? err : new Error(String(err))
+    }
   })
 
   ipcMain.handle('get-media-url', (_e, filePath: string) => {
     assertAllowedPath(filePath, '视频')
     return toMediaUrl(filePath)
   })
+
+  ipcMain.handle(
+    'ensure-preview-proxy',
+    async (_e, filePath: string, force?: boolean, quiet?: boolean) => {
+      assertAllowedPath(filePath, '视频')
+      const silent = Boolean(quiet)
+      if (!silent) {
+        emitProgress('正在检查预览兼容性…')
+        setBusy(true)
+      }
+      try {
+        const result = await ensurePreviewProxy(filePath, {
+          force: Boolean(force),
+          onProgress: silent ? undefined : emitProgress
+        })
+        rememberAllowedPath(result.path)
+        return {
+          path: result.path,
+          url: toMediaUrl(result.path),
+          proxied: result.proxied
+        }
+      } finally {
+        if (!silent) {
+          setBusy(false)
+          emitProgress('')
+        }
+      }
+    }
+  )
 
   ipcMain.handle('get-thumbnail', async (_e, filePath: string) => {
     assertAllowedPath(filePath, '视频')

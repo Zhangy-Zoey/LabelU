@@ -1,6 +1,6 @@
 {
   "name": "labelu-video",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "视频裁剪打标桌面应用",
   "main": "out/main/index.js",
   "author": "labelu",
@@ -65,8 +65,10 @@
       "icon": "build/icon.icns",
       "category": "public.app-category.video",
       "target": [
-        "dmg"
+        "dmg",
+        "zip"
       ],
+      "artifactName": "LabelU-Video-${version}-${arch}.${ext}",
       "identity": null,
       "hardenedRuntime": false,
       "gatekeeperAssess": false,
@@ -108,9 +110,6 @@
       ],
       "language": "2052",
       "artifactName": "LabelU-Video-Setup-${version}.${ext}"
-    },
-    "portable": {
-      "artifactName": "LabelU-Video-Portable-${version}.${ext}"
     },
     "publish": [
       {
