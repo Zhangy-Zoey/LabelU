@@ -32,14 +32,11 @@ export function getLogDir(): string {
 }
 
 /** 覆盖清空异常日志，并删除旧版按日滚动的日志文件 */
-export function clearExceptionLog(reason = 'cleared'): void {
+export function clearExceptionLog(_reason = 'cleared'): void {
   try {
     ensureLogDir()
-    const header =
-      `${new Date().toISOString()} [info] [app] exception log ${reason}` +
-      ` version=${app.getVersion()} platform=${process.platform}\n`
-    fs.writeFileSync(getExceptionLogPath(), header, 'utf8')
-    // 清理历史按日日志，避免残留
+    // 异常日志保持空文件；不写 info 头，避免「新安装就有日志」的误解
+    fs.writeFileSync(getExceptionLogPath(), '', 'utf8')
     for (const name of fs.readdirSync(logDir())) {
       if (/^labelu-\d{4}-\d{2}-\d{2}\.log$/i.test(name)) {
         try {

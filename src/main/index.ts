@@ -468,13 +468,6 @@ function createWindow(): void {
 app.whenReady().then(() => {
   initLogger()
   const startupInfo = applyStartupVersionCheck()
-  appendLog(
-    'info',
-    'app',
-    `ready version=${startupInfo.version} upgraded=${startupInfo.upgraded} log=${getExceptionLogPath()}`,
-    undefined,
-    { force: true }
-  )
 
   // 把启动信息挂到全局，供首屏 IPC 读取（避免重复跑版本逻辑）
   ;(global as unknown as { __labeluStartupInfo?: StartupVersionInfo }).__labeluStartupInfo =
@@ -647,28 +640,14 @@ function setupUpdater(): void {
     autoUpdater.autoDownload = false
     // 按当前平台只解析/下载对应安装包（win→exe，mac→dmg/zip）
     autoUpdater.on('update-available', (info) => {
-      appendLog('info', 'updater', `update-available ${info?.version || ''}`, undefined, {
-        force: true
-      })
       mainWindow?.webContents.send('update-available', info)
     })
-    autoUpdater.on('update-downloaded', (info) => {
-      appendLog('info', 'updater', `update-downloaded ${info?.version || ''}`, undefined, {
-        force: true
-      })
+    autoUpdater.on('update-downloaded', () => {
       mainWindow?.webContents.send('update-downloaded')
     })
     autoUpdater.on('error', (err) => {
-      if (isBenignUpdaterMiss(err)) {
-        appendLog(
-          'info',
-          'updater',
-          `check skipped: ${err instanceof Error ? err.message : String(err)}`,
-          undefined,
-          { force: true }
-        )
-        return
-      }
+      // 尚无 Release / 网络抖动：静默跳过，不写 exceptions.log
+      if (isBenignUpdaterMiss(err)) return
       logError('updater', err)
       mainWindow?.webContents.send(
         'update-error',
@@ -677,16 +656,7 @@ function setupUpdater(): void {
     })
     setTimeout(() => {
       autoUpdater.checkForUpdates().catch((err) => {
-        if (isBenignUpdaterMiss(err)) {
-          appendLog(
-            'info',
-            'updater',
-            `check skipped: ${err instanceof Error ? err.message : String(err)}`,
-            undefined,
-            { force: true }
-          )
-          return
-        }
+        if (isBenignUpdaterMiss(err)) return
         logError('updater.checkForUpdates', err)
       })
     }, 5000)
