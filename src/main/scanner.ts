@@ -7,7 +7,8 @@ import { isPresetCategory } from '../shared/categories'
 import {
   sanitizeName,
   isClipExportFileName,
-  isCompletedFileName
+  isCompletedFileName,
+  compareMediaPaths
 } from '../shared/utils'
 import {
   isSourceClassified,
@@ -24,7 +25,7 @@ function isMediaFile(filePath: string): boolean {
 }
 
 /**
- * 仅当上级目录名属于「指定类别标签」（预设或用户手动添加的三大类标签）时，视为已归类整片。
+ * 仅当上级目录名属于「指定类别标签」（预设或用户手动添加的行为类标签）时，视为已归类整片。
  * 普通子文件夹名不在标签列表中 → 不算已归类。
  */
 function detectCategorizedPlacement(filePath: string): boolean {
@@ -57,7 +58,7 @@ function yieldEventLoop(): Promise<void> {
   return new Promise((resolve) => setImmediate(resolve))
 }
 
-export type ScanOptions = {
+type ScanOptions = {
   /** 为 true 时用轻量完成判定（导入大文件/大文件夹时） */
   fastCompleted?: boolean
   isCancelled?: () => boolean
@@ -133,7 +134,7 @@ export async function scanPathsAsync(
     if (opts.isCancelled?.()) {
       throw new Error('已取消')
     }
-    files.sort((a, b) => a.localeCompare(b, 'zh'))
+    files.sort(compareMediaPaths)
     const items: VideoItem[] = []
     // 快速导入：跳过逐文件 existsSync，completed 交后台 refreshCompletedFlags
     for (let i = 0; i < files.length; i++) {

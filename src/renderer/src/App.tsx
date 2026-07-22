@@ -508,6 +508,10 @@ export default function App(): React.JSX.Element {
   const [dragOver, setDragOver] = useState(false)
   const [status, setStatus] = useState('')
   const [updateBanner, setUpdateBanner] = useState<string | null>(null)
+  /** 有可更新版本时顶栏版本按钮显示红点 */
+  const [updateAvailable, setUpdateAvailable] = useState(false)
+  /** 更新包下载进度 0–100；null 表示未在下载 */
+  const [updateDownloadPercent, setUpdateDownloadPercent] = useState<number | null>(null)
   const [whatsNewModal, setWhatsNewModal] = useState<WhatsNewModal | null>(null)
   const [appVersion, setAppVersion] = useState('')
   const [thumbSize, setThumbSize] = useState(() =>
@@ -565,6 +569,22 @@ export default function App(): React.JSX.Element {
   )
   const saveModalOpenRef = useRef(false)
   saveModalOpenRef.current = Boolean(saveModal)
+  /** Esc 关闭顶层界面用（每帧写入，keydown 只读 ref） */
+  const escUiRef = useRef({
+    deleteCategoryTag: false,
+    save: false,
+    batch: false,
+    reclassify: false,
+    batchResult: false,
+    confirm: null as ConfirmModal | null,
+    importChoice: false,
+    recover: false,
+    whatsNew: false,
+    thumbPreview: false,
+    editing: false
+  })
+  const dismissWhatsNewRef = useRef<() => void>(() => {})
+  const exitAllEditingRef = useRef<() => void>(() => {})
 
   const videoRef = useRef<HTMLVideoElement>(null)
   /** 当前主预览对应的源路径；HEVC 代理失败重试用 */
@@ -721,6 +741,22 @@ export default function App(): React.JSX.Element {
     setCrop(FULL_CROP)
     setStatus('已退出编辑（全片/选区偏好未改）')
   }, [])
+  exitAllEditingRef.current = exitAllEditing
+
+  /** 每帧同步 Esc 可关闭的界面状态 */
+  escUiRef.current = {
+    deleteCategoryTag: Boolean(deleteCategoryTagModal),
+    save: Boolean(saveModal),
+    batch: batchModal,
+    reclassify: Boolean(reclassifyDestModal),
+    batchResult: Boolean(batchResultModal),
+    confirm: confirmModal,
+    importChoice: Boolean(importChoiceModal),
+    recover: Boolean(recoverModal),
+    whatsNew: Boolean(whatsNewModal),
+    thumbPreview: thumbPreviewIds.size > 0,
+    editing: Boolean(fineTuneWhich || cropActive || selectedExportPath || filmstrip)
+  }
 
   const timelineView = useMemo(() => {
     const full = { start: 0, end: Math.max(0, duration), span: Math.max(0.05, duration || 0.05) }
@@ -1677,16 +1713,28 @@ export default function App(): React.JSX.Element {
     })
     const offUpdate = window.api.onUpdateAvailable((info) => {
       const ver = (info as { version?: string })?.version
+      setUpdateAvailable(true)
+      setUpdateDownloadPercent(null)
       setUpdateBanner(ver ? `发现新版本 ${ver}` : '发现新版本')
     })
     const offDownloaded = window.api.onUpdateDownloaded(() => {
+      setUpdateAvailable(true)
+      setUpdateDownloadPercent(100)
       setUpdateBanner('更新已下载，重启即可安装')
+    })
+    const offUpdateProgress = window.api.onUpdateDownloadProgress((percent) => {
+      setUpdateDownloadPercent(Math.max(0, Math.min(100, percent)))
+      setUpdateBanner((prev) => {
+        const base = (prev || '正在下载更新').replace(/（下载中.*$|（\d+%）$/, '').trim()
+        return `${base}（${Math.round(Math.max(0, Math.min(100, percent)))}%）`
+      })
     })
     const offUpdateError = window.api.onUpdateError((message) => {
       // 主进程已过滤首发无 Release 等良性情况；此处再兜一层，避免误弹 toast
       if (/No published versions on GitHub|404|ENOTFOUND|ETIMEDOUT|net::ERR_/i.test(message || '')) {
         return
       }
+      setUpdateDownloadPercent(null)
       reportClientError('updater', message)
       showToast(message ? `检查更新失败：${message}` : '检查更新失败')
     })
@@ -1743,6 +1791,7 @@ export default function App(): React.JSX.Element {
       offClose()
       offUpdate()
       offDownloaded()
+      offUpdateProgress()
       offUpdateError()
     }
   }, [])
@@ -2695,6 +2744,60 @@ export default function App(): React.JSX.Element {
       setRecoverModal({ sessions: pending, index: 0 })
     }
   }, [whatsNewModal])
+  dismissWhatsNewRef.current = dismissWhatsNew
+
+  /** Esc：关闭最顶层弹窗 / 预览 / 编辑态；任意情况优先退出当前界面 */
+  const dismissTopUi = useCallback((): boolean => {
+    const o = escUiRef.current
+    if (o.deleteCategoryTag) {
+      setDeleteCategoryTagModal(null)
+      return true
+    }
+    if (o.save) {
+      setSaveModal(null)
+      return true
+    }
+    if (o.batch) {
+      setBatchModal(false)
+      return true
+    }
+    if (o.reclassify) {
+      setReclassifyDestModal(null)
+      setBatchModal(true)
+      return true
+    }
+    if (o.batchResult) {
+      setBatchResultModal(null)
+      return true
+    }
+    if (o.confirm) {
+      const cancel = o.confirm.onCancel
+      setConfirmModal(null)
+      cancel?.()
+      return true
+    }
+    if (o.importChoice) {
+      setImportChoiceModal(null)
+      return true
+    }
+    if (o.recover) {
+      setRecoverModal(null)
+      return true
+    }
+    if (o.whatsNew) {
+      dismissWhatsNewRef.current()
+      return true
+    }
+    if (o.thumbPreview) {
+      setThumbPreviewIds(new Set())
+      return true
+    }
+    if (o.editing) {
+      exitAllEditingRef.current()
+      return true
+    }
+    return false
+  }, [])
 
   /** 显式将当前媒体改回未完成 */
   const markCurrentIncomplete = useCallback(async (): Promise<void> => {
@@ -3492,16 +3595,15 @@ export default function App(): React.JSX.Element {
     const onKey = (e: KeyboardEvent): void => {
       const tag = (e.target as HTMLElement)?.tagName
 
-      // Esc：保存页优先关闭（输入框聚焦时也生效）
+      // Esc：任意弹窗 / 预览 / 编辑态均可退出（输入框聚焦时也生效）
       if (e.key === 'Escape') {
         e.preventDefault()
-        if (saveModalOpenRef.current) {
-          setSaveModal(null)
-          return
+        e.stopPropagation()
+        if (dismissTopUi()) return
+        // 无上层界面时：若焦点在输入框则失焦
+        if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT') {
+          ;(e.target as HTMLElement).blur()
         }
-        if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT') return
-        if (modalOpenRef.current) return
-        exitAllEditing()
         return
       }
 
@@ -3686,6 +3788,7 @@ export default function App(): React.JSX.Element {
     selectedIds.size,
     current,
     exitAllEditing,
+    dismissTopUi,
     exitFineTune,
     openSaveModal,
     nudgeFineTune,
@@ -4170,37 +4273,69 @@ export default function App(): React.JSX.Element {
         </div>
       )}
       {updateBanner && (
-        <div className="busy-banner app-banner busy-banner-accent">
-          {updateBanner}{' '}
-          <button
-            className="primary"
-            style={{ marginLeft: 8 }}
-            onClick={() => {
-              if (updateBanner.includes('已下载')) {
-                try {
-                  window.api.installUpdate()
-                } catch (err) {
-                  showToast(err instanceof Error ? err.message : '安装更新失败')
-                }
-                return
-              }
-              setUpdateBanner((prev) => (prev ? `${prev.replace(/（下载中…）$/, '')}（下载中…）` : prev))
-              void window.api
-                .downloadUpdate()
-                .then(() => showToast('开始下载更新'))
-                .catch((err: unknown) => {
-                  const msg = err instanceof Error ? err.message : String(err)
-                  setUpdateBanner((prev) => (prev || '发现新版本').replace(/（下载中…）$/, ''))
-                  if (/ZIP file not provided|zip/i.test(msg)) {
-                    showToast('该版本缺少 macOS 自动更新包，请到 GitHub Releases 手动下载安装')
-                  } else {
-                    showToast(msg ? `下载更新失败：${msg}` : '下载更新失败')
+        <div className="busy-banner app-banner busy-banner-accent update-banner">
+          <div className="update-banner-row">
+            <span className="update-banner-text">{updateBanner}</span>
+            {!updateBanner.includes('已下载') && updateDownloadPercent == null ? (
+              <button
+                className="primary"
+                type="button"
+                onClick={() => {
+                  setUpdateDownloadPercent(0)
+                  setUpdateBanner((prev) =>
+                    prev ? `${prev.replace(/（下载中.*$|（\d+%）$/, '').trim()}（0%）` : '正在下载更新（0%）'
+                  )
+                  void window.api
+                    .downloadUpdate()
+                    .then(() => showToast('开始下载更新'))
+                    .catch((err: unknown) => {
+                      const msg = err instanceof Error ? err.message : String(err)
+                      setUpdateDownloadPercent(null)
+                      setUpdateBanner((prev) =>
+                        (prev || '发现新版本').replace(/（下载中.*$|（\d+%）$/, '').trim()
+                      )
+                      if (/ZIP file not provided|zip/i.test(msg)) {
+                        showToast('该版本缺少 macOS 自动更新包，请到 GitHub Releases 手动下载安装')
+                      } else {
+                        showToast(msg ? `下载更新失败：${msg}` : '下载更新失败')
+                      }
+                    })
+                }}
+              >
+                下载更新
+              </button>
+            ) : null}
+            {updateBanner.includes('已下载') ? (
+              <button
+                className="primary"
+                type="button"
+                onClick={() => {
+                  try {
+                    window.api.installUpdate()
+                  } catch (err) {
+                    showToast(err instanceof Error ? err.message : '安装更新失败')
                   }
-                })
-            }}
-          >
-            {updateBanner.includes('已下载') ? '重启安装' : '下载更新'}
-          </button>
+                }}
+              >
+                重启安装
+              </button>
+            ) : null}
+          </div>
+          {updateDownloadPercent != null && !updateBanner.includes('已下载') ? (
+            <div
+              className="update-progress"
+              role="progressbar"
+              aria-valuemin={0}
+              aria-valuemax={100}
+              aria-valuenow={Math.round(updateDownloadPercent)}
+            >
+              <div
+                className="update-progress-fill"
+                style={{ width: `${Math.max(2, Math.round(updateDownloadPercent))}%` }}
+              />
+              <span className="update-progress-label">{Math.round(updateDownloadPercent)}%</span>
+            </div>
+          ) : null}
         </div>
       )}
 
@@ -4250,6 +4385,25 @@ export default function App(): React.JSX.Element {
             }}
           >
             清除选择
+          </button>
+          <button
+            type="button"
+            className="version-check-btn"
+            disabled={busy}
+            title={
+              updateAvailable
+                ? '有新版本，点击检查并自动更新'
+                : '检查并更新到最新版本'
+            }
+            onClick={() => {
+              void window.api.openAbout({ autoUpdate: true }).catch((err: unknown) => {
+                reportClientError('openAbout', err)
+                showToast(err instanceof Error ? err.message : '无法打开关于窗口')
+              })
+            }}
+          >
+            {appVersion ? `v${appVersion}` : '版本'}
+            {updateAvailable ? <span className="update-dot" aria-hidden /> : null}
           </button>
           <button
             type="button"
@@ -5114,7 +5268,7 @@ export default function App(): React.JSX.Element {
                       })}
                     </div>
                   )}
-                  <div className="controls image-mode-controls">
+                  <div className="controls">
                     <button
                       onClick={() => {
                         if (cropActive) {

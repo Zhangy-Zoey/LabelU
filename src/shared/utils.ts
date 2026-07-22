@@ -290,6 +290,79 @@ function pathBasename(filePath: string): string {
   return parts[parts.length - 1] || filePath
 }
 
+/** 接近 Node path.dirname，兼容 Windows 盘符 / UNC 与 POSIX */
+function pathDirname(filePath: string): string {
+  const win = filePath.includes('\\') || /^[A-Za-z]:/.test(filePath) || filePath.startsWith('\\\\')
+  if (win) {
+    let s = filePath.replace(/\//g, '\\')
+    if (/^[A-Za-z]:\\$/i.test(s)) return s.slice(0, 3)
+    if (!/^[A-Za-z]:\\$/i.test(s)) s = s.replace(/\\+$/, '')
+    if (/^[A-Za-z]:$/i.test(s)) return `${s}\\`
+    if (s.startsWith('\\\\')) {
+      const parts = s.slice(2).split('\\').filter(Boolean)
+      if (parts.length <= 2) return `\\\\${parts.join('\\')}`
+      return `\\\\${parts.slice(0, -1).join('\\')}`
+    }
+    const i = s.lastIndexOf('\\')
+    if (i < 0) return '.'
+    if (i === 2 && /^[A-Za-z]:\\/i.test(s)) return s.slice(0, 3)
+    return s.slice(0, i)
+  }
+  if (filePath === '/') return '/'
+  const s = filePath.replace(/\/+$/, '') || '/'
+  const i = s.lastIndexOf('/')
+  if (i < 0) return '.'
+  if (i === 0) return '/'
+  return s.slice(0, i)
+}
+
+function pathJoinDir(dir: string, name: string): string {
+  const win = dir.includes('\\') || /^[A-Za-z]:/.test(dir) || dir.startsWith('\\\\')
+  const sep = win ? '\\' : '/'
+  let base = win ? dir.replace(/\//g, '\\') : dir
+  if (win) {
+    if (/^[A-Za-z]:$/i.test(base)) base = `${base}\\`
+    else if (!/^[A-Za-z]:\\$/i.test(base)) base = base.replace(/\\+$/, '')
+  } else {
+    base = base === '/' ? '/' : base.replace(/\/+$/, '')
+  }
+  if (base === '/' || /^[A-Za-z]:\\$/i.test(base)) return `${base}${name}`
+  if (!base) return name
+  return `${base}${sep}${name}`
+}
+
+function normPathForCompare(p: string): string {
+  let s = p.replace(/\\/g, '/')
+  if (/^[A-Za-z]:/.test(s) || s.startsWith('//')) s = s.toLowerCase()
+  return s
+}
+
+/** 先按所在目录、再按文件名字母序（含数字自然序）；Windows 下忽略大小写与分隔符差异 */
+export function compareMediaPaths(a: string, b: string): number {
+  const na = normPathForCompare(a)
+  const nb = normPathForCompare(b)
+  const da = pathDirname(na)
+  const db = pathDirname(nb)
+  const byDir = da.localeCompare(db, undefined, { numeric: true, sensitivity: 'base' })
+  if (byDir !== 0) return byDir
+  return pathBasename(na).localeCompare(pathBasename(nb), undefined, {
+    numeric: true,
+    sensitivity: 'base'
+  })
+}
+
+export function joinMediaDir(dir: string, name: string): string {
+  return pathJoinDir(dir, name)
+}
+
+export function mediaDirname(filePath: string): string {
+  return pathDirname(filePath)
+}
+
+export function mediaBasename(filePath: string): string {
+  return pathBasename(filePath)
+}
+
 export function pathStem(filePath: string): string {
   const base = pathBasename(filePath)
   const idx = base.lastIndexOf('.')

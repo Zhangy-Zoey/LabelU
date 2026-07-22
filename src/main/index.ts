@@ -4,7 +4,8 @@ import {
   ipcMain,
   dialog,
   protocol,
-  shell
+  shell,
+  Menu
 } from 'electron'
 import path, { join } from 'path'
 import { Readable } from 'stream'
@@ -170,6 +171,7 @@ let busySince = 0
 /** 用户请求中止当前长时间任务 */
 let cancelRequested = false
 let mainWindow: BrowserWindow | null = null
+let aboutWindow: BrowserWindow | null = null
 let allowQuit = false
 /** 上次向渲染进程请求关闭的时间；短时间内再关则强制退出 */
 let closeAskAt = 0
@@ -438,6 +440,161 @@ function resolveAppIcon(): string | undefined {
   return candidates.find((p) => fs.existsSync(p))
 }
 
+function sendToRendererWindows(channel: string, ...args: unknown[]): void {
+  for (const win of [mainWindow, aboutWindow]) {
+    if (!win || win.isDestroyed()) continue
+    try {
+      win.webContents.send(channel, ...args)
+    } catch {
+      /* ignore */
+    }
+  }
+}
+
+function resolveAboutUrl(autoUpdate = false): string {
+  if (isDev() && process.env['ELECTRON_RENDERER_URL']) {
+    const base = process.env['ELECTRON_RENDERER_URL'].replace(/\/$/, '')
+    return autoUpdate ? `${base}/about.html?autoUpdate=1` : `${base}/about.html`
+  }
+  return join(__dirname, '../renderer/about.html')
+}
+
+function requestAboutAutoUpdate(): void {
+  if (!aboutWindow || aboutWindow.isDestroyed()) return
+  try {
+    aboutWindow.webContents.send('about-auto-update')
+  } catch {
+    /* ignore */
+  }
+}
+
+function createAboutWindow(opts?: { autoUpdate?: boolean }): void {
+  const autoUpdate = Boolean(opts?.autoUpdate)
+  if (aboutWindow && !aboutWindow.isDestroyed()) {
+    aboutWindow.show()
+    aboutWindow.focus()
+    if (autoUpdate) requestAboutAutoUpdate()
+    return
+  }
+  const icon = resolveAppIcon()
+  aboutWindow = new BrowserWindow({
+    width: 360,
+    height: 420,
+    resizable: false,
+    minimizable: false,
+    maximizable: false,
+    fullscreenable: false,
+    title: '关于 LabelU Video',
+    backgroundColor: '#2b2b2b',
+    show: false,
+    autoHideMenuBar: true,
+    ...(icon ? { icon } : {}),
+    webPreferences: {
+      preload: join(__dirname, '../preload/index.js'),
+      contextIsolation: true,
+      nodeIntegration: false,
+      sandbox: false,
+      webSecurity: true
+    }
+  })
+  aboutWindow.once('ready-to-show', () => {
+    aboutWindow?.show()
+    aboutWindow?.focus()
+  })
+  aboutWindow.on('closed', () => {
+    aboutWindow = null
+  })
+  const aboutUrl = resolveAboutUrl(autoUpdate)
+  if (aboutUrl.startsWith('http')) {
+    void aboutWindow.loadURL(aboutUrl)
+  } else if (autoUpdate) {
+    void aboutWindow.loadFile(aboutUrl, { query: { autoUpdate: '1' } })
+  } else {
+    void aboutWindow.loadFile(aboutUrl)
+  }
+}
+
+function setupApplicationMenu(): void {
+  const isMac = process.platform === 'darwin'
+  const template: Electron.MenuItemConstructorOptions[] = []
+  if (isMac) {
+    template.push({
+      label: app.name,
+      submenu: [
+        {
+          label: `关于 ${app.name}`,
+          click: () => createAboutWindow()
+        },
+        { type: 'separator' },
+        { role: 'services' },
+        { type: 'separator' },
+        { role: 'hide' },
+        { role: 'hideOthers' },
+        { role: 'unhide' },
+        { type: 'separator' },
+        { role: 'quit' }
+      ]
+    })
+  }
+  template.push(
+    {
+      label: '编辑',
+      submenu: [
+        { role: 'undo' },
+        { role: 'redo' },
+        { type: 'separator' },
+        { role: 'cut' },
+        { role: 'copy' },
+        { role: 'paste' },
+        ...(isMac ? [{ role: 'pasteAndMatchStyle' as const }] : []),
+        { role: 'selectAll' }
+      ]
+    },
+    {
+      label: '查看',
+      submenu: [
+        { role: 'reload' },
+        { role: 'toggleDevTools' },
+        { type: 'separator' },
+        { role: 'resetZoom' },
+        { role: 'zoomIn' },
+        { role: 'zoomOut' },
+        { type: 'separator' },
+        { role: 'togglefullscreen' }
+      ]
+    },
+    {
+      label: '窗口',
+      submenu: [
+        { role: 'minimize' },
+        { role: 'close' },
+        ...(isMac
+          ? [{ type: 'separator' as const }, { role: 'front' as const }]
+          : [{ role: 'quit' as const }])
+      ]
+    },
+    {
+      label: '帮助',
+      submenu: [
+        ...(isMac
+          ? []
+          : [
+              {
+                label: '关于 LabelU Video',
+                click: () => createAboutWindow()
+              } as Electron.MenuItemConstructorOptions,
+              { type: 'separator' as const }
+            ]),
+        {
+          label: '检查更新',
+          click: () => createAboutWindow({ autoUpdate: true })
+        }
+      ]
+    }
+  )
+  Menu.setApplicationMenu(Menu.buildFromTemplate(template))
+}
+
 function createWindow(): void {
   const icon = resolveAppIcon()
   mainWindow = new BrowserWindow({
@@ -612,6 +769,7 @@ app.whenReady().then(() => {
   })
 
   createWindow()
+  setupApplicationMenu()
   // 窗口创建后再读撤回缓存 / 自定义标签 / 白名单种子，不挡首屏
   setImmediate(() => {
     initBatchUndoStore()
@@ -672,18 +830,23 @@ function setupUpdater(): void {
   if (isDev()) return
   try {
     autoUpdater.autoDownload = false
-    // 按当前平台只解析/下载对应安装包（win→exe，mac→dmg/zip）
+    // 按当前平台只解析/下载对应安装包（win→exe，mac→zip/dmg）
     autoUpdater.on('update-available', (info) => {
-      mainWindow?.webContents.send('update-available', info)
+      sendToRendererWindows('update-available', info)
     })
     autoUpdater.on('update-downloaded', () => {
-      mainWindow?.webContents.send('update-downloaded')
+      sendToRendererWindows('update-download-progress', 100)
+      sendToRendererWindows('update-downloaded')
+    })
+    autoUpdater.on('download-progress', (progress) => {
+      const percent = Math.max(0, Math.min(100, Number(progress?.percent) || 0))
+      sendToRendererWindows('update-download-progress', percent)
     })
     autoUpdater.on('error', (err) => {
       // 尚无 Release / 网络抖动：静默跳过，不写 exceptions.log
       if (isBenignUpdaterMiss(err)) return
       logError('updater', err)
-      mainWindow?.webContents.send(
+      sendToRendererWindows(
         'update-error',
         err instanceof Error ? err.message : String(err)
       )
@@ -1485,7 +1648,7 @@ function setupIpc(): void {
       const message = err instanceof Error ? err.message : String(err)
       // ZIP missing / 签名等问题：告知用户，便于改手动下载
       logError('updater.downloadUpdate', err)
-      mainWindow?.webContents.send('update-error', message)
+      sendToRendererWindows('update-error', message)
       throw err instanceof Error ? err : new Error(message)
     }
   })
@@ -1499,6 +1662,32 @@ function setupIpc(): void {
       logError('updater.installUpdate', err)
       throw err instanceof Error ? err : new Error(String(err))
     }
+  })
+
+  /** 手动检查更新（关于窗口 / 顶栏版本按钮）；开发态直接返回 */
+  ipcMain.handle('check-for-updates', async () => {
+    const version = app.getVersion()
+    if (isDev()) {
+      return { ok: false, updateAvailable: false, version, reason: 'dev' as const }
+    }
+    try {
+      const result = await autoUpdater.checkForUpdates()
+      const remote = String(result?.updateInfo?.version || '').trim()
+      const updateAvailable = Boolean(remote && remote !== version)
+      return { ok: true, updateAvailable, version: remote || version }
+    } catch (err) {
+      if (isBenignUpdaterMiss(err)) {
+        return { ok: true, updateAvailable: false, version }
+      }
+      const message = err instanceof Error ? err.message : String(err)
+      logError('updater.checkForUpdates.manual', err)
+      throw new Error(message)
+    }
+  })
+
+  ipcMain.handle('open-about', (_e, opts?: { autoUpdate?: boolean }) => {
+    createAboutWindow({ autoUpdate: Boolean(opts?.autoUpdate) })
+    return true
   })
 
   ipcMain.handle('get-media-url', (_e, filePath: string) => {

@@ -6,10 +6,13 @@ import type {
 } from './types'
 
 /** 渲染进程 `window.api` 与 preload 共用的类型（勿从 preload 反引，web tsconfig 不包含 electron） */
-export type CustomCategoryMap = Record<'normal' | 'abnormal' | 'danger', string[]>
+export type CustomCategoryMap = Record<
+  'normal' | 'abnormal' | 'danger' | 'other',
+  string[]
+>
 
 export type ClassifyDestApiOpts = {
-  reclassifyMode?: 'originalRoot' | 'underCurrent' | 'custom'
+  reclassifyMode?: 'originalRoot' | 'underCurrent' | 'custom' | 'customRoot'
   customDestDir?: string
 }
 
@@ -45,6 +48,8 @@ export type LabeluApi = {
     isVfr: boolean
     rotation: number
     fps: number
+    videoCodec: string
+    needsPreviewProxy: boolean
   }>
   loadSession: (sourcePath: string) => Promise<SessionState | null>
   batchRemainingHints: (paths: string[]) => Promise<Record<string, number>>
@@ -93,7 +98,20 @@ export type LabeluApi = {
   cancelBusyWork: () => Promise<{ ok: boolean; message?: string }>
   downloadUpdate: () => Promise<unknown>
   installUpdate: () => Promise<unknown>
+  checkForUpdates: () => Promise<{
+    ok: boolean
+    updateAvailable: boolean
+    version: string
+    reason?: string
+  }>
+  openAbout: (opts?: { autoUpdate?: boolean }) => Promise<boolean>
   getMediaUrl: (filePath: string) => Promise<string>
+  /** HEVC 等编码在 Windows 上转 H.264 预览代理；可播则返回原路径 */
+  ensurePreviewProxy: (
+    filePath: string,
+    force?: boolean,
+    quiet?: boolean
+  ) => Promise<{ path: string; url: string; proxied: boolean }>
   getThumbnail: (filePath: string) => Promise<string>
   confirmQuit: (shouldQuit: boolean) => Promise<unknown>
   getPathForFile: (file: File) => string
@@ -103,4 +121,7 @@ export type LabeluApi = {
   onUpdateAvailable: (cb: (info: unknown) => void) => () => void
   onUpdateDownloaded: (cb: () => void) => () => void
   onUpdateError: (cb: (message: string) => void) => () => void
+  onUpdateDownloadProgress: (cb: (percent: number) => void) => () => void
+  /** 菜单「检查更新」：关于窗已打开时再次触发自动检查/下载 */
+  onAboutAutoUpdate: (cb: () => void) => () => void
 }

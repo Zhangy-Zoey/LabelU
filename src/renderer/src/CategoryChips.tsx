@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useState } from 'react'
 import {
   type ExtensibleGroupId,
+  EXTENSIBLE_IDS,
   findCustomCategoryGroup,
   getCategoryGroupsWithCustom,
   getCustomCategoryTags,
@@ -20,9 +21,9 @@ type Props = {
   refreshKey?: number
 }
 
-const EXTENSIBLE = new Set<ExtensibleGroupId>(['normal', 'abnormal', 'danger'])
+const EXTENSIBLE = new Set<ExtensibleGroupId>(EXTENSIBLE_IDS)
 
-/** 预设 + 用户自定义标签；正常/异常/破坏三大类行末有「+」可手动添加 */
+/** 预设 + 用户自定义标签；各大类行末有「+」可手动添加 */
 export function CategoryChips({ value, onSelect, onConfirm, onRequestDelete, refreshKey = 0 }: Props) {
   const selected = value.trim()
   const [revision, setRevision] = useState(0)

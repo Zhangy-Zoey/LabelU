@@ -47,10 +47,10 @@ export const CATEGORY_GROUPS: CategoryGroup[] = [
   }
 ]
 
-/** 可手动扩展的三大行为类（不含「其他」） */
-export type ExtensibleGroupId = 'normal' | 'abnormal' | 'danger'
+/** 各大类均可手动扩展自定义标签 */
+export type ExtensibleGroupId = CategoryGroupId
 
-const EXTENSIBLE_IDS: ExtensibleGroupId[] = ['normal', 'abnormal', 'danger']
+export const EXTENSIBLE_IDS: ExtensibleGroupId[] = ['normal', 'abnormal', 'danger', 'other']
 
 const LS_CUSTOM_CATEGORIES = 'labelu.customCategoryTags'
 
@@ -58,7 +58,8 @@ const LS_CUSTOM_CATEGORIES = 'labelu.customCategoryTags'
 const customByGroup: Record<ExtensibleGroupId, string[]> = {
   normal: [],
   abnormal: [],
-  danger: []
+  danger: [],
+  other: []
 }
 
 let knownTagSet = new Set(CATEGORY_GROUPS.flatMap((g) => g.tags))
@@ -89,7 +90,8 @@ export function getCustomCategoryTags(): Record<ExtensibleGroupId, string[]> {
   return {
     normal: [...customByGroup.normal],
     abnormal: [...customByGroup.abnormal],
-    danger: [...customByGroup.danger]
+    danger: [...customByGroup.danger],
+    other: [...customByGroup.other]
   }
 }
 
@@ -129,8 +131,7 @@ export function saveCustomCategoryTags(): void {
 
 export function getCategoryGroupsWithCustom(): CategoryGroup[] {
   return CATEGORY_GROUPS.map((g) => {
-    if (!EXTENSIBLE_IDS.includes(g.id as ExtensibleGroupId)) return g
-    const extras = customByGroup[g.id as ExtensibleGroupId]
+    const extras = customByGroup[g.id]
     if (!extras.length) return g
     const tags = [...g.tags]
     for (const t of extras) {
@@ -201,7 +202,7 @@ const CATEGORY_PALETTE = [
   '#7eb0b8'
 ]
 
-/** 预设或用户在三大类下手动添加的标签 */
+/** 预设或用户手动添加的标签 */
 export function isPresetCategory(name: string): boolean {
   return knownTagSet.has(name.trim())
 }

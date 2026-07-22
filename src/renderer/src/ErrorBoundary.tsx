@@ -28,6 +28,13 @@ export class ErrorBoundary extends Component<Props, State> {
     }
   }
 
+  /** HMR / 子树更新后清掉旧崩溃态，避免一直卡在错误页 */
+  componentDidUpdate(prevProps: Props): void {
+    if (this.state.error && prevProps.children !== this.props.children) {
+      this.setState({ error: null, logPath: null })
+    }
+  }
+
   render(): ReactNode {
     if (this.state.error) {
       return (

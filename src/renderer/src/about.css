@@ -1,0 +1,135 @@
+* {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  margin: 0;
+  width: 100%;
+  height: 100%;
+  overflow: hidden;
+  background: #2b2b2b;
+  color: #f2f2f2;
+  font-family:
+    -apple-system,
+    BlinkMacSystemFont,
+    'Segoe UI',
+    'PingFang SC',
+    'Hiragino Sans GB',
+    'Microsoft YaHei',
+    sans-serif;
+  user-select: none;
+  -webkit-user-select: none;
+}
+
+.about {
+  height: 100%;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  padding: 28px 24px 22px;
+  text-align: center;
+  gap: 8px;
+}
+
+.about-icon {
+  width: 96px;
+  height: 96px;
+  border-radius: 18px;
+  object-fit: contain;
+  background: #fff;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.35);
+  margin-bottom: 6px;
+}
+
+h1 {
+  margin: 0;
+  font-size: 22px;
+  font-weight: 700;
+  letter-spacing: 0.2px;
+}
+
+.about-version {
+  margin: 0;
+  font-size: 13px;
+  color: #b0b0b0;
+}
+
+.about-update {
+  width: min(260px, 86%);
+  margin-top: 10px;
+  display: flex;
+  flex-direction: column;
+  align-items: stretch;
+  gap: 10px;
+}
+
+.about-update-btn {
+  position: relative;
+  appearance: none;
+  border: 1px solid rgba(255, 255, 255, 0.18);
+  background: linear-gradient(180deg, #4a4a4a, #3a3a3a);
+  color: #fff;
+  border-radius: 8px;
+  padding: 8px 14px;
+  font-size: 13px;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.about-update-btn:hover:not(:disabled) {
+  background: linear-gradient(180deg, #555, #404040);
+}
+
+.about-update-btn:disabled {
+  opacity: 0.85;
+  cursor: default;
+}
+
+.about-update-dot {
+  position: absolute;
+  top: 5px;
+  right: 5px;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: #e5484d;
+  box-shadow: 0 0 0 1.5px #3a3a3a;
+}
+
+.about-progress {
+  position: relative;
+  height: 14px;
+  border-radius: 999px;
+  background: rgba(0, 0, 0, 0.35);
+  overflow: hidden;
+  box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.12);
+}
+
+.about-progress-fill {
+  height: 100%;
+  width: 2%;
+  border-radius: inherit;
+  background: linear-gradient(90deg, #7eb8ff, #ffffff);
+  transition: width 0.15s ease-out;
+}
+
+.about-progress-label {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 11px;
+  font-weight: 700;
+  color: #111;
+  text-shadow: 0 0 2px rgba(255, 255, 255, 0.75);
+  pointer-events: none;
+}
+
+.about-copy {
+  margin: 14px 0 0;
+  font-size: 12px;
+  color: #8f8f8f;
+}

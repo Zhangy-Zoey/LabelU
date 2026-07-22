@@ -1,0 +1,31 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta
+      http-equiv="Content-Security-Policy"
+      content="default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: file:;"
+    />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>关于 LabelU Video</title>
+  </head>
+  <body>
+    <div class="about">
+      <img class="about-icon" id="icon" alt="LabelU Video" width="96" height="96" />
+      <h1>LabelU Video</h1>
+      <p class="about-version" id="version">版本 …</p>
+      <div class="about-update">
+        <button type="button" class="about-update-btn" id="updateBtn">
+          <span id="updateBtnLabel">检查更新</span>
+          <span class="about-update-dot" id="updateDot" hidden></span>
+        </button>
+        <div class="about-progress" id="progressWrap" hidden>
+          <div class="about-progress-fill" id="progressFill"></div>
+          <span class="about-progress-label" id="progressLabel">0%</span>
+        </div>
+      </div>
+      <p class="about-copy">Copyright © 2026 labelu</p>
+    </div>
+    <script type="module" src="./src/about.ts"></script>
+  </body>
+</html>

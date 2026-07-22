@@ -12,7 +12,7 @@ import {
   parseClipExportIndex,
   isMeaningfulCrop
 } from '../shared/utils'
-import { exportRootDirFor } from './exportPaths'
+import { exportRootDirFor, resolveClassifyDestDir, type ClassifyDestOptions } from './exportPaths'
 
 function isImageMediaPath(filePath: string): boolean {
   const ext = path.extname(filePath).toLowerCase()
@@ -122,7 +122,6 @@ function pickBinary(name: 'ffmpeg' | 'ffprobe'): string {
 
   for (const c of candidates) {
     if (c && fs.existsSync(c)) {
-      console.log(`[labelu] using ${name}:`, c)
       return c
     }
   }
@@ -143,7 +142,7 @@ function ensureBins(): { ffmpeg: string; ffprobe: string } {
   return { ffmpeg, ffprobe }
 }
 
-export interface ProbeInfo {
+interface ProbeInfo {
   duration: number
   width: number
   height: number
@@ -152,6 +151,21 @@ export interface ProbeInfo {
   rotation: number
   /** 有效帧率，用于时间轴按帧吸附 */
   fps: number
+  /** ffprobe 视频编码名，如 hevc / h264 */
+  videoCodec: string
+  /** Windows Chromium 等环境下需转码预览 */
+  needsPreviewProxy: boolean
+}
+
+/** Chromium 在 Windows 上常无法播 HEVC；统一转成 H.264 预览代理 */
+function codecNeedsPreviewProxy(codecName: string | undefined | null): boolean {
+  if (!codecName) return false
+  const c = codecName.toLowerCase()
+  if (!(c.includes('hevc') || c.includes('h265') || c.includes('hev1') || c.includes('hvc1'))) {
+    return false
+  }
+  // macOS 常有平台 HEVC 解码；Windows 默认走代理
+  return process.platform === 'win32'
 }
 
 function run(
@@ -274,6 +288,7 @@ export async function probeVideo(filePath: string): Promise<ProbeInfo> {
   const rRate = videoStream?.r_frame_rate || '0/0'
   const isVfr = avgRate !== rRate && avgRate !== '0/0' && rRate !== '0/0'
   const fps = parseFrameRate(avgRate !== '0/0' ? avgRate : rRate)
+  const videoCodec = String(videoStream?.codec_name || '').trim()
   const info: ProbeInfo = {
     duration,
     width,
@@ -281,7 +296,9 @@ export async function probeVideo(filePath: string): Promise<ProbeInfo> {
     hasAudio: Boolean(audioStream),
     isVfr,
     rotation,
-    fps
+    fps,
+    videoCodec,
+    needsPreviewProxy: codecNeedsPreviewProxy(videoCodec)
   }
   probeCache.set(cacheKey, { mtime, info })
   return info
@@ -501,25 +518,37 @@ export async function nextExportPath(
   category: string,
   range: { start: number; end: number },
   crop?: CropRect | null,
-  fileExt = '.mp4'
+  fileExt = '.mp4',
+  opts?: ClassifyDestOptions
 ): Promise<string> {
-  // 已在类别目录内时，导出到上一级（与同批源片的类别文件夹并列），避免嵌套
-  const dirPath = exportRootDirFor(sourcePath)
-  const parentDirName = sanitizeName(path.basename(dirPath))
-  const stem = sanitizeName(sourceStemForExport(sourcePath))
-  const categoryDir = path.join(dirPath, sanitizeName(category))
-  const resolvedDir = path.resolve(dirPath)
-  const resolvedCat = path.resolve(categoryDir)
-  const catOk =
-    process.platform === 'win32'
-      ? resolvedCat.toLowerCase() === resolvedDir.toLowerCase() ||
-        resolvedCat.toLowerCase().startsWith(resolvedDir.toLowerCase() + path.sep)
-      : resolvedCat === resolvedDir || resolvedCat.startsWith(resolvedDir + path.sep)
-  if (!catOk) {
-    throw new Error('类别名无效')
+  const cat = sanitizeName(category)
+  if (!cat) throw new Error('类别名无效')
+
+  // 落点与整片归类同一套规则；custom 时直接写入所选最终目录（不套类别名）
+  const categoryDir = resolveClassifyDestDir(sourcePath, cat, opts)
+  const mode = opts?.reclassifyMode ?? 'originalRoot'
+  const customFinal = mode === 'custom'
+
+  if (!customFinal) {
+    const root = path.dirname(categoryDir)
+    const resolvedRoot = path.resolve(root)
+    const resolvedCat = path.resolve(categoryDir)
+    const catOk =
+      process.platform === 'win32'
+        ? resolvedCat.toLowerCase() === resolvedRoot.toLowerCase() ||
+          resolvedCat.toLowerCase().startsWith(resolvedRoot.toLowerCase() + path.sep)
+        : resolvedCat === resolvedRoot || resolvedCat.startsWith(resolvedRoot + path.sep)
+    if (!catOk) {
+      throw new Error('类别名无效')
+    }
   }
+
   fs.mkdirSync(categoryDir, { recursive: true })
 
+  // 文件名前缀仍按「导出根目录名_源文件名」，便于回看匹配
+  const namingRoot = exportRootDirFor(sourcePath)
+  const parentDirName = sanitizeName(path.basename(namingRoot))
+  const stem = sanitizeName(sourceStemForExport(sourcePath))
   const ext = fileExt.startsWith('.') ? fileExt.toLowerCase() : `.${fileExt.toLowerCase()}`
   const prefix = `${parentDirName}_${stem}_`
   let max = 0
@@ -639,4 +668,103 @@ export async function generateThumbnail(videoPath: string): Promise<string> {
     }
     throw err
   }
+}
+
+/**
+ * 为 Chromium 无法直播的编码（主要是 Win 上 HEVC）生成 H.264 预览代理。
+ * 导出仍读原片；仅主预览 / 缩略图播代理。
+ */
+export async function ensurePreviewProxy(
+  sourcePath: string,
+  opts?: { force?: boolean; onProgress?: (msg: string) => void }
+): Promise<{ path: string; proxied: boolean }> {
+  const abs = path.resolve(sourcePath)
+  if (!fs.existsSync(abs)) throw new Error('源视频不存在')
+  if (isImageMediaPath(abs)) return { path: abs, proxied: false }
+
+  const probe = await probeVideo(abs)
+  const need = opts?.force || probe.needsPreviewProxy
+  if (!need) return { path: abs, proxied: false }
+
+  const cacheDir = path.join(app.getPath('userData'), 'preview-proxy')
+  fs.mkdirSync(cacheDir, { recursive: true })
+  let mtime = 0
+  try {
+    mtime = fs.statSync(abs).mtimeMs
+  } catch {
+    throw new Error('源视频不存在')
+  }
+  const cacheKey =
+    process.platform === 'win32' ? abs.toLowerCase() : abs
+  const hash = crypto.createHash('md5').update(`${cacheKey}|${mtime}|v1`).digest('hex')
+  const out = path.join(cacheDir, `${hash}.mp4`)
+  if (opts?.force) {
+    try {
+      if (fs.existsSync(out)) fs.unlinkSync(out)
+    } catch {
+      /* ignore */
+    }
+  } else if (fs.existsSync(out) && fs.statSync(out).size > 1024) {
+    return { path: out, proxied: true }
+  }
+
+  opts?.onProgress?.('正在生成兼容预览（HEVC→H.264）…')
+  const { ffmpeg: bin } = ensureBins()
+  const tmp = `${out}.part`
+  try {
+    if (fs.existsSync(tmp)) fs.unlinkSync(tmp)
+  } catch {
+    /* ignore */
+  }
+
+  // 预览用：限宽 1280、veryfast，体积/耗时可控
+  const args = [
+    '-hide_banner',
+    '-loglevel',
+    'error',
+    '-y',
+    '-i',
+    abs,
+    '-map',
+    '0:v:0',
+    '-map',
+    '0:a?',
+    '-vf',
+    "scale='min(1280,iw)':-2",
+    '-c:v',
+    'libx264',
+    '-preset',
+    'veryfast',
+    '-crf',
+    '23',
+    '-pix_fmt',
+    'yuv420p',
+    '-c:a',
+    'aac',
+    '-b:a',
+    '128k',
+    '-movflags',
+    '+faststart',
+    tmp
+  ]
+  const { code, stderr } = await run(bin, args, undefined, 1_800_000)
+  if (code !== 0 || !fs.existsSync(tmp) || fs.statSync(tmp).size < 1024) {
+    try {
+      if (fs.existsSync(tmp)) fs.unlinkSync(tmp)
+    } catch {
+      /* ignore */
+    }
+    throw new Error(stderr.slice(-500) || '兼容预览生成失败')
+  }
+  try {
+    fs.renameSync(tmp, out)
+  } catch {
+    fs.copyFileSync(tmp, out)
+    try {
+      fs.unlinkSync(tmp)
+    } catch {
+      /* ignore */
+    }
+  }
+  return { path: out, proxied: true }
 }

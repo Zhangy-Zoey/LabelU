@@ -41,7 +41,11 @@ const api: LabeluApi = {
   cancelBusyWork: () => ipcRenderer.invoke('cancel-busy-work'),
   downloadUpdate: () => ipcRenderer.invoke('download-update'),
   installUpdate: () => ipcRenderer.invoke('install-update'),
+  checkForUpdates: () => ipcRenderer.invoke('check-for-updates'),
+  openAbout: (opts) => ipcRenderer.invoke('open-about', opts ?? {}),
   getMediaUrl: (filePath) => ipcRenderer.invoke('get-media-url', filePath),
+  ensurePreviewProxy: (filePath, force, quiet) =>
+    ipcRenderer.invoke('ensure-preview-proxy', filePath, Boolean(force), Boolean(quiet)),
   getThumbnail: (filePath) => ipcRenderer.invoke('get-thumbnail', filePath),
   confirmQuit: (shouldQuit) => ipcRenderer.invoke('confirm-quit', shouldQuit),
   getPathForFile: (file: File) => webUtils.getPathForFile(file),
@@ -72,9 +76,18 @@ const api: LabeluApi = {
       cb(String(message || ''))
     ipcRenderer.on('update-error', listener)
     return () => ipcRenderer.removeListener('update-error', listener)
+  },
+  onUpdateDownloadProgress: (cb) => {
+    const listener = (_: Electron.IpcRendererEvent, percent: number): void =>
+      cb(Number(percent) || 0)
+    ipcRenderer.on('update-download-progress', listener)
+    return () => ipcRenderer.removeListener('update-download-progress', listener)
+  },
+  onAboutAutoUpdate: (cb) => {
+    const listener = (): void => cb()
+    ipcRenderer.on('about-auto-update', listener)
+    return () => ipcRenderer.removeListener('about-auto-update', listener)
   }
 }
 
 contextBridge.exposeInMainWorld('api', api)
-
-export type { LabeluApi }

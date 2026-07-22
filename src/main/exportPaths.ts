@@ -19,16 +19,19 @@ export function isInCategoryFolder(sourcePath: string): boolean {
   return isPresetCategory(parent)
 }
 
-export type ReclassifyDestMode = 'originalRoot' | 'underCurrent' | 'custom'
+export type ReclassifyDestMode = 'originalRoot' | 'underCurrent' | 'custom' | 'customRoot'
 
 export type ClassifyDestOptions = {
-  /** 二次分类落点；仅当源已在类别目录内时生效，默认 originalRoot */
+  /** 二次分类落点；默认 originalRoot。customRoot：指定类别文件夹的源目录 */
   reclassifyMode?: ReclassifyDestMode
-  /** custom：最终目录（不再套一层类别名） */
+  /**
+   * custom：最终目录（不再套一层类别名）
+   * customRoot：类别文件夹的源目录，实际写入 {customDestDir}/{category}/
+   */
   customDestDir?: string
 }
 
-/** 解析整片归类目标目录 */
+/** 解析整片归类 / 片段导出目标目录 */
 export function resolveClassifyDestDir(
   sourcePath: string,
   category: string,
@@ -39,18 +42,24 @@ export function resolveClassifyDestDir(
   const cat = category.trim()
   if (!cat) throw new Error('类别名无效')
 
-  if (!isInCategoryFolder(sourcePath)) {
-    return path.join(parentDir, cat)
-  }
-
   const mode = opts?.reclassifyMode ?? 'originalRoot'
-  if (mode === 'underCurrent') {
-    return path.join(parentDir, cat)
-  }
   if (mode === 'custom') {
     const dest = String(opts?.customDestDir || '').trim()
     if (!dest) throw new Error('请选择目标文件夹')
     return path.resolve(dest)
+  }
+  if (mode === 'customRoot') {
+    const root = String(opts?.customDestDir || '').trim()
+    if (!root) throw new Error('请选择目标文件夹')
+    return path.join(path.resolve(root), cat)
+  }
+
+  if (!isInCategoryFolder(sourcePath)) {
+    return path.join(parentDir, cat)
+  }
+
+  if (mode === 'underCurrent') {
+    return path.join(parentDir, cat)
   }
   return path.join(exportRootDirFor(sourcePath), cat)
 }

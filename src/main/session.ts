@@ -15,16 +15,23 @@ import {
 import { isPresetCategory } from '../shared/categories'
 import {
   exportRootDirFor,
-  isInCategoryFolder,
   resolveClassifyDestDir,
   type ClassifyDestOptions
 } from './exportPaths'
 
 const SESSION_DIR = (): string => path.join(app.getPath('userData'), 'sessions')
+/** 完成并清工作区会话后仍保留：自定义源目录等导出路径的回看索引 */
+const EXPORT_CATALOG_DIR = (): string => path.join(app.getPath('userData'), 'export-catalog')
 
-export type { ReclassifyDestMode, ClassifyDestOptions } from './exportPaths'
+export type { ClassifyDestOptions } from './exportPaths'
 
-export function sessionFileFor(sourcePath: string): string {
+function sessionKeySource(sourcePath: string): string {
+  // 去掉 `_done`，完成重命名后仍命中同一目录索引 / 会话迁移键
+  const resolved = path.resolve(withoutCompletedFileName(sourcePath))
+  return process.platform === 'win32' ? resolved.toLowerCase() : resolved
+}
+
+function sessionFileFor(sourcePath: string): string {
   // 统一 path.resolve，避免相对/绝对路径生成不同会话键；
   // Windows 路径大小写不敏感：再统一小写，避免对话框与拖放大小写不一致导致会话丢失
   const resolved = path.resolve(sourcePath)
@@ -40,18 +47,120 @@ function legacySessionFileFor(sourcePath: string): string {
 }
 
 /** 旧版旁路路径（仅读取兼容，新流程不再写入） */
-export function sidecarPath(sourcePath: string): string {
+function sidecarPath(sourcePath: string): string {
   return sourcePath + '.labelu.json'
 }
 
-export function ensureSessionDir(): void {
+function ensureSessionDir(): void {
   fs.mkdirSync(SESSION_DIR(), { recursive: true })
+}
+
+function exportCatalogFileFor(sourcePath: string): string {
+  const key = Buffer.from(sessionKeySource(sourcePath)).toString('base64url')
+  return path.join(EXPORT_CATALOG_DIR(), `${key}.json`)
+}
+
+type ExportCatalog = {
+  version: 1
+  sourceKey: string
+  updatedAt: string
+  exports: ExportRecord[]
+}
+
+export function saveExportCatalog(sourcePath: string, exports: ExportRecord[]): void {
+  const precise = (exports || []).filter((e) => e?.path && e.end > e.start && !e.approx)
+  const file = exportCatalogFileFor(sourcePath)
+  try {
+    if (precise.length === 0) {
+      if (fs.existsSync(file)) fs.unlinkSync(file)
+      return
+    }
+    fs.mkdirSync(EXPORT_CATALOG_DIR(), { recursive: true })
+    const catalog: ExportCatalog = {
+      version: 1,
+      sourceKey: sessionKeySource(sourcePath),
+      updatedAt: new Date().toISOString(),
+      exports: precise.map((e) => ({
+        path: path.resolve(e.path),
+        start: e.start,
+        end: e.end,
+        category: e.category,
+        crop: e.crop ?? null
+      }))
+    }
+    fs.writeFileSync(file, JSON.stringify(catalog, null, 2), 'utf8')
+  } catch {
+    /* ignore */
+  }
+}
+
+function loadExportCatalog(sourcePath: string): ExportRecord[] {
+  const file = exportCatalogFileFor(sourcePath)
+  if (!fs.existsSync(file)) return []
+  try {
+    const raw = JSON.parse(fs.readFileSync(file, 'utf8')) as ExportCatalog
+    const list = Array.isArray(raw?.exports) ? raw.exports : []
+    return list
+      .filter((e) => e?.path && Number(e.end) > Number(e.start))
+      .map((e) => ({
+        path: path.resolve(String(e.path)),
+        start: Number(e.start),
+        end: Number(e.end),
+        category: String(e.category || '').trim() || '未命名',
+        crop: e.crop ?? null
+      }))
+      .filter((e) => {
+        try {
+          return fs.existsSync(e.path)
+        } catch {
+          return false
+        }
+      })
+  } catch {
+    return []
+  }
+}
+
+export function clearExportCatalog(sourcePath: string): void {
+  const file = exportCatalogFileFor(sourcePath)
+  try {
+    if (fs.existsSync(file)) fs.unlinkSync(file)
+  } catch {
+    /* ignore */
+  }
+}
+
+/** 启动白名单：所有导出目录索引中的路径 */
+export function listAllExportCatalogPaths(): string[] {
+  const dir = EXPORT_CATALOG_DIR()
+  if (!fs.existsSync(dir)) return []
+  const out: string[] = []
+  try {
+    for (const name of fs.readdirSync(dir)) {
+      if (!name.endsWith('.json')) continue
+      try {
+        const raw = JSON.parse(
+          fs.readFileSync(path.join(dir, name), 'utf8')
+        ) as ExportCatalog
+        for (const e of raw.exports || []) {
+          if (e?.path) out.push(path.resolve(String(e.path)))
+        }
+      } catch {
+        /* skip */
+      }
+    }
+  } catch {
+    /* ignore */
+  }
+  return out
 }
 
 export function saveSession(state: SessionState): void {
   ensureSessionDir()
   state.updatedAt = new Date().toISOString()
   fs.writeFileSync(sessionFileFor(state.sourcePath), JSON.stringify(state, null, 2), 'utf8')
+  // 同步持久化导出索引，完成清会话后仍可回看（含 customRoot）
+  saveExportCatalog(state.sourcePath, state.exports || [])
 }
 
 type SidecarExport = {
@@ -94,7 +203,7 @@ export function clipSidecarPath(exportFilePath: string): string {
 }
 
 /** @deprecated 新导出把时段写进文件名；仅用于读取旧版旁路 */
-export function loadClipSidecar(exportFilePath: string): ClipSidecarFile | null {
+function loadClipSidecar(exportFilePath: string): ClipSidecarFile | null {
   const file = clipSidecarPath(exportFilePath)
   if (!fs.existsSync(file)) return null
   try {
@@ -107,7 +216,7 @@ export function loadClipSidecar(exportFilePath: string): ClipSidecarFile | null 
 }
 
 /** 优先从文件名解析时段/类别，其次读旧版 .labelu-clip.json */
-export function resolveClipTiming(
+function resolveClipTiming(
   exportFilePath: string
 ): { start: number; end: number; category?: string; crop?: CropRect | null } | null {
   const fromName = parseClipExportMeta(exportFilePath)
@@ -190,7 +299,7 @@ function placeApproxExports(
  * 从旁路 JSON + 导出文件名时段（或旧版 .labelu-clip.json）+ 类别目录文件，重建完整分类会话。
  * 无时间记录的历史文件会标 approx 并放入剩余空隙，避免「磁盘有片、轴上看不见」。
  */
-export async function loadSidecarSession(sourcePath: string): Promise<SessionState | null> {
+async function loadSidecarSession(sourcePath: string): Promise<SessionState | null> {
   const dir = path.dirname(sourcePath)
   const byPath = new Map<string, ExportRecord>()
 
@@ -206,6 +315,13 @@ export async function loadSidecarSession(sourcePath: string): Promise<SessionSta
       category: String(item.category || '').trim() || '未命名',
       crop: item.crop ?? null
     })
+  }
+
+  // 导出目录索引（含源树外的 customRoot 落点）
+  for (const e of loadExportCatalog(sourcePath)) {
+    const key = path.resolve(e.path)
+    if (byPath.has(key)) continue
+    byPath.set(key, e)
   }
 
   const diskFiles = listCategoryExportFiles(sourcePath)
@@ -353,6 +469,7 @@ export async function removeFromWorkspace(
 ): Promise<void> {
   clearSession(sourcePath)
   clearSidecar(sourcePath)
+  clearExportCatalog(sourcePath)
   const cleared = await clearCompletedFlag(sourcePath)
   if (!deleteSourceFile) return
   const toDelete = fs.existsSync(cleared) ? cleared : sourcePath
@@ -378,6 +495,7 @@ export function discardSession(state: SessionState, deleteExports: boolean): voi
         /* ignore */
       }
     }
+    clearExportCatalog(state.sourcePath)
   }
   clearSession(state.sourcePath)
   clearSidecar(state.sourcePath)
@@ -390,7 +508,7 @@ export function pushUndo(stack: UndoEntry[], entry: UndoEntry, max = 20): UndoEn
 }
 
 /** 旧版旁路完成标记（仅兼容读取/清理，不再新建） */
-export function completedFlagPath(sourcePath: string): string {
+function completedFlagPath(sourcePath: string): string {
   return sourcePath + '.labelu.done'
 }
 
@@ -436,7 +554,7 @@ export function isCompleted(sourcePath: string): boolean {
   }
 }
 
-export function hasSidecarRecord(sourcePath: string): boolean {
+function hasSidecarRecord(sourcePath: string): boolean {
   try {
     return fs.existsSync(sidecarPath(sourcePath))
   } catch {
@@ -504,13 +622,22 @@ export function listCategoryDirectories(sourceDir: string): string[] {
   return loadCategoryListsForDir(dir).map(({ cat }) => path.join(dir, cat))
 }
 
-/** 在源目录的类别子文件夹中，查找属于该源视频的导出片段 */
+/** 在源目录的类别子文件夹 + 导出目录索引中，查找属于该源视频的导出片段 */
 export function listCategoryExportFiles(sourcePath: string): string[] {
   const dir = exportRootDirFor(sourcePath)
   const parentDirName = sanitizeName(path.basename(dir))
   const stem = sanitizeName(sourceStemForExport(sourcePath))
   const prefix = `${parentDirName}_${stem}_`
   const out: string[] = []
+  const seen = new Set<string>()
+
+  const add = (abs: string): void => {
+    const key =
+      process.platform === 'win32' ? path.resolve(abs).toLowerCase() : path.resolve(abs)
+    if (seen.has(key)) return
+    seen.add(key)
+    out.push(path.resolve(abs))
+  }
 
   const catLists = loadCategoryListsForDir(dir)
   for (const { cat, files } of catLists) {
@@ -519,8 +646,13 @@ export function listCategoryExportFiles(sourcePath: string): string[] {
       if (!f.startsWith(prefix)) continue
       const ext = path.extname(f).toLowerCase()
       if (!(MEDIA_EXTENSIONS as readonly string[]).includes(ext)) continue
-      out.push(path.join(catDir, f))
+      add(path.join(catDir, f))
     }
+  }
+
+  // customRoot 等落在源树外的导出：完成清会话后仍靠索引回看
+  for (const e of loadExportCatalog(sourcePath)) {
+    add(e.path)
   }
   return out
 }
@@ -548,7 +680,7 @@ export async function clearCompletedFlag(sourcePath: string): Promise<string> {
   }
 }
 
-export type ClassifyResult = {
+type ClassifyResult = {
   /** 实际用于移动的源路径（可能已去掉 `_done`） */
   sourcePath: string
   exportPath: string
@@ -568,7 +700,8 @@ function sleepMs(ms: number): Promise<void> {
 /** Windows 上文件仍被播放器占用时 rename 常 EBUSY，短重试 */
 async function renameWithRetry(src: string, dest: string): Promise<void> {
   let lastErr: unknown
-  for (let i = 0; i < 12; i++) {
+  const attempts = process.platform === 'win32' ? 24 : 12
+  for (let i = 0; i < attempts; i++) {
     try {
       fs.renameSync(src, dest)
       return
@@ -586,7 +719,7 @@ async function renameWithRetry(src: string, dest: string): Promise<void> {
 }
 
 /** 异步流式复制（避免大文件卡死主线程），并校验大小 */
-export async function copyFileVerified(src: string, dest: string): Promise<void> {
+async function copyFileVerified(src: string, dest: string): Promise<void> {
   await new Promise<void>((resolve, reject) => {
     const rs = fs.createReadStream(src)
     const ws = fs.createWriteStream(dest)
@@ -731,7 +864,7 @@ export async function classifyWholeFileAsync(
 
   const categoryDir = resolveClassifyDestDir(sourcePath, cat, opts)
   const mode = opts?.reclassifyMode ?? 'originalRoot'
-  const customFinal = isInCategoryFolder(sourcePath) && mode === 'custom'
+  const customFinal = mode === 'custom'
 
   if (!customFinal) {
     const root = path.dirname(categoryDir)

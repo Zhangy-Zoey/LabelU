@@ -1,6 +1,6 @@
 {
   "name": "labelu-video",
-  "version": "1.0.1",
+  "version": "1.0.2",
   "description": "视频裁剪打标桌面应用",
   "main": "out/main/index.js",
   "author": "labelu",
