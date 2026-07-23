@@ -18,6 +18,7 @@ import {
   resolveClassifyDestDir,
   type ClassifyDestOptions
 } from './exportPaths'
+import { probeVideo } from './ffmpeg'
 
 const SESSION_DIR = (): string => path.join(app.getPath('userData'), 'sessions')
 /** 完成并清工作区会话后仍保留：自定义源目录等导出路径的回看索引 */
@@ -345,7 +346,6 @@ async function loadSidecarSession(sourcePath: string): Promise<SessionState | nu
   const orphans: { path: string; category: string; clipDur: number }[] = []
 
   if (orphanPaths.length > 0) {
-    const { probeVideo } = await import('./ffmpeg')
     for (const abs of orphanPaths) {
       try {
         const p = await probeVideo(abs)
@@ -374,7 +374,6 @@ async function loadSidecarSession(sourcePath: string): Promise<SessionState | nu
 
   if (!(duration > 0) && (known.length || orphans.length)) {
     try {
-      const { probeVideo } = await import('./ffmpeg')
       const p = await probeVideo(sourcePath)
       if (p.duration > 0) duration = p.duration
     } catch {

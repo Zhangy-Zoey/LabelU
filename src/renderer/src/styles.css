@@ -404,6 +404,18 @@ body.resizing-panes * {
   padding: 12px;
   /* 避免 Ctrl+滚轮时浏览器整页缩放 */
   overscroll-behavior: contain;
+  position: relative;
+  user-select: none;
+}
+
+.thumb-marquee {
+  position: fixed;
+  z-index: 80;
+  pointer-events: none;
+  box-sizing: border-box;
+  border: 1px solid rgba(31, 122, 168, 0.85);
+  background: rgba(31, 122, 168, 0.18);
+  border-radius: 2px;
 }
 
 .thumb-virtual {
@@ -453,6 +465,18 @@ body.resizing-panes * {
   box-shadow: 0 0 0 2px rgba(125, 158, 132, 0.55);
 }
 
+.video-thumb.secondary-picked {
+  border-color: #c47a2c;
+  box-shadow: 0 0 0 2px rgba(196, 122, 44, 0.65);
+}
+
+.video-thumb.selected.secondary-picked {
+  border-color: #c47a2c;
+  box-shadow:
+    0 0 0 2px rgba(196, 122, 44, 0.7),
+    inset 0 0 0 2px rgba(61, 143, 90, 0.45);
+}
+
 .video-thumb.selected.active {
   border-width: 3px;
   border-color: #1f7aa8;
@@ -461,12 +485,30 @@ body.resizing-panes * {
     inset 0 0 0 2px rgba(61, 143, 90, 0.55);
 }
 
+.video-thumb.secondary-picked.active {
+  border-width: 3px;
+  border-color: #1f7aa8;
+  box-shadow:
+    0 0 0 3px rgba(31, 122, 168, 0.65),
+    inset 0 0 0 2px rgba(196, 122, 44, 0.65);
+}
+
 .video-thumb.completed {
   opacity: 0.55;
 }
 
 .video-thumb.previewing {
   opacity: 1;
+}
+
+.video-thumb.previewing.selected {
+  border-color: var(--success);
+  box-shadow: 0 0 0 2px rgba(125, 158, 132, 0.7);
+}
+
+.video-thumb.previewing,
+.video-thumb.previewing .thumb-media {
+  cursor: pointer;
 }
 
 .thumb-media {
@@ -478,8 +520,7 @@ body.resizing-panes * {
   overflow: hidden;
 }
 
-.thumb-media img,
-.thumb-preview-video {
+.thumb-media img {
   width: 100%;
   height: 100%;
   object-fit: cover;
@@ -488,7 +529,12 @@ body.resizing-panes * {
 }
 
 .thumb-preview-video {
-  pointer-events: auto;
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
+  display: block;
+  /* 点击/拖选交给卡片与网格，避免 video 吃掉事件 */
+  pointer-events: none;
   background: #1a1816;
 }
 
@@ -638,6 +684,39 @@ body.resizing-panes * {
   right: auto;
   background: #1f7aa8;
   box-shadow: 0 0 0 1px rgba(255, 255, 255, 0.65);
+}
+
+.thumb-badge.pick {
+  left: 6px;
+  right: auto;
+  background: rgba(0, 0, 0, 0.55);
+  color: #fff;
+  font-weight: 600;
+}
+
+.thumb-badge.pick.on {
+  background: #c47a2c;
+}
+
+.video-thumb.selected .thumb-badge.pick {
+  background: rgba(0, 0, 0, 0.55);
+}
+
+.video-thumb.secondary-picked .thumb-badge.pick,
+.video-thumb.secondary-picked .thumb-badge.pick.on {
+  background: #c47a2c;
+}
+
+.video-thumb.previewing.active .thumb-badge.pick,
+.video-thumb.selected.active .thumb-badge.pick,
+.video-thumb.secondary-picked.active .thumb-badge.pick {
+  top: 28px;
+}
+
+.app-header-actions button.active-toggle {
+  background: var(--accent-soft);
+  color: #000;
+  border-color: rgba(142, 182, 200, 0.5);
 }
 
 .thumb-caption {
@@ -2343,6 +2422,11 @@ button.linkish {
   color: #1a1a1a;
   text-shadow: 0 0 2px rgba(255, 255, 255, 0.8);
   pointer-events: none;
+}
+
+.modal-update .update-progress-modal {
+  width: 100%;
+  margin: 4px 0 8px;
 }
 
 .busy-cancel-btn {

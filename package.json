@@ -1,6 +1,6 @@
 {
   "name": "labelu-video",
-  "version": "1.0.2",
+  "version": "1.0.3",
   "description": "视频裁剪打标桌面应用",
   "main": "out/main/index.js",
   "author": "labelu",
@@ -17,7 +17,7 @@
     "dist": "npm run dist:mac",
     "dist:mac": "npm run check:whats-new && npm run prepare:bin:mac && ELECTRON_MIRROR=https://npmmirror.com/mirrors/electron/ ELECTRON_BUILDER_BINARIES_MIRROR=https://npmmirror.com/mirrors/electron-builder-binaries/ npm run build && CSC_IDENTITY_AUTO_DISCOVERY=false ELECTRON_MIRROR=https://npmmirror.com/mirrors/electron/ ELECTRON_BUILDER_BINARIES_MIRROR=https://npmmirror.com/mirrors/electron-builder-binaries/ electron-builder --mac --arm64",
     "dist:win": "npm run check:whats-new && npm run prepare:bin:win && ELECTRON_MIRROR=https://npmmirror.com/mirrors/electron/ ELECTRON_BUILDER_BINARIES_MIRROR=https://npmmirror.com/mirrors/electron-builder-binaries/ npm run build && ELECTRON_MIRROR=https://npmmirror.com/mirrors/electron/ ELECTRON_BUILDER_BINARIES_MIRROR=https://npmmirror.com/mirrors/electron-builder-binaries/ electron-builder --win --x64",
-    "release": "echo \"请分别在 Windows / macOS 上执行 release:win 与 release:mac（同 version），用户端只会下载本平台安装包\"",
+    "release": "echo \"同 version 下可在本机执行 release:mac 与 release:win（Mac 可交叉打 Windows NSIS）；用户端只会下载本平台安装包\"",
     "release:win": "npm run check:whats-new && npm run prepare:bin:win && ELECTRON_MIRROR=https://npmmirror.com/mirrors/electron/ ELECTRON_BUILDER_BINARIES_MIRROR=https://npmmirror.com/mirrors/electron-builder-binaries/ npm run build && ELECTRON_MIRROR=https://npmmirror.com/mirrors/electron/ ELECTRON_BUILDER_BINARIES_MIRROR=https://npmmirror.com/mirrors/electron-builder-binaries/ electron-builder --win --x64 --publish always",
     "release:mac": "npm run check:whats-new && npm run prepare:bin:mac && ELECTRON_MIRROR=https://npmmirror.com/mirrors/electron/ ELECTRON_BUILDER_BINARIES_MIRROR=https://npmmirror.com/mirrors/electron-builder-binaries/ npm run build && CSC_IDENTITY_AUTO_DISCOVERY=false ELECTRON_MIRROR=https://npmmirror.com/mirrors/electron/ ELECTRON_BUILDER_BINARIES_MIRROR=https://npmmirror.com/mirrors/electron-builder-binaries/ electron-builder --mac --arm64 --publish always"
   },

@@ -19,23 +19,40 @@ function isImageMediaPath(filePath: string): boolean {
   return (IMAGE_EXTENSIONS as readonly string[]).includes(ext)
 }
 
-/** 当前 ffmpeg/ffprobe 子进程，供取消时强杀 */
-let activeChild: ChildProcess | null = null
+/** 当前 ffmpeg/ffprobe 子进程集合，供取消时整树强杀 */
+const activeChildren = new Set<ChildProcess>()
 let cancelChecker: (() => boolean) | null = null
 
 export function setFfmpegCancelChecker(fn: (() => boolean) | null): void {
   cancelChecker = fn
 }
 
-export function killActiveFfmpeg(): void {
-  const child = activeChild
-  activeChild = null
-  if (!child) return
+/** Windows 上 kill() 不一定带走子进程树，用 taskkill /T */
+function killChildTree(child: ChildProcess): void {
+  const pid = child.pid
+  if (process.platform === 'win32' && pid) {
+    try {
+      spawn('taskkill', ['/pid', String(pid), '/T', '/F'], {
+        windowsHide: true,
+        stdio: 'ignore'
+      })
+      return
+    } catch {
+      /* fall through */
+    }
+  }
   try {
     child.kill('SIGKILL')
   } catch {
     /* ignore */
   }
+}
+
+export function killActiveFfmpeg(): void {
+  const list: ChildProcess[] = []
+  activeChildren.forEach((c) => list.push(c))
+  activeChildren.clear()
+  for (const child of list) killChildTree(child)
 }
 
 export function toMediaUrl(filePath: string): string {
@@ -157,18 +174,62 @@ interface ProbeInfo {
   needsPreviewProxy: boolean
 }
 
-/** Chromium 在 Windows 上常无法播 HEVC；统一转成 H.264 预览代理 */
+/**
+ * Chromium 对 HEVC 支持因平台而异：
+ * - Windows：几乎总要 H.264 代理
+ * - macOS：优先系统解码；播失败时由调用方 force 再生成代理
+ */
 function codecNeedsPreviewProxy(codecName: string | undefined | null): boolean {
   if (!codecName) return false
   const c = codecName.toLowerCase()
   if (!(c.includes('hevc') || c.includes('h265') || c.includes('hev1') || c.includes('hvc1'))) {
     return false
   }
-  // macOS 常有平台 HEVC 解码；Windows 默认走代理
   return process.platform === 'win32'
 }
 
-function run(
+/**
+ * 有限并发：Win 多路 HEVC 代理可并行（默认 2），又避免无限 spawn。
+ * activeChildren 跟踪全部子进程，取消时可整树杀掉。
+ */
+const FFMPEG_MAX_CONCURRENT = process.platform === 'win32' ? 2 : 2
+let ffmpegInFlight = 0
+const ffmpegWaiters: Array<() => void> = []
+
+function acquireFfmpegSlot(): Promise<void> {
+  if (ffmpegInFlight < FFMPEG_MAX_CONCURRENT) {
+    ffmpegInFlight++
+    return Promise.resolve()
+  }
+  return new Promise((resolve) => {
+    ffmpegWaiters.push(() => {
+      ffmpegInFlight++
+      resolve()
+    })
+  })
+}
+
+function releaseFfmpegSlot(): void {
+  ffmpegInFlight = Math.max(0, ffmpegInFlight - 1)
+  const next = ffmpegWaiters.shift()
+  if (next) next()
+}
+
+async function run(
+  bin: string,
+  args: string[],
+  onProgress?: (line: string) => void,
+  timeoutMs = 600_000
+): Promise<{ code: number; stdout: string; stderr: string }> {
+  await acquireFfmpegSlot()
+  try {
+    return await runOnce(bin, args, onProgress, timeoutMs)
+  } finally {
+    releaseFfmpegSlot()
+  }
+}
+
+function runOnce(
   bin: string,
   args: string[],
   onProgress?: (line: string) => void,
@@ -183,27 +244,17 @@ function run(
       windowsHide: true,
       stdio: ['ignore', 'pipe', 'pipe']
     })
-    activeChild = child
+    activeChildren.add(child)
     let stdout = ''
     let stderr = ''
     let settled = false
     const timer = setTimeout(() => {
-      try {
-        child.kill('SIGKILL')
-      } catch {
-        /* ignore */
-      }
+      killChildTree(child)
       finish(() => reject(new Error(`FFmpeg 超时（>${Math.round(timeoutMs / 1000)}s）: ${bin}`)))
     }, timeoutMs)
 
     const cancelPoll = setInterval(() => {
-      if (cancelChecker?.()) {
-        try {
-          child.kill('SIGKILL')
-        } catch {
-          /* ignore */
-        }
-      }
+      if (cancelChecker?.()) killChildTree(child)
     }, 200)
 
     const finish = (fn: () => void): void => {
@@ -211,7 +262,7 @@ function run(
       settled = true
       clearTimeout(timer)
       clearInterval(cancelPoll)
-      if (activeChild === child) activeChild = null
+      activeChildren.delete(child)
       fn()
     }
 
@@ -635,44 +686,60 @@ export async function generateThumbnail(videoPath: string): Promise<string> {
   }
 
   const { ffmpeg: bin } = ensureBins()
-  const tmp = `${out}.tmp.jpg`
+  // 保持 .jpg 扩展名，避免 Windows 上 FFmpeg 无法识别封装
+  const tmp = path.join(cacheDir, `${hash}.tmp.jpg`)
   const isImage = isImageMediaPath(videoPath)
+  const scale = "scale='min(480,iw)':-2"
+  /** 多组参数：HEVC/损坏时间戳在 Win 上对 -ss 位置敏感 */
+  const attemptArgs: string[][] = isImage
+    ? [['-y', '-i', videoPath, '-frames:v', '1', '-q:v', '5', '-vf', scale, '-f', 'image2', tmp]]
+    : [
+        ['-y', '-ss', '0.5', '-i', videoPath, '-frames:v', '1', '-an', '-q:v', '5', '-vf', scale, '-f', 'image2', tmp],
+        ['-y', '-i', videoPath, '-ss', '0', '-frames:v', '1', '-an', '-q:v', '5', '-vf', scale, '-f', 'image2', tmp],
+        ['-y', '-ss', '0', '-i', videoPath, '-frames:v', '1', '-an', '-q:v', '5', '-vf', scale, '-f', 'image2', tmp]
+      ]
+
+  let lastErr = ''
   try {
-    const args = isImage
-      ? ['-y', '-i', videoPath, '-frames:v', '1', '-q:v', '5', '-vf', 'scale=480:-1', tmp]
-      : [
-          '-y',
-          '-ss',
-          '0.5',
-          '-i',
-          videoPath,
-          '-frames:v',
-          '1',
-          '-q:v',
-          '5',
-          '-vf',
-          'scale=480:-1',
-          tmp
-        ]
-    const result = await run(bin, args, undefined, 45_000)
-    if (result.code !== 0 || !fs.existsSync(tmp) || fs.statSync(tmp).size < 100) {
-      throw new Error(result.stderr.slice(-400) || '缩略图生成失败')
+    if (fs.existsSync(tmp)) fs.unlinkSync(tmp)
+  } catch {
+    /* ignore */
+  }
+
+  for (const args of attemptArgs) {
+    try {
+      const result = await run(bin, args, undefined, 60_000)
+      if (result.code === 0 && fs.existsSync(tmp) && fs.statSync(tmp).size >= 100) {
+        try {
+          fs.renameSync(tmp, out)
+        } catch {
+          fs.copyFileSync(tmp, out)
+          try {
+            fs.unlinkSync(tmp)
+          } catch {
+            /* ignore */
+          }
+        }
+        return toMediaUrl(out)
+      }
+      lastErr = result.stderr.slice(-400) || `code=${result.code}`
+    } catch (err) {
+      lastErr = err instanceof Error ? err.message : String(err)
     }
-    fs.renameSync(tmp, out)
-    return toMediaUrl(out)
-  } catch (err) {
     try {
       if (fs.existsSync(tmp)) fs.unlinkSync(tmp)
     } catch {
       /* ignore */
     }
-    throw err
   }
+  throw new Error(lastErr || '缩略图生成失败')
 }
 
+const previewProxyInFlight = new Map<string, Promise<{ path: string; proxied: boolean }>>()
+
 /**
- * 为 Chromium 无法直播的编码（主要是 Win 上 HEVC）生成 H.264 预览代理。
- * 导出仍读原片；仅主预览 / 缩略图播代理。
+ * 为 Chromium 难以直出的编码生成 H.264 预览代理。
+ * Windows 对 HEVC 默认需要；macOS 优先原片，force 时仍可生成（播失败回退）。
  */
 export async function ensurePreviewProxy(
   sourcePath: string,
@@ -696,8 +763,32 @@ export async function ensurePreviewProxy(
   }
   const cacheKey =
     process.platform === 'win32' ? abs.toLowerCase() : abs
-  const hash = crypto.createHash('md5').update(`${cacheKey}|${mtime}|v1`).digest('hex')
+  // v3：临时文件必须为 *.part.mp4（勿用 *.mp4.part，Windows FFmpeg 无法识别 muxer）
+  const hash = crypto.createHash('md5').update(`${cacheKey}|${mtime}|v3`).digest('hex')
   const out = path.join(cacheDir, `${hash}.mp4`)
+  const flightKey = `${cacheKey}|${mtime}|v3|${opts?.force ? '1' : '0'}`
+
+  if (!opts?.force && fs.existsSync(out) && fs.statSync(out).size > 1024) {
+    return { path: out, proxied: true }
+  }
+
+  const existing = previewProxyInFlight.get(flightKey)
+  if (existing) return existing
+
+  const job = buildPreviewProxy(abs, out, opts)
+  previewProxyInFlight.set(flightKey, job)
+  try {
+    return await job
+  } finally {
+    previewProxyInFlight.delete(flightKey)
+  }
+}
+
+async function buildPreviewProxy(
+  abs: string,
+  out: string,
+  opts?: { force?: boolean; onProgress?: (msg: string) => void }
+): Promise<{ path: string; proxied: boolean }> {
   if (opts?.force) {
     try {
       if (fs.existsSync(out)) fs.unlinkSync(out)
@@ -710,44 +801,60 @@ export async function ensurePreviewProxy(
 
   opts?.onProgress?.('正在生成兼容预览（HEVC→H.264）…')
   const { ffmpeg: bin } = ensureBins()
-  const tmp = `${out}.part`
-  try {
-    if (fs.existsSync(tmp)) fs.unlinkSync(tmp)
-  } catch {
-    /* ignore */
+  // 扩展名必须以 .mp4 结尾；`.mp4.part` 在 Windows 上会报 Invalid argument / muxer 初始化失败
+  const stem = path.basename(out, '.mp4')
+  const tmp = path.join(path.dirname(out), `${stem}.part.mp4`)
+  const legacyTmp = path.join(path.dirname(out), `${stem}.mp4.part`)
+  for (const p of [tmp, legacyTmp]) {
+    try {
+      if (fs.existsSync(p)) fs.unlinkSync(p)
+    } catch {
+      /* ignore */
+    }
   }
 
-  // 预览用：限宽 1280、veryfast，体积/耗时可控
-  const args = [
-    '-hide_banner',
-    '-loglevel',
-    'error',
-    '-y',
-    '-i',
-    abs,
-    '-map',
-    '0:v:0',
-    '-map',
-    '0:a?',
-    '-vf',
-    "scale='min(1280,iw)':-2",
-    '-c:v',
-    'libx264',
-    '-preset',
-    'veryfast',
-    '-crf',
-    '23',
-    '-pix_fmt',
-    'yuv420p',
-    '-c:a',
-    'aac',
-    '-b:a',
-    '128k',
-    '-movflags',
-    '+faststart',
-    tmp
-  ]
-  const { code, stderr } = await run(bin, args, undefined, 1_800_000)
+  const runProxy = async (withAudio: boolean): Promise<{ code: number; stderr: string }> => {
+    const args = [
+      '-hide_banner',
+      '-loglevel',
+      'error',
+      '-y',
+      '-i',
+      abs,
+      '-map',
+      '0:v:0',
+      ...(withAudio ? ['-map', '0:a?'] : ['-an']),
+      '-vf',
+      "scale='min(1280,iw)':-2",
+      '-c:v',
+      'libx264',
+      '-preset',
+      'veryfast',
+      '-crf',
+      '23',
+      '-pix_fmt',
+      'yuv420p',
+      ...(withAudio ? ['-c:a', 'aac', '-b:a', '128k'] : []),
+      '-movflags',
+      '+faststart',
+      '-f',
+      'mp4',
+      tmp
+    ]
+    return run(bin, args, undefined, 1_800_000)
+  }
+
+  let { code, stderr } = await runProxy(true)
+  if (code !== 0 || !fs.existsSync(tmp) || fs.statSync(tmp).size < 1024) {
+    try {
+      if (fs.existsSync(tmp)) fs.unlinkSync(tmp)
+    } catch {
+      /* ignore */
+    }
+    // 部分素材音频轨异常：无声再试一次仍可预览画面
+    ;({ code, stderr } = await runProxy(false))
+  }
+
   if (code !== 0 || !fs.existsSync(tmp) || fs.statSync(tmp).size < 1024) {
     try {
       if (fs.existsSync(tmp)) fs.unlinkSync(tmp)

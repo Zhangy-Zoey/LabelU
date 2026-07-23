@@ -3,18 +3,25 @@ import { useEffect, useRef, useState } from 'react'
 const MOD_KEY = /Mac|Macintosh/i.test(navigator.userAgent) ? '⌘' : 'Ctrl'
 
 type Props = {
+  id: string
   path: string
   name: string
   parentDirName: string
   completed: boolean
   active: boolean
   selected: boolean
+  /** 二次选中（批量分类目标） */
+  secondaryPicked?: boolean
+  /** 二次选择模式开启 */
+  secondaryMode?: boolean
   /** 由父组件控制：是否正在小窗预览 */
   previewActive: boolean
   isCategoryCopy?: boolean
   mediaKind?: 'video' | 'image'
   disabled?: boolean
   onOpen: () => void
+  /** 双击打开主预览（不改选中） */
+  onActivate?: () => void
   onToggleSelect: () => void
   onRangeSelect: () => void
   /** 点击播放键：父组件决定单播或多选同播 */
@@ -22,17 +29,21 @@ type Props = {
 }
 
 export function VideoThumb({
+  id,
   path,
   name,
   parentDirName,
   completed,
   active,
   selected,
+  secondaryPicked,
+  secondaryMode,
   previewActive,
   isCategoryCopy,
   mediaKind,
   disabled,
   onOpen,
+  onActivate,
   onToggleSelect,
   onRangeSelect,
   onPlayClick
@@ -46,6 +57,8 @@ export function VideoThumb({
   const [previewUrl, setPreviewUrl] = useState<string | null>(null)
   const [previewTime, setPreviewTime] = useState(0)
   const [previewDuration, setPreviewDuration] = useState(0)
+  /** macOS 等：原片 HEVC 播失败后强制走 H.264 代理 */
+  const proxyForcedRef = useRef(false)
   const previewing = previewActive && Boolean(previewUrl)
 
   useEffect(() => {
@@ -94,13 +107,14 @@ export function VideoThumb({
   // 父组件控制开/关小窗预览
   useEffect(() => {
     let cancelled = false
+    proxyForcedRef.current = false
     if (!previewActive) {
       stopPreviewMedia()
       return
     }
     void (async () => {
       try {
-        // Windows HEVC：安静生成兼容预览，不抢全局 busy
+        // 可播则返回原片 URL；Win HEVC 会生成代理。quiet 不抢全局 busy
         const proxy = await window.api.ensurePreviewProxy(path, false, true)
         if (cancelled) return
         setPreviewUrl(proxy.url)
@@ -124,6 +138,28 @@ export function VideoThumb({
     // path 变化时由父级关掉 previewActive 或重开
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [previewActive, path])
+
+  const retryWithForcedProxy = (): void => {
+    if (proxyForcedRef.current || !previewActive) return
+    proxyForcedRef.current = true
+    void (async () => {
+      try {
+        const proxy = await window.api.ensurePreviewProxy(path, true, true)
+        setPreviewUrl(proxy.url)
+        setPreviewTime(0)
+        setPreviewDuration(0)
+        requestAnimationFrame(() => {
+          const v = videoRef.current
+          if (!v) return
+          v.muted = true
+          v.currentTime = 0
+          void v.play().catch(() => undefined)
+        })
+      } catch {
+        stopPreviewMedia()
+      }
+    })()
+  }
 
   useEffect(
     () => () => {
@@ -178,11 +214,22 @@ export function VideoThumb({
   return (
     <div
       ref={rootRef}
-      className={`video-thumb ${active ? 'active' : ''} ${completed ? 'completed' : ''} ${selected ? 'selected' : ''} ${previewing ? 'previewing' : ''}`}
-      title={`${name}\n单击：单选并打开主预览${isImage ? '' : ' · 播放键小窗预览（多选时同时播） · 进度条可拖拽'}\n${MOD_KEY}+单击多选 · Shift+单击：从锚点连选到此处\nDelete 从工作区移除（保留原文件）`}
+      data-video-id={id}
+      className={`video-thumb ${active ? 'active' : ''} ${completed ? 'completed' : ''} ${selected ? 'selected' : ''} ${secondaryPicked ? 'secondary-picked' : ''} ${previewing ? 'previewing' : ''}`}
+      title={
+        secondaryMode
+          ? `${name}
+二次选择中：单击已选卡片切换是否纳入批量分类；可拖选
+不改主选中 · 不打断播放 · 双击打开主预览
+${MOD_KEY}+单击仍可加减主选中`
+          : `${name}
+选中：单击打开 · ${MOD_KEY}+单击加减 · Shift+连选 · 按住拖选
+小窗：点播放键开/关（可叠加；多选时点其一可同播全部选中）
+多选后可开「二次选择」再挑分类目标`
+      }
       onMouseDown={(e) => {
         if (disabled) return
-        if (e.shiftKey) e.preventDefault()
+        if (e.shiftKey || e.metaKey || e.ctrlKey) e.preventDefault()
       }}
       onClick={(e) => {
         if (disabled) return
@@ -198,6 +245,12 @@ export function VideoThumb({
         }
         onOpen()
       }}
+      onDoubleClick={(e) => {
+        if (disabled) return
+        if (e.shiftKey || e.metaKey || e.ctrlKey) return
+        e.preventDefault()
+        onActivate?.()
+      }}
     >
       <div className="thumb-media">
         {previewing && previewUrl ? (
@@ -208,6 +261,7 @@ export function VideoThumb({
             muted
             playsInline
             loop
+            draggable={false}
             onLoadedMetadata={(e) => {
               const d = e.currentTarget.duration
               if (Number.isFinite(d) && d > 0) setPreviewDuration(d)
@@ -216,13 +270,9 @@ export function VideoThumb({
               if (scrubbingRef.current) return
               setPreviewTime(e.currentTarget.currentTime)
             }}
-            onClick={(e) => {
-              e.preventDefault()
-              e.stopPropagation()
-              const v = videoRef.current
-              if (!v) return
-              if (v.paused) void v.play().catch(() => undefined)
-              else v.pause()
+            onError={() => {
+              // macOS 等：系统 HEVC 解码失败时强制 H.264 代理回退
+              retryWithForcedProxy()
             }}
           />
         ) : src && !failed ? (
@@ -236,10 +286,10 @@ export function VideoThumb({
             className={`thumb-play-btn ${previewing ? 'playing' : ''}`}
             title={
               previewing
-                ? '停止小窗预览'
+                ? '停止此条小窗（其它继续播）'
                 : selected
-                  ? '播放：多选时同时预览所有选中视频'
-                  : '小窗预览播放'
+                  ? '小窗播放：可叠加；多选时点其一将同播全部选中'
+                  : '小窗播放（可叠加）'
             }
             disabled={disabled}
             onClick={(e) => {
@@ -264,11 +314,18 @@ export function VideoThumb({
             aria-valuemin={0}
             aria-valuemax={Math.round(previewDuration) || 0}
             aria-valuenow={Math.round(previewTime)}
-            title="拖拽调整进度"
-            onMouseDown={startScrub}
+            title="拖拽进度"
             onClick={(e) => {
+              if (e.shiftKey || e.metaKey || e.ctrlKey) return
               e.preventDefault()
               e.stopPropagation()
+            }}
+            onMouseDown={(e) => {
+              if (e.shiftKey || e.metaKey || e.ctrlKey) {
+                e.preventDefault()
+                return
+              }
+              startScrub(e)
             }}
           >
             <div className="thumb-scrub-track">
@@ -276,6 +333,14 @@ export function VideoThumb({
               <div className="thumb-scrub-thumb" style={{ left: `${progressPct}%` }} />
             </div>
           </div>
+        )}
+        {secondaryMode && selected && (
+          <span
+            className={`thumb-badge pick ${secondaryPicked ? 'on' : ''}`}
+            title="单击切换是否纳入批量分类"
+          >
+            {secondaryPicked ? '二次已选' : '点选分类'}
+          </span>
         )}
         {active && (
           <span className="thumb-badge current" title="当前正在编辑">

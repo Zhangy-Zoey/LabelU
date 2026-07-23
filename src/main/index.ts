@@ -73,6 +73,12 @@ import {
 } from '../shared/categories'
 import { appendLog, getLogDir, getExceptionLogPath, initLogger, logError } from './logger'
 import { applyStartupVersionCheck, markWhatsNewSeen, type StartupVersionInfo } from './versionState'
+import {
+  saveWorkspaceResume,
+  peekWorkspaceResume,
+  consumeWorkspaceResume,
+  type WorkspaceResumeSnapshot
+} from './workspaceResume'
 
 /** 推算段仅供回看展示，不参与可剪剩余区 / 工作区持久化 */
 function preciseExports(exports: ExportRecord[]): ExportRecord[] {
@@ -204,7 +210,7 @@ app.on('second-instance', () => {
 const allowedRoots = new Set<string>()
 let thumbQueue: Promise<void> = Promise.resolve()
 let thumbActive = 0
-const THUMB_MAX_CONCURRENT = 2
+const THUMB_MAX_CONCURRENT = 1
 
 function rememberAllowedPath(p: string): void {
   try {
@@ -328,6 +334,16 @@ function seedAllowedRootsFromDisk(): void {
   }
   try {
     for (const p of listAllExportCatalogPaths()) rememberAllowedPath(p)
+  } catch {
+    /* ignore */
+  }
+  // 更新重启前保存的工作区路径
+  try {
+    const resume = peekWorkspaceResume()
+    if (resume?.paths?.length) {
+      for (const p of resume.paths) rememberAllowedPath(p)
+      if (resume.currentPath) rememberAllowedPath(resume.currentPath)
+    }
   } catch {
     /* ignore */
   }
@@ -851,12 +867,15 @@ function setupUpdater(): void {
         err instanceof Error ? err.message : String(err)
       )
     })
-    setTimeout(() => {
+    const runCheck = (): void => {
       autoUpdater.checkForUpdates().catch((err) => {
         if (isBenignUpdaterMiss(err)) return
         logError('updater.checkForUpdates', err)
       })
-    }, 5000)
+    }
+    // 启动稍后检查一次；使用中每 4 小时再查，便于长开着的窗口也能弹更新提示
+    setTimeout(runCheck, 5000)
+    setInterval(runCheck, 4 * 60 * 60 * 1000)
   } catch (err) {
     logError('updater.setup', err)
   }
@@ -1663,6 +1682,30 @@ function setupIpc(): void {
       throw err instanceof Error ? err : new Error(String(err))
     }
   })
+
+  /** 一键更新前写入工作区快照，重启后恢复列表 */
+  ipcMain.handle('save-workspace-resume', (_e, snapshot: WorkspaceResumeSnapshot) => {
+    if (!snapshot || typeof snapshot !== 'object') {
+      throw new Error('工作区快照无效')
+    }
+    saveWorkspaceResume({
+      version: 1,
+      reason: 'post-update',
+      savedAt: new Date().toISOString(),
+      paths: Array.isArray(snapshot.paths) ? snapshot.paths : [],
+      currentPath: snapshot.currentPath ?? null,
+      onlyIncomplete: snapshot.onlyIncomplete,
+      mediaKindFilter: snapshot.mediaKindFilter
+    })
+    const peek = peekWorkspaceResume()
+    if (peek?.paths?.length) {
+      for (const p of peek.paths) rememberAllowedPath(p)
+      if (peek.currentPath) rememberAllowedPath(peek.currentPath)
+    }
+    return { ok: true as const }
+  })
+
+  ipcMain.handle('consume-workspace-resume', () => consumeWorkspaceResume())
 
   /** 手动检查更新（关于窗口 / 顶栏版本按钮）；开发态直接返回 */
   ipcMain.handle('check-for-updates', async () => {

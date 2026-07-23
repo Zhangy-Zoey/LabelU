@@ -1,5 +1,8 @@
 import path from 'path'
 import { isPresetCategory } from '../shared/categories'
+import type { ReclassifyDestMode } from '../shared/labeluApi'
+
+export type { ReclassifyDestMode }
 
 /**
  * 导出/整片归类的根目录：
@@ -18,8 +21,6 @@ export function isInCategoryFolder(sourcePath: string): boolean {
   const parent = path.basename(path.dirname(path.resolve(sourcePath)))
   return isPresetCategory(parent)
 }
-
-export type ReclassifyDestMode = 'originalRoot' | 'underCurrent' | 'custom' | 'customRoot'
 
 export type ClassifyDestOptions = {
   /** 二次分类落点；默认 originalRoot。customRoot：指定类别文件夹的源目录 */

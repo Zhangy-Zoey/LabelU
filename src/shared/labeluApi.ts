@@ -11,8 +11,11 @@ export type CustomCategoryMap = Record<
   string[]
 >
 
+/** 二次分类落点；与 main/exportPaths.ReclassifyDestMode 一致 */
+export type ReclassifyDestMode = 'originalRoot' | 'underCurrent' | 'custom' | 'customRoot'
+
 export type ClassifyDestApiOpts = {
-  reclassifyMode?: 'originalRoot' | 'underCurrent' | 'custom' | 'customRoot'
+  reclassifyMode?: ReclassifyDestMode
   customDestDir?: string
 }
 
@@ -34,6 +37,17 @@ export type StartupInfo = {
   showWhatsNew: boolean
   whatsNewTitle: string
   whatsNewLines: string[]
+}
+
+/** 一键更新前工作区快照（main/workspaceResume 与渲染进程共用） */
+export type WorkspaceResumeSnapshot = {
+  version: 1
+  reason: 'post-update'
+  savedAt: string
+  paths: string[]
+  currentPath?: string | null
+  onlyIncomplete?: boolean
+  mediaKindFilter?: 'all' | 'video' | 'image'
 }
 
 export type LabeluApi = {
@@ -104,9 +118,12 @@ export type LabeluApi = {
     version: string
     reason?: string
   }>
+  /** 一键更新前保存工作区；重启后 consume 恢复 */
+  saveWorkspaceResume: (snapshot: WorkspaceResumeSnapshot) => Promise<{ ok: boolean }>
+  consumeWorkspaceResume: () => Promise<WorkspaceResumeSnapshot | null>
   openAbout: (opts?: { autoUpdate?: boolean }) => Promise<boolean>
   getMediaUrl: (filePath: string) => Promise<string>
-  /** HEVC 等编码在 Windows 上转 H.264 预览代理；可播则返回原路径 */
+  /** HEVC 等：Windows 默认转 H.264 代理；macOS 优先原片，播失败可 force */
   ensurePreviewProxy: (
     filePath: string,
     force?: boolean,

@@ -1,13 +1,14 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import type { CropRect, ExportRecord, SessionState, TimeRange, VideoItem } from '../../shared/types'
+import type { WorkspaceResumeSnapshot, ReclassifyDestMode, ClassifyDestApiOpts } from '../../shared/labeluApi'
 import { IMAGE_TIMELINE_SECONDS, MIN_SELECTION_SECONDS, isImagePath } from '../../shared/types'
 import { clamp, computeRemainingFromExports, formatTime, formatTimecode, formatTimelineTime, frameDuration, frameIndex, isMeaningfulCrop, minSelectionGap, resolveClipSelection, selectionTolerance, snapToFrame, stepByFrames, totalDuration, sanitizeName, compareMediaPaths, joinMediaDir, mediaDirname, mediaBasename } from '../../shared/utils'
 import { isPresetCategory, applyCustomCategoryTags, getCustomCategoryTags, loadCustomCategoryTags, saveCustomCategoryTags, categoryShadeStyle, tryRemoveCustomCategoryTag, isBuiltinCategoryTag, findCustomCategoryGroup } from '../../shared/categories'
 import { filmstripOrder, seekAndCaptureFrame, seekVideo } from './frameCapture'
 import { CategoryChips } from './CategoryChips'
 import { VideoThumb } from './VideoThumb'
+import { hitTestThumbMarquee } from './thumbMarquee'
 import appIcon from './assets/app-icon.png'
-
 /** 仅当上级目录名属于预设行为标签时，才作为默认分类名 */
 function defaultCategoryFromDir(dirName: string | undefined | null): string {
   const name = (dirName || '').trim()
@@ -319,6 +320,16 @@ type ConfirmModal = {
   onCancel?: () => void
 }
 
+/** 使用中发现新版本时的弹窗；一键更新会保存工作区并下载安装 */
+type UpdateModalState = {
+  version: string
+  phase: 'available' | 'saving' | 'downloading' | 'ready' | 'installing' | 'error'
+  progress: number | null
+  error?: string
+  /** 用户点「稍后」后仅保留顶栏横幅，同版本不再反复弹窗 */
+  dismissed?: boolean
+}
+
 type BatchResultItem = {
   path: string
   ok: boolean
@@ -333,18 +344,10 @@ type BatchResultModal = {
   cancelled?: boolean
 }
 
-type ReclassifyDestMode = 'originalRoot' | 'underCurrent' | 'custom' | 'customRoot'
-
 type ReclassifyDestModal = {
-  purpose: 'batch'
   category: string
   paths: string[]
   categorizedCount: number
-}
-
-type ClassifyDestOpts = {
-  reclassifyMode?: ReclassifyDestMode
-  customDestDir?: string
 }
 
 type PendingSaveClip = {
@@ -512,6 +515,9 @@ export default function App(): React.JSX.Element {
   const [updateAvailable, setUpdateAvailable] = useState(false)
   /** 更新包下载进度 0–100；null 表示未在下载 */
   const [updateDownloadPercent, setUpdateDownloadPercent] = useState<number | null>(null)
+  const [updateModal, setUpdateModal] = useState<UpdateModalState | null>(null)
+  const updateModalRef = useRef<UpdateModalState | null>(null)
+  updateModalRef.current = updateModal
   const [whatsNewModal, setWhatsNewModal] = useState<WhatsNewModal | null>(null)
   const [appVersion, setAppVersion] = useState('')
   const [thumbSize, setThumbSize] = useState(() =>
@@ -523,7 +529,10 @@ export default function App(): React.JSX.Element {
   const [paneBodyW, setPaneBodyW] = useState(0)
   const appBodyRef = useRef<HTMLDivElement>(null)
   const [selectedIds, setSelectedIds] = useState<Set<string>>(() => new Set())
-  /** 缩略图小窗预览中的视频 id（多选同播时含多个） */
+  /** 二次选择模式：重启默认关闭，不持久化；开启后从已多选项中再挑批量分类目标 */
+  const [secondarySelectMode, setSecondarySelectMode] = useState(false)
+  const [secondaryIds, setSecondaryIds] = useState<Set<string>>(() => new Set())
+  /** 缩略图小窗预览中的视频 id（与选中独立，可叠加播放） */
   const [thumbPreviewIds, setThumbPreviewIds] = useState<Set<string>>(() => new Set())
   const [batchModal, setBatchModal] = useState(false)
   const [batchCategory, setBatchCategory] = useState('')
@@ -539,14 +548,22 @@ export default function App(): React.JSX.Element {
   const [reclassifyPrefDontAsk, setReclassifyPrefDontAsk] = useState(() =>
     loadStoredBool(LS_RECLASSIFY_DONT_ASK, false)
   )
-  const lastClassifyOptsRef = useRef<ClassifyDestOpts | undefined>(undefined)
+  const lastClassifyOptsRef = useRef<ClassifyDestApiOpts | undefined>(undefined)
   /** 更新说明弹窗关闭后再展示「恢复未完成会话」 */
   const pendingRecoverSessionsRef = useRef<SessionState[] | null>(null)
+  /** 更新重启后的工作区快照；whatsNew 关闭后再恢复 */
+  const pendingWorkspaceResumeRef = useRef<WorkspaceResumeSnapshot | null>(null)
+  const restoreWorkspaceResumeRef = useRef<(snap: WorkspaceResumeSnapshot) => Promise<void>>(
+    async () => {}
+  )
+  const applyOneClickUpdateRef = useRef<() => Promise<void>>(async () => {})
   /** 合并并发的 clearCompleted，避免拖动手柄连点竞态 */
   const clearCompletedInflightRef = useRef<Promise<string | null> | null>(null)
   const finishCurrentRef = useRef<(opts?: { silent?: boolean }) => Promise<boolean>>(
     async () => true
   )
+  /** finishCurrent 最近一次成功写回的路径（可能已改名） */
+  const lastFinishedPathRef = useRef<string | null>(null)
   const goRelativeRef = useRef<(dir: -1 | 1) => Promise<void>>(async () => {})
   const [uiUndoStack, setUiUndoStack] = useState<UiUndoEntry[]>([])
   const selectAnchorRef = useRef<number | null>(null)
@@ -554,6 +571,26 @@ export default function App(): React.JSX.Element {
   const remainingByPathRef = useRef<Map<string, number>>(new Map())
   const [remainingHints, setRemainingHints] = useState<Record<string, number>>({})
   const thumbGridRef = useRef<HTMLDivElement>(null)
+  /** 缩略图拖选框（viewport 坐标） */
+  const [thumbMarquee, setThumbMarquee] = useState<{
+    x0: number
+    y0: number
+    x1: number
+    y1: number
+  } | null>(null)
+  const thumbDragRef = useRef<{
+    active: boolean
+    moved: boolean
+    x0: number
+    y0: number
+    additive: boolean
+    /** 拖选开始时的选中快照（additive 时合并） */
+    baseSelected: Set<string>
+    /** 二次选择模式：拖选写入 secondaryIds */
+    secondaryMode: boolean
+  } | null>(null)
+  /** 刚结束拖选时抑制卡片 click */
+  const suppressThumbClickRef = useRef(false)
   /** 弹窗打开时屏蔽全局快捷键（避免 effect 依赖弹窗状态导致每帧重绑） */
   const modalOpenRef = useRef(false)
   modalOpenRef.current = Boolean(
@@ -565,7 +602,8 @@ export default function App(): React.JSX.Element {
       recoverModal ||
       deleteCategoryTagModal ||
       importChoiceModal ||
-      whatsNewModal
+      whatsNewModal ||
+      (updateModal && !updateModal.dismissed)
   )
   const saveModalOpenRef = useRef(false)
   saveModalOpenRef.current = Boolean(saveModal)
@@ -580,6 +618,7 @@ export default function App(): React.JSX.Element {
     importChoice: false,
     recover: false,
     whatsNew: false,
+    update: false,
     thumbPreview: false,
     editing: false
   })
@@ -754,6 +793,7 @@ export default function App(): React.JSX.Element {
     importChoice: Boolean(importChoiceModal),
     recover: Boolean(recoverModal),
     whatsNew: Boolean(whatsNewModal),
+    update: Boolean(updateModal && !updateModal.dismissed),
     thumbPreview: thumbPreviewIds.size > 0,
     editing: Boolean(fineTuneWhich || cropActive || selectedExportPath || filmstrip)
   }
@@ -1461,6 +1501,7 @@ export default function App(): React.JSX.Element {
 
   const [thumbScrollTop, setThumbScrollTop] = useState(0)
   const [thumbViewportH, setThumbViewportH] = useState(600)
+  const [thumbContentW, setThumbContentW] = useState(200)
 
   useEffect(() => {
     const el = thumbGridRef.current
@@ -1468,6 +1509,8 @@ export default function App(): React.JSX.Element {
     const sync = (): void => {
       setThumbViewportH(el.clientHeight)
       setThumbScrollTop(el.scrollTop)
+      // 与 CSS auto-fill 列宽一致：扣除 grid padding
+      setThumbContentW(Math.max(1, el.clientWidth - 24))
     }
     sync()
     el.addEventListener('scroll', sync, { passive: true })
@@ -1482,8 +1525,10 @@ export default function App(): React.JSX.Element {
   const thumbVirtual = useMemo(() => {
     const gap = 10
     const caption = 44
+    const pad = 12
     const itemH = thumbSize + caption + gap
-    const cols = Math.max(1, Math.floor((Math.max(200, sidebarWidth - 28) + gap) / (thumbSize + gap)))
+    // 对齐 .thumb-virtual-window 的 repeat(auto-fill, minmax(thumbSize, 1fr))
+    const cols = Math.max(1, Math.floor((thumbContentW + gap) / (thumbSize + gap)))
     const indices = visibleIndices
     const rows = Math.ceil(indices.length / cols)
     const totalH = Math.max(itemH, rows * itemH)
@@ -1495,13 +1540,59 @@ export default function App(): React.JSX.Element {
       videoIndex,
       offset: start + local
     }))
-    return { cols, itemH, totalH, start, slice }
-  }, [visibleIndices, thumbSize, sidebarWidth, thumbScrollTop, thumbViewportH])
+    return { cols, itemH, totalH, start, slice, gap, pad, caption }
+  }, [visibleIndices, thumbSize, thumbContentW, thumbScrollTop, thumbViewportH])
+
+  /** 拖选命中用：含滚出视口项的布局参数 */
+  const thumbLayoutRef = useRef({
+    cols: 1,
+    itemH: 180,
+    gap: 10,
+    pad: 12,
+    visibleIndices: [] as number[],
+    videos: [] as VideoItem[]
+  })
+  thumbLayoutRef.current = {
+    cols: thumbVirtual.cols,
+    itemH: thumbVirtual.itemH,
+    gap: thumbVirtual.gap,
+    pad: thumbVirtual.pad,
+    visibleIndices,
+    videos
+  }
 
   const selectedVideos = useMemo(
     () => videos.filter((v) => selectedIds.has(v.id)),
     [videos, selectedIds]
   )
+
+  /** 批量分类目标：二次选择开启时用二次选中，否则用主选中 */
+  const batchTargetVideos = useMemo(
+    () =>
+      secondarySelectMode
+        ? videos.filter((v) => secondaryIds.has(v.id))
+        : selectedVideos,
+    [secondarySelectMode, videos, secondaryIds, selectedVideos]
+  )
+
+  /** 主选中不足多选时退出二次选择；并剔除已不在主选中里的二次项 */
+  useEffect(() => {
+    if (selectedIds.size <= 1) {
+      setSecondarySelectMode(false)
+      setSecondaryIds((prev) => (prev.size === 0 ? prev : new Set()))
+      return
+    }
+    setSecondaryIds((prev) => {
+      if (prev.size === 0) return prev
+      let changed = false
+      const next = new Set<string>()
+      Array.from(prev).forEach((id) => {
+        if (selectedIds.has(id)) next.add(id)
+        else changed = true
+      })
+      return changed ? next : prev
+    })
+  }, [selectedIds])
 
   useEffect(() => {
     try {
@@ -1751,6 +1842,14 @@ export default function App(): React.JSX.Element {
           reportClientError('listPendingSessions', err)
         }
 
+        let workspaceResume: WorkspaceResumeSnapshot | null = null
+        try {
+          workspaceResume = await window.api.consumeWorkspaceResume()
+        } catch (err) {
+          reportClientError('consumeWorkspaceResume', err)
+        }
+        const hasResume = Boolean(workspaceResume?.paths?.length)
+
         if (info.showWhatsNew) {
           setWhatsNewModal({
             title: info.whatsNewTitle,
@@ -1759,6 +1858,19 @@ export default function App(): React.JSX.Element {
           })
           pendingRecoverSessionsRef.current =
             pendingSessions.length > 0 ? pendingSessions : null
+          pendingWorkspaceResumeRef.current = hasResume ? workspaceResume : null
+        } else if (hasResume && workspaceResume) {
+          // 先恢复更新前工作区，再弹未完成会话
+          pendingRecoverSessionsRef.current =
+            pendingSessions.length > 0 ? pendingSessions : null
+          await restoreWorkspaceResumeRef.current(workspaceResume)
+          const pending = pendingRecoverSessionsRef.current
+          pendingRecoverSessionsRef.current = null
+          if (pending && pending.length > 0) {
+            window.setTimeout(() => {
+              setRecoverModal({ sessions: pending, index: 0 })
+            }, 400)
+          }
         } else if (pendingSessions.length > 0) {
           // 无更新说明时稍延后，避免挡首屏
           window.setTimeout(() => {
@@ -1918,7 +2030,8 @@ export default function App(): React.JSX.Element {
       } catch (err: unknown) {
         if (gen !== loadGenRef.current) return
         setMediaUrl('')
-        showToast(`无法加载：${String(err)}`)
+        const raw = err instanceof Error ? err.message : String(err)
+        showToast(raw ? `无法加载：${raw}` : '无法加载媒体')
         setStatus('加载失败')
       }
     },
@@ -1934,6 +2047,9 @@ export default function App(): React.JSX.Element {
       }
       setMediaKindFilter(kindFilter)
       setSelectedIds(new Set())
+      setSecondaryIds(new Set())
+      setSecondarySelectMode(false)
+      setThumbPreviewIds(new Set())
       selectAnchorRef.current = null
       setBatchUndoItems(null)
 
@@ -2073,7 +2189,29 @@ export default function App(): React.JSX.Element {
     await applyImportedList(items)
   }, [busy, applyImportedList, showToast, current, videos])
 
+  /** 当前选中里可小窗播放的视频 id */
+  const videoIdsFromSelection = useCallback(
+    (ids: Set<string>): string[] =>
+      videos
+        .filter(
+          (v) => ids.has(v.id) && v.mediaKind !== 'image' && !isImagePath(v.path)
+        )
+        .map((v) => v.id),
+    [videos]
+  )
+
+  /**
+   * 选中与小窗播放分离：
+   * - Ctrl/⌘：加减主选中
+   * - Shift：锚点连选
+   * - 单击：打开主预览；二次选择模式下单击已主选卡片 → 切换二次选中（不改主选中、不切预览）
+   * - 播放键：开关小窗；多选时可同播
+   */
   const toggleSelect = useCallback((id: string, listIndex: number) => {
+    if (suppressThumbClickRef.current) {
+      suppressThumbClickRef.current = false
+      return
+    }
     selectAnchorRef.current = listIndex
     setSelectedIds((prev) => {
       const next = new Set(prev)
@@ -2081,19 +2219,15 @@ export default function App(): React.JSX.Element {
       else next.add(id)
       return next
     })
-    setThumbPreviewIds((prev) => {
-      if (!prev.has(id)) return prev
-      // 取消选中时停掉该条小窗预览
-      if (prev.size === 1) return new Set()
-      const next = new Set(prev)
-      next.delete(id)
-      return next
-    })
   }, [])
 
-  /** Shift+单击：从锚点连选到当前项（含中间全部）。锚点不随二次 Shift 点击移动。 */
+  /** Shift+单击：从锚点连选到当前项。二次选择模式：范围内已主选的项并入二次选中。 */
   const rangeSelect = useCallback(
     (toIndex: number) => {
+      if (suppressThumbClickRef.current) {
+        suppressThumbClickRef.current = false
+        return
+      }
       if (toIndex < 0 || toIndex >= videos.length) return
 
       let anchorIdx = selectAnchorRef.current
@@ -2106,34 +2240,36 @@ export default function App(): React.JSX.Element {
 
       const a = Math.min(anchorIdx, toIndex)
       const b = Math.max(anchorIdx, toIndex)
-      const next = new Set<string>()
-      for (let i = a; i <= b; i++) {
-        const item = videos[i]
-        if (item) next.add(item.id)
-      }
-      setSelectedIds(next)
-    },
-    [videos, index]
-  )
 
-  /** 松开主预览 / 缩略图预览句柄，避免 Windows rename/move EBUSY */
-  const releaseMediaHandles = useCallback(async (): Promise<void> => {
-    setThumbPreviewIds(new Set())
-    setExportPreviewUrl(null)
-    setStillFrameUrl(null)
-    setMediaUrl('')
-    for (const el of [videoRef.current, scrubVideoRef.current]) {
-      if (!el) continue
-      try {
-        el.pause()
-        el.removeAttribute('src')
-        el.load()
-      } catch {
-        /* ignore */
+      if (secondarySelectMode) {
+        setSecondaryIds((prev) => {
+          const next = new Set(prev)
+          for (let i = a; i <= b; i++) {
+            const item = videos[i]
+            if (item && selectedIds.has(item.id)) next.add(item.id)
+          }
+          return next
+        })
+        return
       }
-    }
-    await new Promise<void>((r) => window.setTimeout(r, MEDIA_RELEASE_MS))
-  }, [])
+
+      const previewing = thumbPreviewIds.size > 0
+      setSelectedIds((prev) => {
+        const range = new Set<string>()
+        for (let i = a; i <= b; i++) {
+          const item = videos[i]
+          if (item) range.add(item.id)
+        }
+        if (prev.size > 1 || previewing) {
+          const merged = new Set(prev)
+          range.forEach((id) => merged.add(id))
+          return merged
+        }
+        return range
+      })
+    },
+    [videos, index, thumbPreviewIds.size, secondarySelectMode, selectedIds]
+  )
 
   /** 完成/撤销完成后重新挂可播 URL（Win HEVC 走代理） */
   const reloadPlayableMedia = useCallback(async (sourcePath: string): Promise<void> => {
@@ -2154,30 +2290,67 @@ export default function App(): React.JSX.Element {
     setMediaUrl(url)
   }, [])
 
+  /** 松开指定路径相关媒体句柄；尽量保留其它小窗继续播 */
+  const releaseMediaForPaths = useCallback(
+    async (paths: string[]): Promise<void> => {
+      const pathSet = new Set(paths.map((p) => normMediaPath(p)))
+      const currentPath = videos[index]?.path
+      const touchesCurrent =
+        Boolean(currentPath) && pathSet.has(normMediaPath(currentPath!))
+
+      setThumbPreviewIds((prev) => {
+        if (prev.size === 0) return prev
+        let changed = false
+        const next = new Set(prev)
+        for (const v of videos) {
+          if (pathSet.has(normMediaPath(v.path)) && next.delete(v.id)) changed = true
+        }
+        return changed ? next : prev
+      })
+
+      if (touchesCurrent) {
+        setExportPreviewUrl(null)
+        setStillFrameUrl(null)
+        setMediaUrl('')
+        for (const el of [videoRef.current, scrubVideoRef.current]) {
+          if (!el) continue
+          try {
+            el.pause()
+            el.removeAttribute('src')
+            el.load()
+          } catch {
+            /* ignore */
+          }
+        }
+      }
+      await new Promise<void>((r) => window.setTimeout(r, MEDIA_RELEASE_MS))
+    },
+    [videos, index]
+  )
+
   const openBatchModal = useCallback(async () => {
-    if (selectedVideos.length === 0) {
-      showToast(`请先多选视频（${MOD_KEY}+单击或 Shift+单击）`)
+    if (secondarySelectMode) {
+      if (batchTargetVideos.length === 0) {
+        showToast('二次选择中：请单击已选中的卡片，挑出要批量分类的视频')
+        return
+      }
+    } else if (batchTargetVideos.length === 0) {
+      showToast(`请先多选视频（${MOD_KEY}+单击、Shift+单击或拖选）`)
       return
     }
-    const first = selectedVideos[0]
+    const first = batchTargetVideos[0]
     setBatchCategory(defaultCategoryFromDir(first.parentDirName))
     setBatchModal(true)
-  }, [selectedVideos, showToast])
+  }, [batchTargetVideos, secondarySelectMode, showToast])
 
   const runBatchClassify = useCallback(
-    async (paths: string[], category: string, opts?: ClassifyDestOpts) => {
+    async (paths: string[], category: string, opts?: ClassifyDestApiOpts) => {
       if (busy || paths.length === 0) return
       lastClassifyOptsRef.current = opts
       setStatus(`正在批量分类 ${paths.length} 个视频…`)
       try {
-        // 松开主预览与缩略图小窗，避免 Windows rename/move 失败
-        const currentPath = videos[index]?.path
-        const touchesCurrent =
-          Boolean(currentPath) &&
-          paths.some((p) => normMediaPath(p) === normMediaPath(currentPath!))
-        if (touchesCurrent || thumbPreviewIds.size > 0) {
-          await releaseMediaHandles()
-        }
+        // 只释放将被移动的项（及当前主预览若命中），其它小窗可继续播
+        await releaseMediaForPaths(paths)
 
         const pathSet = new Set(paths.map((p) => normMediaPath(p)))
         const selectedSnapshot = videos.filter((v) => pathSet.has(normMediaPath(v.path)))
@@ -2189,6 +2362,7 @@ export default function App(): React.JSX.Element {
         const okPaths = new Set(
           results.filter((r) => r.ok).map((r) => normMediaPath(r.path))
         )
+        const currentPath = videos[index]?.path
         const currentMoved = currentPath
           ? okPaths.has(normMediaPath(currentPath))
           : false
@@ -2209,7 +2383,17 @@ export default function App(): React.JSX.Element {
         const nextList = videos.filter((v) => !okPaths.has(normMediaPath(v.path)))
         setVideos(nextList)
         setSelectedIds(new Set())
+        setSecondaryIds(new Set())
+        setSecondarySelectMode(false)
         selectAnchorRef.current = null
+        setThumbPreviewIds((prev) => {
+          if (prev.size === 0) return prev
+          const next = new Set(prev)
+          for (const v of videos) {
+            if (okPaths.has(normMediaPath(v.path))) next.delete(v.id)
+          }
+          return next
+        })
 
         setBatchResultModal({
           category,
@@ -2246,7 +2430,7 @@ export default function App(): React.JSX.Element {
         setStatus('批量分类失败')
       }
     },
-    [busy, videos, index, loadVideoAt, showToast, releaseMediaHandles, thumbPreviewIds.size]
+    [busy, videos, index, loadVideoAt, showToast, releaseMediaForPaths]
   )
 
   const confirmBatchClassify = useCallback(async () => {
@@ -2255,9 +2439,9 @@ export default function App(): React.JSX.Element {
       showToast('请输入类别')
       return
     }
-    if (busy || selectedVideos.length === 0) return
-    const paths = selectedVideos.map((v) => v.path)
-    const categorizedCount = selectedVideos.filter((v) => v.isCategoryCopy).length
+    if (busy || batchTargetVideos.length === 0) return
+    const paths = batchTargetVideos.map((v) => v.path)
+    const categorizedCount = batchTargetVideos.filter((v) => v.isCategoryCopy).length
     setBatchModal(false)
 
     if (categorizedCount > 0) {
@@ -2274,15 +2458,15 @@ export default function App(): React.JSX.Element {
       setReclassifyMode(savedMode)
       setReclassifyCustomDir(savedDir)
       setReclassifyDontAsk(false)
-      setReclassifyDestModal({ purpose: 'batch', category, paths, categorizedCount })
+      setReclassifyDestModal({ category, paths, categorizedCount })
       return
     }
 
     await runBatchClassify(paths, category)
-  }, [batchCategory, busy, selectedVideos, showToast, runBatchClassify])
+  }, [batchCategory, busy, batchTargetVideos, showToast, runBatchClassify])
 
   const runSaveClipExport = useCallback(
-    async (payload: PendingSaveClip, opts?: ClassifyDestOpts): Promise<void> => {
+    async (payload: PendingSaveClip, opts?: ClassifyDestApiOpts): Promise<void> => {
       if (savingRef.current || busy) {
         showToast('正在保存，请稍候…')
         return
@@ -2368,7 +2552,7 @@ export default function App(): React.JSX.Element {
       showToast('请先选择目标文件夹')
       return
     }
-    const opts: ClassifyDestOpts = {
+    const opts: ClassifyDestApiOpts = {
       reclassifyMode,
       customDestDir: reclassifyMode === 'custom' ? reclassifyCustomDir.trim() : undefined
     }
@@ -2428,14 +2612,9 @@ export default function App(): React.JSX.Element {
       setBatchResultModal(null)
       setStatus(`正在重试 ${failedPaths.length} 个失败项…`)
       try {
-        const currentPath = videos[index]?.path
-        const touchesCurrent =
-          Boolean(currentPath) &&
-          failedPaths.some((p) => normMediaPath(p) === normMediaPath(currentPath!))
-        if (touchesCurrent || thumbPreviewIds.size > 0) {
-          await releaseMediaHandles()
-        }
+        await releaseMediaForPaths(failedPaths)
 
+        const currentPath = videos[index]?.path
         const { results, canUndo, cancelled } = await window.api.batchClassify(
           failedPaths,
           category,
@@ -2459,6 +2638,14 @@ export default function App(): React.JSX.Element {
         }
         const nextList = videos.filter((v) => !okPaths.has(normMediaPath(v.path)))
         setVideos(nextList)
+        setThumbPreviewIds((prev) => {
+          if (prev.size === 0) return prev
+          const next = new Set(prev)
+          for (const v of videos) {
+            if (okPaths.has(normMediaPath(v.path))) next.delete(v.id)
+          }
+          return next
+        })
         setBatchResultModal({
           category,
           results,
@@ -2481,15 +2668,7 @@ export default function App(): React.JSX.Element {
         setStatus('重试失败')
       }
     },
-    [
-      busy,
-      videos,
-      index,
-      showToast,
-      releaseMediaHandles,
-      thumbPreviewIds.size,
-      loadVideoAt
-    ]
+    [busy, videos, index, showToast, releaseMediaForPaths, loadVideoAt]
   )
   const undoBatchClassify = useCallback(async () => {
     if (busy || batchUndoItems === null) {
@@ -2498,8 +2677,13 @@ export default function App(): React.JSX.Element {
     }
     setStatus('正在撤回批量分类…')
     try {
-      const { restored, errors } = await window.api.undoBatchClassify()
       const items = batchUndoItems
+      const releasePaths = [
+        ...items.map((v) => v.path),
+        ...(current ? [current.path] : [])
+      ]
+      await releaseMediaForPaths(releasePaths)
+      const { restored, errors } = await window.api.undoBatchClassify()
       setBatchUndoItems(null)
       if (restored > 0 && items.length > 0) {
         setVideos((prev) => {
@@ -2522,7 +2706,7 @@ export default function App(): React.JSX.Element {
       showToast(String(err))
       setStatus('撤回失败')
     }
-  }, [busy, batchUndoItems, showToast])
+  }, [busy, batchUndoItems, current, showToast, releaseMediaForPaths])
 
   const onDrop = (e: React.DragEvent): void => {
     e.preventDefault()
@@ -2586,8 +2770,8 @@ export default function App(): React.JSX.Element {
       const oldPath = current.path
       const gen = loadGenRef.current
       try {
-        // Windows：播放中占用文件句柄会导致 rename 失败；先松开媒体（含缩略图小窗）
-        await releaseMediaHandles()
+        // Windows：播放中占用文件句柄会导致 rename 失败；只松开当前项相关媒体
+        await releaseMediaForPaths([oldPath])
 
         const result = await window.api.finishVideo({
           sourcePath: oldPath,
@@ -2596,6 +2780,7 @@ export default function App(): React.JSX.Element {
         })
         if (gen !== loadGenRef.current) return true
         const newPath = result?.path || oldPath
+        lastFinishedPathRef.current = newPath
         dirtyRef.current = false
         completedRef.current = true
         setUndoCount(0)
@@ -2657,7 +2842,7 @@ export default function App(): React.JSX.Element {
       clipExports.length,
       showToast,
       syncRemainingHint,
-      releaseMediaHandles,
+      releaseMediaForPaths,
       reloadPlayableMedia
     ]
   )
@@ -2677,7 +2862,7 @@ export default function App(): React.JSX.Element {
       const oldPath = current.path
       const gen = loadGenRef.current
       try {
-        await releaseMediaHandles()
+        await releaseMediaForPaths([oldPath])
 
         const res = await window.api.clearCompleted(oldPath)
         const newPath = res?.path || oldPath
@@ -2728,7 +2913,7 @@ export default function App(): React.JSX.Element {
     })
     clearCompletedInflightRef.current = p
     return p
-  }, [current, releaseMediaHandles, reloadPlayableMedia])
+  }, [current, releaseMediaForPaths, reloadPlayableMedia])
 
   const dismissWhatsNew = useCallback(() => {
     const modal = whatsNewModal
@@ -2738,10 +2923,19 @@ export default function App(): React.JSX.Element {
         reportClientError('markWhatsNewSeen', err)
       })
     }
+    const snap = pendingWorkspaceResumeRef.current
+    pendingWorkspaceResumeRef.current = null
     const pending = pendingRecoverSessionsRef.current
     pendingRecoverSessionsRef.current = null
-    if (pending && pending.length > 0) {
-      setRecoverModal({ sessions: pending, index: 0 })
+    const showRecover = (): void => {
+      if (pending && pending.length > 0) {
+        setRecoverModal({ sessions: pending, index: 0 })
+      }
+    }
+    if (snap?.paths?.length) {
+      void restoreWorkspaceResumeRef.current(snap).finally(showRecover)
+    } else {
+      showRecover()
     }
   }, [whatsNewModal])
   dismissWhatsNewRef.current = dismissWhatsNew
@@ -2786,6 +2980,18 @@ export default function App(): React.JSX.Element {
     }
     if (o.whatsNew) {
       dismissWhatsNewRef.current()
+      return true
+    }
+    if (o.update) {
+      setUpdateModal((prev) =>
+        prev
+          ? {
+              ...prev,
+              dismissed: true,
+              phase: prev.phase === 'error' ? 'available' : prev.phase
+            }
+          : prev
+      )
       return true
     }
     if (o.thumbPreview) {
@@ -2860,44 +3066,216 @@ export default function App(): React.JSX.Element {
   finishCurrentRef.current = finishCurrent
   goRelativeRef.current = goRelative
 
-  /** 单击缩略图：单选并切换当前项 */
+  /**
+   * 单击缩略图：
+   * - 二次选择开启 → 仅对已主选中的卡片切换二次选中（不改主选中、不打断播放、不切主预览）
+   * - 否则 → 单选并打开主预览
+   */
   const selectOnlyAndOpen = useCallback(
     (id: string, listIndex: number) => {
+      if (suppressThumbClickRef.current) {
+        suppressThumbClickRef.current = false
+        return
+      }
       selectAnchorRef.current = listIndex
+      if (secondarySelectMode) {
+        if (!selectedIds.has(id)) {
+          showToast('二次选择：请单击已选中的卡片')
+          return
+        }
+        setSecondaryIds((prev) => {
+          const next = new Set(prev)
+          if (next.has(id)) next.delete(id)
+          else next.add(id)
+          return next
+        })
+        return
+      }
       setSelectedIds(new Set([id]))
-      setThumbPreviewIds(new Set())
+      void goToIndex(listIndex)
+    },
+    [goToIndex, secondarySelectMode, selectedIds, showToast]
+  )
+
+  /** 双击：打开主预览（不改选中集合） */
+  const openMainFromThumb = useCallback(
+    (listIndex: number) => {
+      if (suppressThumbClickRef.current) {
+        suppressThumbClickRef.current = false
+        return
+      }
+      selectAnchorRef.current = listIndex
       void goToIndex(listIndex)
     },
     [goToIndex]
   )
 
-  /** 缩略图播放键：多选且点中已选项 → 同播；否则只播/停这一个 */
+  const applyThumbMarqueeSelection = useCallback(
+    (
+      x0: number,
+      y0: number,
+      x1: number,
+      y1: number,
+      additive: boolean,
+      base: Set<string>,
+      secondaryMode: boolean,
+      primaryPool: Set<string>
+    ) => {
+      const grid = thumbGridRef.current
+      if (!grid) return
+      const layout = thumbLayoutRef.current
+      const hit = hitTestThumbMarquee(layout, grid, x0, y0, x1, y1, {
+        onlyInPool: secondaryMode ? primaryPool : undefined
+      })
+
+      if (secondaryMode) {
+        if (additive) {
+          const merged = new Set(base)
+          hit.forEach((id) => merged.add(id))
+          setSecondaryIds(merged)
+        } else {
+          setSecondaryIds(hit)
+        }
+        return
+      }
+
+      if (additive) {
+        const merged = new Set(base)
+        hit.forEach((id) => merged.add(id))
+        setSelectedIds(merged)
+      } else {
+        setSelectedIds(hit)
+      }
+      if (hit.size === 1) {
+        let only = ''
+        hit.forEach((id) => {
+          only = id
+        })
+        const idx = layout.videos.findIndex((v) => v.id === only)
+        if (idx >= 0) selectAnchorRef.current = idx
+      }
+    },
+    []
+  )
+
+  const onThumbGridMouseDown = useCallback(
+    (e: React.MouseEvent) => {
+      if (busy || e.button !== 0) return
+      const target = e.target as HTMLElement | null
+      if (!target) return
+      // 播放键 / 进度条不启动拖选
+      if (target.closest('.thumb-play-btn, .thumb-scrub, button, input, select, a')) return
+      // Ctrl/⌘ 单击交给卡片切换，不拖选
+      if (e.metaKey || e.ctrlKey) return
+
+      const additive = e.shiftKey
+      const baseSelected = secondarySelectMode
+        ? new Set(secondaryIds)
+        : new Set(selectedIds)
+      thumbDragRef.current = {
+        active: true,
+        moved: false,
+        x0: e.clientX,
+        y0: e.clientY,
+        additive,
+        baseSelected,
+        secondaryMode: secondarySelectMode
+      }
+
+      const move = (ev: MouseEvent): void => {
+        const drag = thumbDragRef.current
+        if (!drag?.active) return
+        const dx = ev.clientX - drag.x0
+        const dy = ev.clientY - drag.y0
+        if (!drag.moved && dx * dx + dy * dy >= 25) drag.moved = true
+        if (!drag.moved) return
+        setThumbMarquee({ x0: drag.x0, y0: drag.y0, x1: ev.clientX, y1: ev.clientY })
+        applyThumbMarqueeSelection(
+          drag.x0,
+          drag.y0,
+          ev.clientX,
+          ev.clientY,
+          drag.additive,
+          drag.baseSelected,
+          drag.secondaryMode,
+          selectedIds
+        )
+      }
+      const up = (ev: MouseEvent): void => {
+        window.removeEventListener('mousemove', move)
+        window.removeEventListener('mouseup', up)
+        const drag = thumbDragRef.current
+        thumbDragRef.current = null
+        setThumbMarquee(null)
+        if (!drag) return
+        if (drag.moved) {
+          suppressThumbClickRef.current = true
+          applyThumbMarqueeSelection(
+            drag.x0,
+            drag.y0,
+            ev.clientX,
+            ev.clientY,
+            drag.additive,
+            drag.baseSelected,
+            drag.secondaryMode,
+            selectedIds
+          )
+          window.setTimeout(() => {
+            suppressThumbClickRef.current = false
+          }, 0)
+        }
+      }
+      window.addEventListener('mousemove', move)
+      window.addEventListener('mouseup', up)
+    },
+    [
+      busy,
+      selectedIds,
+      secondaryIds,
+      secondarySelectMode,
+      applyThumbMarqueeSelection
+    ]
+  )
+
+  /**
+   * 缩略图播放键（与选中独立）：
+   * - 未在播 → 加入小窗（可叠加）；若点在已多选项上，一次同播全部选中
+   * - 已在播 → 只停这一条
+   */
   const handleThumbPlay = useCallback(
     (id: string) => {
       const item = videos.find((v) => v.id === id)
       if (!item || item.mediaKind === 'image' || isImagePath(item.path)) return
 
-      setThumbPreviewIds((prev) => {
-        const multi = selectedIds.size > 1 && selectedIds.has(id)
-        if (multi) {
-          const targetIds = videos
-            .filter(
-              (v) =>
-                selectedIds.has(v.id) &&
-                v.mediaKind !== 'image' &&
-                !isImagePath(v.path)
-            )
-            .map((v) => v.id)
-          if (targetIds.length === 0) return prev
-          const allPlaying = targetIds.every((t) => prev.has(t))
-          if (allPlaying) return new Set()
-          return new Set(targetIds)
-        }
-        if (prev.has(id) && prev.size === 1) return new Set()
-        return new Set([id])
-      })
+      const prev = thumbPreviewIds
+      if (prev.has(id)) {
+        const next = new Set(prev)
+        next.delete(id)
+        setThumbPreviewIds(next)
+        return
+      }
+
+      const next = new Set(prev)
+      const multiPlay = selectedIds.size > 1 && selectedIds.has(id)
+      if (multiPlay) {
+        for (const vid of videoIdsFromSelection(selectedIds)) next.add(vid)
+      } else {
+        next.add(id)
+      }
+      setThumbPreviewIds(next)
+
+      if (multiPlay && !secondarySelectMode) {
+        showToast('可开启「二次选择」再挑要批量分类的视频（不打断播放）')
+      }
     },
-    [videos, selectedIds]
+    [
+      videos,
+      selectedIds,
+      thumbPreviewIds,
+      videoIdsFromSelection,
+      showToast,
+      secondarySelectMode
+    ]
   )
 
   /** 点击左上角图标：保存并标记所有操作过的视频为已完成，退回主界面 */
@@ -2963,6 +3341,9 @@ export default function App(): React.JSX.Element {
       setMediaUrl('')
       setExportPreviewUrl(null)
       setSelectedIds(new Set())
+      setSecondaryIds(new Set())
+      setSecondarySelectMode(false)
+      setThumbPreviewIds(new Set())
       selectAnchorRef.current = null
       setBatchUndoItems(null)
       setClipExports([])
@@ -2981,6 +3362,244 @@ export default function App(): React.JSX.Element {
       setStatus('保存失败')
     }
   }, [busy, videos, current, finishCurrent, showToast])
+
+  /**
+   * 保存当前与其它未完成会话的改动（不退回主界面）。
+   * 返回保存后的路径列表，供更新重启后恢复。
+   */
+  const saveAllPendingWork = useCallback(async (): Promise<{
+    ok: boolean
+    paths: string[]
+    currentPath: string | null
+  }> => {
+    if (busy) {
+      showToast('正在处理中，请稍候…')
+      return { ok: false, paths: [], currentPath: null }
+    }
+    const listBefore = videos
+    const currentPathBefore = current?.path || null
+    if (listBefore.length === 0) {
+      return { ok: true, paths: [], currentPath: null }
+    }
+
+    setStatus('正在保存当前工作…')
+    lastFinishedPathRef.current = null
+    const ok = await finishCurrent({ silent: true })
+    if (!ok) {
+      setStatus('保存失败')
+      return { ok: false, paths: listBefore.map((v) => v.path), currentPath: currentPathBefore }
+    }
+
+    const renames = new Map<string, string>()
+    if (
+      currentPathBefore &&
+      lastFinishedPathRef.current &&
+      normMediaPath(lastFinishedPathRef.current) !== normMediaPath(currentPathBefore)
+    ) {
+      renames.set(normMediaPath(currentPathBefore), lastFinishedPathRef.current)
+    }
+
+    let pending: Awaited<ReturnType<typeof window.api.listPendingSessions>> = []
+    try {
+      pending = await window.api.listPendingSessions()
+    } catch {
+      pending = []
+    }
+    const pendingPaths = new Set(pending.map((s) => normMediaPath(s.sourcePath)))
+
+    for (const v of listBefore) {
+      if (currentPathBefore && normMediaPath(v.path) === normMediaPath(currentPathBefore)) {
+        continue
+      }
+      if (v.completed) continue
+      if (!pendingPaths.has(normMediaPath(v.path))) continue
+      try {
+        const result = await window.api.finishVideo({
+          sourcePath: v.path,
+          hasExported: true,
+          soft: true,
+          markDone: true
+        })
+        const to = result?.path || v.path
+        if (to !== v.path) renames.set(normMediaPath(v.path), to)
+      } catch {
+        /* soft 失败忽略 */
+      }
+    }
+
+    let paths = listBefore.map((v) => renames.get(normMediaPath(v.path)) || v.path)
+    const seen = new Set<string>()
+    paths = paths.filter((p) => {
+      const k = normMediaPath(p)
+      if (seen.has(k)) return false
+      seen.add(k)
+      return true
+    })
+
+    const currentPathOut = currentPathBefore
+      ? renames.get(normMediaPath(currentPathBefore)) ||
+        lastFinishedPathRef.current ||
+        currentPathBefore
+      : null
+
+    if (renames.size) {
+      setVideos((prev) =>
+        prev.map((v) => {
+          const to = renames.get(normMediaPath(v.path))
+          return to ? { ...v, completed: true, path: to, name: fileNameOf(to) } : v
+        })
+      )
+    }
+
+    setStatus('')
+    return { ok: true, paths, currentPath: currentPathOut }
+  }, [busy, videos, current, finishCurrent, showToast])
+
+  /** 更新重启后恢复工作区列表 */
+  const restoreWorkspaceResume = useCallback(
+    async (snap: WorkspaceResumeSnapshot): Promise<void> => {
+      const paths = (snap.paths || []).map((p) => String(p || '').trim()).filter(Boolean)
+      if (!paths.length) return
+      setStatus('正在恢复更新前的工作区…')
+      try {
+        if (typeof snap.onlyIncomplete === 'boolean') {
+          setOnlyIncomplete(snap.onlyIncomplete)
+        }
+        const filter =
+          snap.mediaKindFilter === 'video' ||
+          snap.mediaKindFilter === 'image' ||
+          snap.mediaKindFilter === 'all'
+            ? snap.mediaKindFilter
+            : 'all'
+        const items = await window.api.importUserPaths(paths)
+        if (!items.length) {
+          showToast('更新前工作区中的文件已不存在或无法访问')
+          setStatus('')
+          return
+        }
+        setMediaKindFilter(filter)
+        setSelectedIds(new Set())
+        setSecondaryIds(new Set())
+        setSecondarySelectMode(false)
+        setThumbPreviewIds(new Set())
+        selectAnchorRef.current = null
+        setBatchUndoItems(null)
+        setVideos(items)
+        const focus = snap.currentPath ? normMediaPath(snap.currentPath) : ''
+        let idx = focus ? items.findIndex((v) => normMediaPath(v.path) === focus) : -1
+        if (idx < 0) idx = items.findIndex((v) => !v.completed)
+        if (idx < 0) idx = 0
+        await loadVideoAt(idx, items)
+        void window.api.refreshCompletedFlags(items).then((next) => {
+          if (!Array.isArray(next) || next.length === 0) return
+          setVideos((prev) => {
+            const flags = new Map(next.map((v) => [v.path, v]))
+            return prev.map((v) => {
+              const n = flags.get(v.path)
+              return n ? { ...v, completed: n.completed } : v
+            })
+          })
+        })
+        void refreshRemainingHints(items)
+        showToast(`已恢复更新前的工作区（${items.length} 项）`)
+        setStatus('')
+      } catch (err) {
+        reportClientError('restoreWorkspaceResume', err)
+        showToast(err instanceof Error ? err.message : '恢复工作区失败')
+        setStatus('恢复工作区失败')
+      }
+    },
+    [loadVideoAt, refreshRemainingHints, showToast]
+  )
+  restoreWorkspaceResumeRef.current = restoreWorkspaceResume
+
+  /** 一键更新：保存全部操作 → 记下工作区 → 下载 → 安装重启 */
+  const applyOneClickUpdate = useCallback(async (): Promise<void> => {
+    if (busy) {
+      showToast('正在处理中，请稍候…')
+      return
+    }
+    const ver = updateModalRef.current?.version || ''
+    const alreadyReady = updateModalRef.current?.phase === 'ready'
+
+    setUpdateModal({
+      version: ver,
+      phase: 'saving',
+      progress: null,
+      dismissed: false
+    })
+    setUpdateBanner(ver ? `正在保存并更新到 ${ver}…` : '正在保存并准备更新…')
+
+    try {
+      const saved = await saveAllPendingWork()
+      if (!saved.ok) {
+        setUpdateModal({
+          version: ver,
+          phase: 'error',
+          progress: null,
+          error: '保存当前工作失败，已取消更新',
+          dismissed: false
+        })
+        return
+      }
+
+      if (!alreadyReady) {
+        setUpdateModal({
+          version: ver,
+          phase: 'downloading',
+          progress: 0,
+          dismissed: false
+        })
+        setUpdateDownloadPercent(0)
+        setUpdateBanner(ver ? `正在下载更新 ${ver}（0%）` : '正在下载更新（0%）')
+        await window.api.downloadUpdate()
+      }
+
+      if (saved.paths.length > 0) {
+        await window.api.saveWorkspaceResume({
+          version: 1,
+          reason: 'post-update',
+          savedAt: new Date().toISOString(),
+          paths: saved.paths,
+          currentPath: saved.currentPath,
+          onlyIncomplete,
+          mediaKindFilter
+        })
+      }
+
+      setUpdateModal({
+        version: ver,
+        phase: 'installing',
+        progress: 100,
+        dismissed: false
+      })
+      setUpdateBanner('正在安装并重启…')
+      setUpdateDownloadPercent(100)
+      await window.api.installUpdate()
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err)
+      reportClientError('applyOneClickUpdate', err)
+      setUpdateDownloadPercent(null)
+      setUpdateModal({
+        version: ver,
+        phase: 'error',
+        progress: null,
+        error: /ZIP file not provided|zip/i.test(msg)
+          ? '该版本缺少 macOS 自动更新包，请到 GitHub Releases 手动下载安装'
+          : msg || '更新失败',
+        dismissed: false
+      })
+      setUpdateBanner(ver ? `发现新版本 ${ver}` : '发现新版本')
+      showToast(
+        /ZIP file not provided|zip/i.test(msg)
+          ? '该版本缺少 macOS 自动更新包，请到 GitHub Releases 手动下载安装'
+          : msg
+            ? `更新失败：${msg}`
+            : '更新失败'
+      )
+    }
+  }, [busy, saveAllPendingWork, onlyIncomplete, mediaKindFilter, showToast])
+  applyOneClickUpdateRef.current = applyOneClickUpdate
 
   const openSaveModal = useCallback(async () => {
     if (!current || busy) return
@@ -3456,6 +4075,7 @@ export default function App(): React.JSX.Element {
       const currentRemoved = Boolean(current && targetPaths.has(current.path))
 
       try {
+        await releaseMediaForPaths(targets.map((v) => v.path))
         for (const v of targets) {
           await window.api.removeFromWorkspace(v.path, false)
         }
@@ -3467,12 +4087,18 @@ export default function App(): React.JSX.Element {
           for (const v of targets) next.delete(v.id)
           return next
         })
+        setThumbPreviewIds((prev) => {
+          const next = new Set(prev)
+          for (const v of targets) next.delete(v.id)
+          return next
+        })
         selectAnchorRef.current = null
         dirtyRef.current = false
 
         if (nextList.length === 0) {
           setMediaUrl('')
           setExportPreviewUrl(null)
+          setThumbPreviewIds(new Set())
           setIndex(0)
           setStatus('列表已空')
           showToast('已从工作区移除（原文件保留）')
@@ -3492,7 +4118,7 @@ export default function App(): React.JSX.Element {
         showToast(String(err))
       }
     },
-    [busy, current, videos, index, loadVideoAt, showToast]
+    [busy, current, videos, index, loadVideoAt, showToast, releaseMediaForPaths]
   )
 
   const removeSelectedFromWorkspace = useCallback(() => {
@@ -4276,52 +4902,38 @@ export default function App(): React.JSX.Element {
         <div className="busy-banner app-banner busy-banner-accent update-banner">
           <div className="update-banner-row">
             <span className="update-banner-text">{updateBanner}</span>
-            {!updateBanner.includes('已下载') && updateDownloadPercent == null ? (
+            {updateModal?.phase !== 'saving' &&
+            updateModal?.phase !== 'downloading' &&
+            updateModal?.phase !== 'installing' ? (
               <button
                 className="primary"
                 type="button"
                 onClick={() => {
-                  setUpdateDownloadPercent(0)
-                  setUpdateBanner((prev) =>
-                    prev ? `${prev.replace(/（下载中.*$|（\d+%）$/, '').trim()}（0%）` : '正在下载更新（0%）'
-                  )
-                  void window.api
-                    .downloadUpdate()
-                    .then(() => showToast('开始下载更新'))
-                    .catch((err: unknown) => {
-                      const msg = err instanceof Error ? err.message : String(err)
-                      setUpdateDownloadPercent(null)
-                      setUpdateBanner((prev) =>
-                        (prev || '发现新版本').replace(/（下载中.*$|（\d+%）$/, '').trim()
-                      )
-                      if (/ZIP file not provided|zip/i.test(msg)) {
-                        showToast('该版本缺少 macOS 自动更新包，请到 GitHub Releases 手动下载安装')
-                      } else {
-                        showToast(msg ? `下载更新失败：${msg}` : '下载更新失败')
-                      }
-                    })
+                  void applyOneClickUpdateRef.current()
                 }}
               >
-                下载更新
+                {updateBanner.includes('已下载') || updateModal?.phase === 'ready'
+                  ? '一键安装重启'
+                  : '一键更新'}
               </button>
             ) : null}
-            {updateBanner.includes('已下载') ? (
+            {updateModal?.dismissed ? (
               <button
-                className="primary"
                 type="button"
-                onClick={() => {
-                  try {
-                    window.api.installUpdate()
-                  } catch (err) {
-                    showToast(err instanceof Error ? err.message : '安装更新失败')
-                  }
-                }}
+                onClick={() =>
+                  setUpdateModal((prev) =>
+                    prev ? { ...prev, dismissed: false, phase: prev.phase === 'error' ? 'available' : prev.phase } : prev
+                  )
+                }
               >
-                重启安装
+                详情
               </button>
             ) : null}
           </div>
-          {updateDownloadPercent != null && !updateBanner.includes('已下载') ? (
+          {updateDownloadPercent != null &&
+          updateModal?.phase !== 'ready' &&
+          updateModal?.phase !== 'installing' &&
+          !updateBanner.includes('已下载') ? (
             <div
               className="update-progress"
               role="progressbar"
@@ -4364,10 +4976,45 @@ export default function App(): React.JSX.Element {
             选择文件夹或文件
           </button>
           <button
-            disabled={busy || selectedIds.size === 0}
+            disabled={busy || batchTargetVideos.length === 0}
             onClick={() => void openBatchModal()}
+            title={
+              secondarySelectMode
+                ? '分类二次选中的视频（不打断小窗播放、不切主预览）'
+                : '分类当前主选中的视频'
+            }
           >
-            批量分类{selectedIds.size ? ` (${selectedIds.size})` : ''}
+            批量分类{batchTargetVideos.length ? ` (${batchTargetVideos.length})` : ''}
+          </button>
+          <button
+            type="button"
+            className={secondarySelectMode ? 'active-toggle' : undefined}
+            disabled={busy || selectedIds.size <= 1}
+            aria-pressed={secondarySelectMode}
+            onClick={() => {
+              if (secondarySelectMode) {
+                setSecondarySelectMode(false)
+                setSecondaryIds(new Set())
+                return
+              }
+              setSecondarySelectMode(true)
+              setSecondaryIds(new Set())
+              showToast('二次选择已开启：单击已选卡片挑出要分类的视频')
+            }}
+            title={
+              selectedIds.size <= 1
+                ? '请先多选视频后再开启二次选择'
+                : secondarySelectMode
+                  ? '关闭二次选择（重启应用也会默认关闭）'
+                  : '开启后：单击已选卡片进行二次选中，再批量分类（不打断播放）'
+            }
+          >
+            二次选择
+            {secondarySelectMode && secondaryIds.size
+              ? ` (${secondaryIds.size})`
+              : secondarySelectMode
+                ? ' · 开'
+                : ''}
           </button>
           <button
             disabled={busy || batchUndoItems === null}
@@ -4377,15 +5024,27 @@ export default function App(): React.JSX.Element {
             撤回批量
           </button>
           <button
-            disabled={busy || selectedIds.size === 0}
+            disabled={busy || (selectedIds.size === 0 && secondaryIds.size === 0)}
             onClick={() => {
               setSelectedIds(new Set())
+              setSecondaryIds(new Set())
+              setSecondarySelectMode(false)
               selectAnchorRef.current = null
-              setThumbPreviewIds(new Set())
             }}
+            title="仅清除选中，不影响正在小窗播放的视频"
           >
             清除选择
           </button>
+          {thumbPreviewIds.size > 0 ? (
+            <button
+              type="button"
+              disabled={busy}
+              onClick={() => setThumbPreviewIds(new Set())}
+              title="停止全部缩略图小窗预览（Esc 同样有效）"
+            >
+              停止全部小窗{thumbPreviewIds.size > 1 ? ` (${thumbPreviewIds.size})` : ''}
+            </button>
+          ) : null}
           <button
             type="button"
             className="version-check-btn"
@@ -4453,6 +5112,8 @@ export default function App(): React.JSX.Element {
                 const next = e.target.value as MediaKindFilter
                 setMediaKindFilter(next)
                 setSelectedIds(new Set())
+                setSecondaryIds(new Set())
+                setSecondarySelectMode(false)
                 selectAnchorRef.current = null
                 // 切到筛选后首个可见项
                 window.setTimeout(() => {
@@ -4503,6 +5164,7 @@ export default function App(): React.JSX.Element {
           ref={thumbGridRef}
           className="video-list thumb-grid"
           style={{ '--thumb-size': `${thumbSize}px` } as React.CSSProperties}
+          onMouseDown={onThumbGridMouseDown}
         >
           {videos.length === 0 ? (
             <div className="empty-list">尚未导入视频或图片</div>
@@ -4528,6 +5190,7 @@ export default function App(): React.JSX.Element {
                   return (
                     <VideoThumb
                       key={v.id}
+                      id={v.id}
                       path={v.path}
                       name={v.name}
                       parentDirName={v.parentDirName}
@@ -4536,9 +5199,12 @@ export default function App(): React.JSX.Element {
                       mediaKind={v.mediaKind}
                       active={videoIndex === index}
                       selected={selectedIds.has(v.id)}
+                      secondaryPicked={secondaryIds.has(v.id)}
+                      secondaryMode={secondarySelectMode}
                       previewActive={thumbPreviewIds.has(v.id)}
                       disabled={busy}
                       onOpen={() => selectOnlyAndOpen(v.id, videoIndex)}
+                      onActivate={() => openMainFromThumb(videoIndex)}
                       onToggleSelect={() => toggleSelect(v.id, videoIndex)}
                       onRangeSelect={() => rangeSelect(videoIndex)}
                       onPlayClick={() => handleThumbPlay(v.id)}
@@ -4548,6 +5214,17 @@ export default function App(): React.JSX.Element {
               </div>
             </div>
           )}
+          {thumbMarquee ? (
+            <div
+              className="thumb-marquee"
+              style={{
+                left: Math.min(thumbMarquee.x0, thumbMarquee.x1),
+                top: Math.min(thumbMarquee.y0, thumbMarquee.y1),
+                width: Math.abs(thumbMarquee.x1 - thumbMarquee.x0),
+                height: Math.abs(thumbMarquee.y1 - thumbMarquee.y0)
+              }}
+            />
+          ) : null}
         </div>
       </aside>
 
@@ -5512,9 +6189,10 @@ export default function App(): React.JSX.Element {
           <div className="modal modal-save">
             <h2>批量分类</h2>
             <p>
-              将选中的 {selectedVideos.length}{' '}
+              将
+              {secondarySelectMode ? '二次选中' : '选中'}的 {batchTargetVideos.length}{' '}
               个视频移动到类别文件夹（原目录不再保留）。支持一次撤回。
-              {selectedVideos.some((v) => v.isCategoryCopy) ? (
+              {batchTargetVideos.some((v) => v.isCategoryCopy) ? (
                 <>
                   <br />
                   含已归类项：确认后将选择二次分类落点
@@ -5712,6 +6390,90 @@ export default function App(): React.JSX.Element {
               >
                 知道了
               </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {updateModal && !updateModal.dismissed && (
+        <div className="modal-backdrop">
+          <div className="modal modal-update">
+            <h2>
+              {updateModal.phase === 'error'
+                ? '更新失败'
+                : updateModal.phase === 'installing'
+                  ? '正在安装更新'
+                  : updateModal.phase === 'downloading' || updateModal.phase === 'saving'
+                    ? '正在准备更新'
+                    : updateModal.phase === 'ready'
+                      ? '更新已就绪'
+                      : '发现新版本'}
+            </h2>
+            <p>
+              {updateModal.phase === 'error'
+                ? updateModal.error || '更新失败，请稍后重试'
+                : updateModal.phase === 'saving'
+                  ? '正在保存当前全部操作，随后下载并安装更新…'
+                  : updateModal.phase === 'downloading'
+                    ? `正在下载${updateModal.version ? ` ${updateModal.version}` : '新版本'}，完成后将自动安装并重启。重启后会恢复当前工作区。`
+                    : updateModal.phase === 'installing'
+                      ? '安装包已就绪，正在重启应用…'
+                      : updateModal.phase === 'ready'
+                        ? `新版本${updateModal.version ? ` ${updateModal.version}` : ''}已下载。点击一键更新将先保存当前工作，再安装并重启；重启后自动恢复工作区。`
+                        : `检测到新版本${updateModal.version ? ` ${updateModal.version}` : ''}。点击「一键更新」将：保存当前全部操作 → 下载安装包 → 安装并重启 → 自动恢复工作区。`}
+            </p>
+            {(updateModal.phase === 'downloading' || updateModal.phase === 'saving') &&
+            updateModal.progress != null ? (
+              <div
+                className="update-progress update-progress-modal"
+                role="progressbar"
+                aria-valuemin={0}
+                aria-valuemax={100}
+                aria-valuenow={Math.round(updateModal.progress)}
+              >
+                <div
+                  className="update-progress-fill"
+                  style={{ width: `${Math.max(2, Math.round(updateModal.progress))}%` }}
+                />
+                <span className="update-progress-label">
+                  {updateModal.phase === 'saving'
+                    ? '保存中…'
+                    : `${Math.round(updateModal.progress)}%`}
+                </span>
+              </div>
+            ) : null}
+            <div className="modal-actions">
+              {updateModal.phase === 'available' ||
+              updateModal.phase === 'ready' ||
+              updateModal.phase === 'error' ? (
+                <>
+                  <button
+                    type="button"
+                    onClick={() =>
+                      setUpdateModal((prev) => (prev ? { ...prev, dismissed: true } : prev))
+                    }
+                  >
+                    稍后
+                  </button>
+                  <button
+                    type="button"
+                    className="primary"
+                    onClick={() => {
+                      void applyOneClickUpdate()
+                    }}
+                  >
+                    {updateModal.phase === 'ready' ? '一键安装重启' : '一键更新'}
+                  </button>
+                </>
+              ) : (
+                <button type="button" disabled>
+                  {updateModal.phase === 'saving'
+                    ? '正在保存…'
+                    : updateModal.phase === 'downloading'
+                      ? '正在下载…'
+                      : '正在安装…'}
+                </button>
+              )}
             </div>
           </div>
         </div>
