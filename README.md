@@ -25,12 +25,23 @@ npm run dist:mac   # macOS Apple Silicon（arm64 dmg/zip）
 1. 确认 `package.json` → `build.publish` 的 GitHub `owner` / `repo`
 2. 修改 `version`，并在 `src/shared/whatsNew.ts` 增补该版本更新说明
 3. 设置 `GH_TOKEN`（需 `repo` 权限）或 `gh auth login`
-4. **同一 version** 分别在两台机器发布（用户端只会下载本平台安装包）：
+4. **同一 version** 分别发布 Win / Mac（用户端只会下载本平台安装包）：
 
 ```bash
 npm run release:win   # Windows：上传 Setup.exe + latest.yml
 npm run release:mac   # macOS：上传 dmg/zip + latest-mac.yml
 ```
+
+客户端**检查/下载更新**默认走国内可访问的 generic 镜像（不再直连 GitHub API）。  
+仍发布到 GitHub Releases；镜像会代理 `releases/latest/download/`。
+
+自建 OSS/CDN（更稳）时：把 `latest.yml` / `latest-mac.yml` 与安装包放到公开目录，构建或运行前设置：
+
+```bash
+export LABELU_UPDATE_URL="https://your-bucket.example.com/labelu/"
+```
+
+或在用户目录写入 `update-feed-url.txt`。详见 `scripts/sync-update-feed.js` 与 `RELEASE_CHECKLIST.md`。
 
 详见 `RELEASE_CHECKLIST.md`。
 

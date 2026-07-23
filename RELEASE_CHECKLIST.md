@@ -71,6 +71,8 @@ npm run release:mac   # 在 macOS 上发布
 
 ## 更新与日志行为
 
+- 客户端更新源为 **generic**（默认国内 GitHub 镜像；可用 `LABELU_UPDATE_URL` / `update-feed-url.txt` 指向 OSS）
+- 发版仍上传 GitHub Releases；`npm run release:*` 后可运行 `node scripts/sync-update-feed.js` 查看需同步到 OSS 的文件
 - 用户点「下载更新」→「重启安装」：卸旧装新（本平台安装包）
 - 首次打开新版本：弹出「更新内容」；异常日志 `exceptions.log` 会被覆盖清空
 - 顶栏「查看日志」：打开当前异常日志文件

@@ -1,6 +1,6 @@
 {
   "name": "labelu-video",
-  "version": "1.0.3",
+  "version": "1.0.4",
   "description": "视频裁剪打标桌面应用",
   "main": "out/main/index.js",
   "author": "labelu",
@@ -12,6 +12,7 @@
     "postinstall": "node scripts/fix-binaries.js",
     "icons": ".icon-venv/bin/python scripts/make-icons.py",
     "check:whats-new": "node scripts/check-whats-new.js",
+    "sync:update-feed": "node scripts/sync-update-feed.js",
     "prepare:bin:win": "node scripts/prepare-binaries.js win32 x64",
     "prepare:bin:mac": "node scripts/prepare-binaries.js darwin arm64",
     "dist": "npm run dist:mac",
@@ -112,6 +113,10 @@
       "artifactName": "LabelU-Video-Setup-${version}.${ext}"
     },
     "publish": [
+      {
+        "provider": "generic",
+        "url": "https://ghfast.top/https://github.com/Zhangy-Zoey/LabelU/releases/latest/download/"
+      },
       {
         "provider": "github",
         "owner": "Zhangy-Zoey",

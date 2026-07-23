@@ -11,6 +11,7 @@ import path, { join } from 'path'
 import { Readable } from 'stream'
 import fs from 'fs'
 import { autoUpdater } from 'electron-updater'
+import { resolveUpdateFeedUrl } from './updateFeed'
 import { scanPathsAsync, collectCategoryWhitelistPathsAsync, refreshCompletedFlags } from './scanner'
 import {
   probeVideo,
@@ -846,7 +847,13 @@ function setupUpdater(): void {
   if (isDev()) return
   try {
     autoUpdater.autoDownload = false
-    // 按当前平台只解析/下载对应安装包（win→exe，mac→zip/dmg）
+    // 强制走 generic（国内镜像 / OSS），不依赖 GitHub API
+    const feedUrl = resolveUpdateFeedUrl()
+    autoUpdater.setFeedURL({
+      provider: 'generic',
+      url: feedUrl
+    })
+    // 按当前平台只解析/下载对应安装包（win→exe，mac→zip）
     autoUpdater.on('update-available', (info) => {
       sendToRendererWindows('update-available', info)
     })
@@ -1661,6 +1668,8 @@ function setupIpc(): void {
 
   ipcMain.handle('download-update', async () => {
     try {
+      // mac：下载阶段就让 Squirrel 开始取包，避免点「重启安装」时还在干等
+      autoUpdater.autoInstallOnAppQuit = true
       await autoUpdater.downloadUpdate()
       return { ok: true as const }
     } catch (err) {
@@ -1673,14 +1682,61 @@ function setupIpc(): void {
   })
 
   ipcMain.handle('install-update', () => {
-    try {
-      // isSilent=false：未签名包在 mac 上更稳；isForceRunAfter=true 装完重启
-      autoUpdater.quitAndInstall(false, true)
-      return { ok: true as const }
-    } catch (err) {
-      logError('updater.installUpdate', err)
-      throw err instanceof Error ? err : new Error(String(err))
-    }
+    // 主窗口 close 默认 preventDefault；不放开则 quitAndInstall / app.quit 无法退出，表现为「不重启」
+    allowQuit = true
+    closeAskAt = 0
+    setImmediate(() => {
+      try {
+        app.removeAllListeners('window-all-closed')
+        for (const win of BrowserWindow.getAllWindows()) {
+          try {
+            if (win.isDestroyed()) continue
+            win.removeAllListeners('close')
+            win.destroy()
+          } catch {
+            /* ignore */
+          }
+        }
+
+        if (process.platform === 'win32') {
+          try {
+            ;(
+              autoUpdater as {
+                verifyUpdateCodeSignature?: (a: string[], b: string) => Promise<string | null>
+              }
+            ).verifyUpdateCodeSignature = async () => null
+          } catch {
+            /* ignore */
+          }
+          autoUpdater.quitAndInstall(true, true)
+        } else {
+          autoUpdater.quitAndInstall(false, true)
+        }
+
+        // 兜底：未签名 mac 上 Squirrel 常无法自动替换；打开已下载包并强制退出
+        setTimeout(() => {
+          try {
+            const helper = (autoUpdater as unknown as { downloadedUpdateHelper?: { file?: string | null } | null })
+              .downloadedUpdateHelper
+            const file = helper && typeof helper === 'object' ? helper.file : null
+            if (process.platform === 'darwin' && file && fs.existsSync(file)) {
+              void shell.openPath(file)
+            }
+          } catch {
+            /* ignore */
+          }
+          try {
+            app.exit(0)
+          } catch {
+            /* ignore */
+          }
+        }, 2000)
+      } catch (err) {
+        logError('updater.installUpdate', err)
+        allowQuit = false
+      }
+    })
+    return { ok: true as const }
   })
 
   /** 一键更新前写入工作区快照，重启后恢复列表 */

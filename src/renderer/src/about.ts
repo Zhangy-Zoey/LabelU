@@ -130,10 +130,14 @@ async function runCheckAndAutoUpdate(): Promise<void> {
 updateBtn.addEventListener('click', () => {
   void (async () => {
     if (downloaded) {
+      updateBtnLabel.textContent = '正在退出并安装…'
+      updateBtn.disabled = true
       try {
-        window.api.installUpdate()
+        await window.api.installUpdate()
       } catch (err) {
         updateBtn.title = err instanceof Error ? err.message : '安装失败'
+        updateBtnLabel.textContent = '重启安装'
+        updateBtn.disabled = false
       }
       return
     }

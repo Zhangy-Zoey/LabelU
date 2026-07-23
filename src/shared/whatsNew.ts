@@ -6,6 +6,11 @@
  * （`npm run build` / dist / release 会跑 scripts/check-whats-new.js 校验）
  */
 export const WHATS_NEW: Record<string, string[]> = {
+  '1.0.4': [
+    '检查更新与下载改为国内可访问的镜像源（generic），显著加快更新与安装包下载',
+    '修复「重启安装」无法退出应用的问题；未签名包安装流程更可靠',
+    '支持用环境变量 LABELU_UPDATE_URL 或本地 update-feed-url.txt 指向自建 OSS/CDN'
+  ],
   '1.0.3': [
     '多选后可开启「二次选择」：从已选项中再挑目标做批量分类，不打断小窗播放、不切主预览',
     '缩略图支持拖选框选（含滚出视口项）；播放中可继续点选/拖选',
