@@ -3586,7 +3586,9 @@ export default function App(): React.JSX.Element {
         progress: null,
         error: /ZIP file not provided|zip/i.test(msg)
           ? '该版本缺少 macOS 自动更新包，请到 GitHub Releases 手动下载安装'
-          : msg || '更新失败',
+          : /未签名|Code signature|ShipIt|应用程序/i.test(msg)
+            ? msg
+            : msg || '更新失败',
         dismissed: false
       })
       setUpdateBanner(ver ? `发现新版本 ${ver}` : '发现新版本')
@@ -3594,7 +3596,9 @@ export default function App(): React.JSX.Element {
         /ZIP file not provided|zip/i.test(msg)
           ? '该版本缺少 macOS 自动更新包，请到 GitHub Releases 手动下载安装'
           : msg
-            ? `更新失败：${msg}`
+            ? /未签名|Code signature|ShipIt|应用程序/i.test(msg)
+              ? msg
+              : `更新失败：${msg}`
             : '更新失败'
       )
     }

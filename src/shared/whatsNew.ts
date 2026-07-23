@@ -6,6 +6,10 @@
  * （`npm run build` / dist / release 会跑 scripts/check-whats-new.js 校验）
  */
 export const WHATS_NEW: Record<string, string[]> = {
+  '1.0.5': [
+    '修复 macOS 未签名包「重启安装」失败（ShipIt 验签）：改为打开安装包并提示拖到「应用程序」',
+    'macOS 更新不再触发系统自动覆盖，避免 Code signature 报错'
+  ],
   '1.0.4': [
     '检查更新与下载改为国内可访问的镜像源（generic），显著加快更新与安装包下载',
     '修复「重启安装」无法退出应用的问题；未签名包安装流程更可靠',

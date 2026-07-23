@@ -44,7 +44,9 @@ function setProgress(percent: number | null): void {
 
 function renderButton(): void {
   if (downloaded) {
-    updateBtnLabel.textContent = '重启安装'
+    updateBtnLabel.textContent = /Mac|Macintosh/i.test(navigator.userAgent)
+      ? '打开安装包并退出'
+      : '重启安装'
     updateBtn.disabled = false
     setProgress(null)
     setDot(true)
@@ -130,14 +132,16 @@ async function runCheckAndAutoUpdate(): Promise<void> {
 updateBtn.addEventListener('click', () => {
   void (async () => {
     if (downloaded) {
-      updateBtnLabel.textContent = '正在退出并安装…'
+      const isMac = /Mac|Macintosh/i.test(navigator.userAgent)
+      updateBtnLabel.textContent = isMac ? '正在打开安装包…' : '正在退出并安装…'
       updateBtn.disabled = true
       try {
         await window.api.installUpdate()
       } catch (err) {
         updateBtn.title = err instanceof Error ? err.message : '安装失败'
-        updateBtnLabel.textContent = '重启安装'
+        updateBtnLabel.textContent = isMac ? '打开安装包并退出' : '重启安装'
         updateBtn.disabled = false
+        versionEl.textContent = err instanceof Error ? err.message : '安装失败'
       }
       return
     }
@@ -183,6 +187,9 @@ window.api.onUpdateError((message) => {
   setProgress(null)
   renderButton()
   updateBtn.title = message || '更新失败'
+  if (/未签名|手动|应用程序|Code signature|ShipIt/i.test(message || '')) {
+    versionEl.textContent = message || '请手动安装更新'
+  }
 })
 
 window.api.onAboutAutoUpdate(() => {

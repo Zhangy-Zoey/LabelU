@@ -835,18 +835,58 @@ app.on('window-all-closed', () => {
   if (process.platform !== 'darwin') app.quit()
 })
 
-/** 后台检查更新时的「正常」失败：首发尚无 Release、网络抖动等，不写异常日志、不弹 toast */
+/** 后台检查更新时的「正常」失败：首发尚无 Release、网络抖动、未签名 mac ShipIt 等 */
 function isBenignUpdaterMiss(err: unknown): boolean {
   const msg = err instanceof Error ? err.message : String(err || '')
-  return /No published versions on GitHub|404|Cannot find .+ in latest|ERR_CONNECTION|ENOTFOUND|ETIMEDOUT|net::ERR_/i.test(
+  return /No published versions on GitHub|404|Cannot find .+ in latest|ERR_CONNECTION|ENOTFOUND|ETIMEDOUT|net::ERR_|Code signature|did not pass validation|ShipIt|代码不含资源/i.test(
     msg
   )
+}
+
+function isMacUnsignedShipItError(err: unknown): boolean {
+  const msg = err instanceof Error ? err.message : String(err || '')
+  return /Code signature|did not pass validation|ShipIt|代码不含资源/i.test(msg)
+}
+
+function getDownloadedUpdateFile(): string | null {
+  try {
+    const helper = (
+      autoUpdater as unknown as {
+        downloadedUpdateHelper?: { file?: string | null } | null
+      }
+    ).downloadedUpdateHelper
+    const file = helper && typeof helper === 'object' ? helper.file : null
+    if (file && fs.existsSync(file)) return file
+  } catch {
+    /* ignore */
+  }
+  return null
+}
+
+/** 强制允许退出并销毁全部窗口（绕过主窗口 close 拦截） */
+function forceQuitForUpdate(): void {
+  allowQuit = true
+  closeAskAt = 0
+  app.removeAllListeners('window-all-closed')
+  for (const win of BrowserWindow.getAllWindows()) {
+    try {
+      if (win.isDestroyed()) continue
+      win.removeAllListeners('close')
+      win.destroy()
+    } catch {
+      /* ignore */
+    }
+  }
 }
 
 function setupUpdater(): void {
   if (isDev()) return
   try {
     autoUpdater.autoDownload = false
+    // 未签名 mac：绝不能让 Squirrel/ShipIt 自动安装（会校验签名并失败）
+    if (process.platform === 'darwin') {
+      autoUpdater.autoInstallOnAppQuit = false
+    }
     // 强制走 generic（国内镜像 / OSS），不依赖 GitHub API
     const feedUrl = resolveUpdateFeedUrl()
     autoUpdater.setFeedURL({
@@ -866,8 +906,15 @@ function setupUpdater(): void {
       sendToRendererWindows('update-download-progress', percent)
     })
     autoUpdater.on('error', (err) => {
-      // 尚无 Release / 网络抖动：静默跳过，不写 exceptions.log
       if (isBenignUpdaterMiss(err)) return
+      // 未签名 mac 的 ShipIt 报错对用户改为可操作提示
+      if (process.platform === 'darwin' && isMacUnsignedShipItError(err)) {
+        sendToRendererWindows(
+          'update-error',
+          '当前 macOS 包未签名，无法自动覆盖安装。请下载更新包后手动拖到「应用程序」。'
+        )
+        return
+      }
       logError('updater', err)
       sendToRendererWindows(
         'update-error',
@@ -1668,37 +1715,36 @@ function setupIpc(): void {
 
   ipcMain.handle('download-update', async () => {
     try {
-      // mac：下载阶段就让 Squirrel 开始取包，避免点「重启安装」时还在干等
-      autoUpdater.autoInstallOnAppQuit = true
+      // mac 未签名：禁止 Squirrel 接手（autoInstallOnAppQuit=true 会触发 ShipIt 验签失败）
+      if (process.platform === 'darwin') {
+        autoUpdater.autoInstallOnAppQuit = false
+      } else {
+        autoUpdater.autoInstallOnAppQuit = true
+      }
       await autoUpdater.downloadUpdate()
       return { ok: true as const }
     } catch (err) {
+      if (process.platform === 'darwin' && isMacUnsignedShipItError(err)) {
+        const message =
+          '当前 macOS 包未签名，无法走系统自动安装。请到 GitHub Releases 下载 dmg，拖到「应用程序」后打开。'
+        sendToRendererWindows('update-error', message)
+        throw new Error(message)
+      }
       const message = err instanceof Error ? err.message : String(err)
-      // ZIP missing / 签名等问题：告知用户，便于改手动下载
       logError('updater.downloadUpdate', err)
       sendToRendererWindows('update-error', message)
       throw err instanceof Error ? err : new Error(message)
     }
   })
 
-  ipcMain.handle('install-update', () => {
-    // 主窗口 close 默认 preventDefault；不放开则 quitAndInstall / app.quit 无法退出，表现为「不重启」
-    allowQuit = true
-    closeAskAt = 0
-    setImmediate(() => {
-      try {
-        app.removeAllListeners('window-all-closed')
-        for (const win of BrowserWindow.getAllWindows()) {
-          try {
-            if (win.isDestroyed()) continue
-            win.removeAllListeners('close')
-            win.destroy()
-          } catch {
-            /* ignore */
-          }
-        }
-
-        if (process.platform === 'win32') {
+  ipcMain.handle('install-update', async () => {
+    // Windows：NSIS 可 quitAndInstall
+    if (process.platform === 'win32') {
+      allowQuit = true
+      closeAskAt = 0
+      setImmediate(() => {
+        try {
+          forceQuitForUpdate()
           try {
             ;(
               autoUpdater as {
@@ -1709,34 +1755,65 @@ function setupIpc(): void {
             /* ignore */
           }
           autoUpdater.quitAndInstall(true, true)
-        } else {
-          autoUpdater.quitAndInstall(false, true)
-        }
-
-        // 兜底：未签名 mac 上 Squirrel 常无法自动替换；打开已下载包并强制退出
-        setTimeout(() => {
-          try {
-            const helper = (autoUpdater as unknown as { downloadedUpdateHelper?: { file?: string | null } | null })
-              .downloadedUpdateHelper
-            const file = helper && typeof helper === 'object' ? helper.file : null
-            if (process.platform === 'darwin' && file && fs.existsSync(file)) {
-              void shell.openPath(file)
+          setTimeout(() => {
+            try {
+              app.exit(0)
+            } catch {
+              /* ignore */
             }
-          } catch {
-            /* ignore */
-          }
-          try {
-            app.exit(0)
-          } catch {
-            /* ignore */
-          }
-        }, 2000)
-      } catch (err) {
-        logError('updater.installUpdate', err)
-        allowQuit = false
+          }, 2500)
+        } catch (err) {
+          logError('updater.installUpdate', err)
+          allowQuit = false
+        }
+      })
+      return { ok: true as const, mode: 'nsis' as const }
+    }
+
+    // macOS 未签名：不能 quitAndInstall（ShipIt 验签必挂）。打开已下载 zip/dmg，请用户拖入应用程序。
+    const file = getDownloadedUpdateFile()
+    if (!file) {
+      throw new Error(
+        '未找到已下载的安装包。请到 GitHub Releases 下载 dmg，拖到「应用程序」后重新打开。'
+      )
+    }
+
+    // 复制到下载文件夹，方便用户找到
+    let openTarget = file
+    try {
+      const downloads = app.getPath('downloads')
+      const dest = path.join(downloads, path.basename(file))
+      if (path.resolve(dest) !== path.resolve(file)) {
+        fs.copyFileSync(file, dest)
+        openTarget = dest
       }
-    })
-    return { ok: true as const }
+    } catch {
+      /* 用原路径即可 */
+    }
+
+    await shell.openPath(openTarget)
+    const win = BrowserWindow.getFocusedWindow() || mainWindow
+    if (win && !win.isDestroyed()) {
+      await dialog.showMessageBox(win, {
+        type: 'info',
+        title: '请手动完成安装',
+        message: 'macOS 未签名版本无法自动覆盖安装',
+        detail:
+          '已打开更新包（通常在「下载」里）。请将 LabelU Video 拖到「应用程序」文件夹替换旧版，然后重新打开。\n\n点击「退出」关闭当前版本。',
+        buttons: ['退出'],
+        defaultId: 0
+      })
+    }
+
+    forceQuitForUpdate()
+    setTimeout(() => {
+      try {
+        app.exit(0)
+      } catch {
+        /* ignore */
+      }
+    }, 300)
+    return { ok: true as const, mode: 'manual-mac' as const, path: openTarget }
   })
 
   /** 一键更新前写入工作区快照，重启后恢复列表 */
