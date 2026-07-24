@@ -6,6 +6,13 @@
  * （`npm run build` / dist / release 会跑 scripts/check-whats-new.js 校验）
  */
 export const WHATS_NEW: Record<string, string[]> = {
+  '1.0.6': [
+    '大幅优化 Windows / macOS 流畅度：播放指针刷新节流、选帧抓取更轻、裁切遮罩更省 GPU',
+    'HEVC 优先系统硬解，播失败或黑屏时再自动生成 H.264 兼容预览；已生成的预览会缓存复用',
+    'Windows：媒体 Range 改为异步读取；可选 LABELU_FORCE_DGPU=1 强制独显',
+    'macOS：兼容预览与缩略图优先 VideoToolbox 硬件编解码，FFmpeg 并发略提高',
+    '修复代理回退打断微调、代理失败无法重试、帧条加载挂起等稳定性问题'
+  ],
   '1.0.5': [
     '修复 macOS 未签名包「重启安装」失败（ShipIt 验签）：改为打开安装包并提示拖到「应用程序」',
     'macOS 更新不再触发系统自动覆盖，避免 Code signature 报错'

@@ -5,6 +5,7 @@ import { IMAGE_TIMELINE_SECONDS, MIN_SELECTION_SECONDS, isImagePath } from '../.
 import { clamp, computeRemainingFromExports, formatTime, formatTimecode, formatTimelineTime, frameDuration, frameIndex, isMeaningfulCrop, minSelectionGap, resolveClipSelection, selectionTolerance, snapToFrame, stepByFrames, totalDuration, sanitizeName, compareMediaPaths, joinMediaDir, mediaDirname, mediaBasename } from '../../shared/utils'
 import { isPresetCategory, applyCustomCategoryTags, getCustomCategoryTags, loadCustomCategoryTags, saveCustomCategoryTags, categoryShadeStyle, tryRemoveCustomCategoryTag, isBuiltinCategoryTag, findCustomCategoryGroup } from '../../shared/categories'
 import { filmstripOrder, seekAndCaptureFrame, seekVideo } from './frameCapture'
+import { codecMayNeedProxyFallback, waitForDecodedFrame } from './playbackHealth'
 import { CategoryChips } from './CategoryChips'
 import { VideoThumb } from './VideoThumb'
 import { hitTestThumbMarquee } from './thumbMarquee'
@@ -629,6 +630,11 @@ export default function App(): React.JSX.Element {
   /** 当前主预览对应的源路径；HEVC 代理失败重试用 */
   const playSourcePathRef = useRef('')
   const previewProxyTriedRef = useRef(false)
+  /** 当前片可能是 HEVC：优先硬解，解不出帧再强制代理 */
+  const playMayNeedProxyRef = useRef(false)
+  const decodeWatchGenRef = useRef(0)
+  /** 同片源切到兼容预览时保留选帧状态 */
+  const keepFineTuneOnNextMediaUrlRef = useRef(false)
   const imageRef = useRef<HTMLImageElement>(null)
   const cropRef = useRef<CropRect>(FULL_CROP)
   cropRef.current = crop
@@ -657,6 +663,8 @@ export default function App(): React.JSX.Element {
   timelineMarkersRef.current = timelineMarkers
   /** 递增以作废尚未完成的 play()，避免定格后又被异步播放拉起 */
   const playbackGenRef = useRef(0)
+  /** 节流 timeupdate → setState，避免整页 30~60Hz 重渲导致 Win 卡顿 */
+  const lastUiTimeUpdateRef = useRef(0)
   const selStartRef = useRef(selStart)
   const selEndRef = useRef(selEnd)
   const frameCacheRef = useRef(new Map<string, string>())
@@ -1182,6 +1190,13 @@ export default function App(): React.JSX.Element {
   useEffect(() => {
     frameCacheRef.current.clear()
     filmstripGenRef.current++
+    if (keepFineTuneOnNextMediaUrlRef.current) {
+      keepFineTuneOnNextMediaUrlRef.current = false
+      // 代理切换：保留微调模式，清空旧解码器帧（拖动手柄会再刷帧条）
+      setFilmstrip(null)
+      setStillFrameUrl(null)
+      return
+    }
     setFilmstrip(null)
     setFineTuneWhich(null)
     setStillFrameUrl(null)
@@ -1259,6 +1274,15 @@ export default function App(): React.JSX.Element {
       const offsets = filmstripOrder(FILMSTRIP_RADIUS)
 
       void (async () => {
+        let captured = 0
+        const publish = (): void => {
+          if (gen !== filmstripGenRef.current) return
+          setFilmstrip({
+            which,
+            centerTime: edge,
+            items: buildFilmstripItems(edge)
+          })
+        }
         for (const off of offsets) {
           if (gen !== filmstripGenRef.current) return
           const t = off === 0 ? edge : clamp((centerIdx + off) / fpsStep, 0, dur)
@@ -1267,31 +1291,45 @@ export default function App(): React.JSX.Element {
           if (frameCacheRef.current.has(cacheKey)) continue
           try {
             if (video.readyState < 1) {
-              await new Promise<void>((resolve) => {
-                const done = (): void => {
-                  video.removeEventListener('loadeddata', done)
-                  resolve()
+              await new Promise<void>((resolve, reject) => {
+                if (gen !== filmstripGenRef.current) {
+                  reject(new Error('filmstrip cancelled'))
+                  return
                 }
-                video.addEventListener('loadeddata', done)
+                let settled = false
+                const finish = (ok: boolean): void => {
+                  if (settled) return
+                  settled = true
+                  window.clearTimeout(timer)
+                  video.removeEventListener('loadeddata', onReady)
+                  video.removeEventListener('error', onErr)
+                  if (ok) resolve()
+                  else reject(new Error('scrub load failed'))
+                }
+                const onReady = (): void => finish(true)
+                const onErr = (): void => finish(false)
+                const timer = window.setTimeout(() => finish(true), 2500)
+                video.addEventListener('loadeddata', onReady)
+                video.addEventListener('error', onErr)
               })
             }
             if (gen !== filmstripGenRef.current) return
-            const url = await seekAndCaptureFrame(video, t, 400)
+            // 较小宽度 + 中等 JPEG：拖拽选帧时 UI 线程压力小很多
+            const url = await seekAndCaptureFrame(video, t, 220, 0.7)
             if (gen !== filmstripGenRef.current) return
             frameCacheRef.current.set(cacheKey, url)
             if (frameCacheRef.current.size > 480) {
               const keys = Array.from(frameCacheRef.current.keys()).slice(0, 160)
               for (const k of keys) frameCacheRef.current.delete(k)
             }
-            setFilmstrip({
-              which,
-              centerTime: edge,
-              items: buildFilmstripItems(edge)
-            })
+            captured++
+            // 中心帧立刻刷新；其余合并（每 3 帧 / 末帧）减少 React 重渲
+            if (off === 0 || captured % 3 === 0) publish()
           } catch {
             /* skip missing frame */
           }
         }
+        publish()
       })()
     },
     [buildFilmstripItems, mediaUrl, duration, ensureScrubReady]
@@ -1506,11 +1544,16 @@ export default function App(): React.JSX.Element {
   useEffect(() => {
     const el = thumbGridRef.current
     if (!el) return
+    let raf = 0
     const sync = (): void => {
-      setThumbViewportH(el.clientHeight)
-      setThumbScrollTop(el.scrollTop)
-      // 与 CSS auto-fill 列宽一致：扣除 grid padding
-      setThumbContentW(Math.max(1, el.clientWidth - 24))
+      if (raf) return
+      raf = requestAnimationFrame(() => {
+        raf = 0
+        setThumbViewportH(el.clientHeight)
+        setThumbScrollTop(el.scrollTop)
+        // 与 CSS auto-fill 列宽一致：扣除 grid padding
+        setThumbContentW(Math.max(1, el.clientWidth - 24))
+      })
     }
     sync()
     el.addEventListener('scroll', sync, { passive: true })
@@ -1519,6 +1562,7 @@ export default function App(): React.JSX.Element {
     return () => {
       el.removeEventListener('scroll', sync)
       ro.disconnect()
+      if (raf) cancelAnimationFrame(raf)
     }
   }, [videos.length, sidebarWidth])
 
@@ -2012,21 +2056,23 @@ export default function App(): React.JSX.Element {
 
         playSourcePathRef.current = item.path
         previewProxyTriedRef.current = false
+        const mayNeed = !isImage && codecMayNeedProxyFallback(probe.videoCodec)
+        playMayNeedProxyRef.current = mayNeed
+        decodeWatchGenRef.current++
+        // 无 force：有历史兼容预览缓存则复用，否则原片硬解
         let playPath = item.path
-        if (!isImage && probe.needsPreviewProxy) {
-          setStatus('正在生成兼容预览…')
-          const proxy = await window.api.ensurePreviewProxy(item.path)
+        if (!isImage) {
+          const proxy = await window.api.ensurePreviewProxy(item.path, false, true)
           if (gen !== loadGenRef.current) return
           playPath = proxy.path
-          previewProxyTriedRef.current = true
           if (proxy.proxied) {
-            showToast('已使用兼容预览（原片为 HEVC）')
+            previewProxyTriedRef.current = true
+            playMayNeedProxyRef.current = false
           }
         }
         const url = await window.api.getMediaUrl(playPath)
         if (gen !== loadGenRef.current) return
         setMediaUrl(url)
-        if (!isImage && probe.needsPreviewProxy) setStatus('')
       } catch (err: unknown) {
         if (gen !== loadGenRef.current) return
         setMediaUrl('')
@@ -2271,24 +2317,70 @@ export default function App(): React.JSX.Element {
     [videos, index, thumbPreviewIds.size, secondarySelectMode, selectedIds]
   )
 
-  /** 完成/撤销完成后重新挂可播 URL（Win HEVC 走代理） */
+  /** 完成/撤销完成后重新挂可播 URL；有缓存代理则复用 */
   const reloadPlayableMedia = useCallback(async (sourcePath: string): Promise<void> => {
     playSourcePathRef.current = sourcePath
     previewProxyTriedRef.current = false
     try {
       const probe = await window.api.probe(sourcePath)
-      if (probe.needsPreviewProxy) {
-        previewProxyTriedRef.current = true
-        const proxy = await window.api.ensurePreviewProxy(sourcePath, false, true)
-        setMediaUrl(proxy.url)
-        return
-      }
+      playMayNeedProxyRef.current = codecMayNeedProxyFallback(probe.videoCodec)
     } catch {
-      /* fall through to raw url */
+      playMayNeedProxyRef.current = false
     }
-    const url = await window.api.getMediaUrl(sourcePath)
-    setMediaUrl(url)
+    try {
+      const proxy = await window.api.ensurePreviewProxy(sourcePath, false, true)
+      if (proxy.proxied) {
+        previewProxyTriedRef.current = true
+        playMayNeedProxyRef.current = false
+      }
+      setMediaUrl(proxy.url)
+    } catch {
+      const url = await window.api.getMediaUrl(sourcePath)
+      setMediaUrl(url)
+    }
   }, [])
+
+  /** 同片源切到兼容预览时保留选帧状态，避免微调被打断 */
+  const fallbackToPreviewProxy = useCallback(async (reason: 'error' | 'nodecode'): Promise<void> => {
+    if (exportPreviewUrlRef.current) return
+    const sourcePath = playSourcePathRef.current
+    if (!sourcePath || previewProxyTriedRef.current) return
+    previewProxyTriedRef.current = true
+    setStatus('正在生成兼容预览…')
+    try {
+      const proxy = await window.api.ensurePreviewProxy(sourcePath, true)
+      const url = await window.api.getMediaUrl(proxy.path)
+      if (playSourcePathRef.current !== sourcePath) return
+      keepFineTuneOnNextMediaUrlRef.current = true
+      playMayNeedProxyRef.current = false
+      setMediaUrl(url)
+      showToast(reason === 'nodecode' ? '原片无法解码，已切换兼容预览' : '已切换为兼容预览')
+      setStatus('')
+    } catch (err) {
+      // 允许用户再次触发回退（换片前）
+      previewProxyTriedRef.current = false
+      showToast(`视频无法播放：${String(err)}`)
+      setStatus('视频加载失败')
+    }
+  }, [showToast])
+
+  /** HEVC 等：黑屏时常不触发 error，用「是否解出帧」兜底 */
+  const ensurePlayableOrProxy = useCallback((): void => {
+    if (!playMayNeedProxyRef.current) return
+    if (previewProxyTriedRef.current || exportPreviewUrlRef.current) return
+    const sourcePath = playSourcePathRef.current
+    if (!sourcePath) return
+    const v = videoRef.current
+    if (!v) return
+    const watchGen = ++decodeWatchGenRef.current
+    void (async () => {
+      const ok = await waitForDecodedFrame(v, 2200)
+      if (watchGen !== decodeWatchGenRef.current) return
+      if (ok) return
+      if (playSourcePathRef.current !== sourcePath) return
+      await fallbackToPreviewProxy('nodecode')
+    })()
+  }, [fallbackToPreviewProxy])
 
   /** 松开指定路径相关媒体句柄；尽量保留其它小窗继续播 */
   const releaseMediaForPaths = useCallback(
@@ -4534,11 +4626,12 @@ export default function App(): React.JSX.Element {
       const t = pendingSeek
       pendingSeek = null
       const now = performance.now()
-      if (now - lastFilmstripAt >= 90) {
+      // Win 上 seek+canvas 很重：拖拽时降低帧条/预览刷新频率
+      if (now - lastFilmstripAt >= 160) {
         lastFilmstripAt = now
         scheduleFilmstrip(which, t)
       }
-      if (which === 'in' && now - lastPreviewAt >= 100) {
+      if (which === 'in' && now - lastPreviewAt >= 140) {
         lastPreviewAt = now
         void seekPreviewFrame(t, { force: true })
       }
@@ -5366,50 +5459,60 @@ export default function App(): React.JSX.Element {
                         onTimeUpdate={() => {
                           const v = videoRef.current
                           if (!v) return
+                          const endT = previewEndRef.current
+                          // 选区终点必须每帧检查，不能节流
+                          if (endT != null && endT > 0 && v.currentTime >= endT - 0.04) {
+                            const a = Math.min(selStartRef.current, selEndRef.current)
+                            const b = Math.max(selStartRef.current, selEndRef.current)
+                            if (loopSelectionRef.current && b - a >= 0.05 && !v.paused) {
+                              if (selectionLoopGuardRef.current) return
+                              selectionLoopGuardRef.current = true
+                              try {
+                                v.currentTime = a
+                              } catch {
+                                /* ignore */
+                              }
+                              setCurrentTime(a)
+                              previewEndRef.current = b
+                              window.setTimeout(() => {
+                                selectionLoopGuardRef.current = false
+                                const cur = videoRef.current
+                                if (!cur || cur.paused) return
+                                if (previewEndRef.current == null) return
+                                void cur.play().catch(() => undefined)
+                              }, 40)
+                              return
+                            }
+                            try {
+                              v.pause()
+                            } catch {
+                              /* ignore */
+                            }
+                            try {
+                              v.currentTime = endT
+                            } catch {
+                              /* ignore */
+                            }
+                            previewEndRef.current = null
+                            setCurrentTime(endT)
+                            return
+                          }
+                          // 导出片段映射到时间轴：也不要被 80ms 节流挡住
                           if (exportPreviewUrl && selectedExportPath) {
                             const exp = clipExports.find((e) => e.path === selectedExportPath)
                             if (exp && Number.isFinite(v.duration) && v.duration > 0) {
+                              const now = performance.now()
+                              if (now - lastUiTimeUpdateRef.current < 80) return
+                              lastUiTimeUpdateRef.current = now
                               const ratio = clamp(v.currentTime / v.duration, 0, 1)
                               setCurrentTime(exp.start + ratio * (exp.end - exp.start))
                               return
                             }
                           }
+                          const now = performance.now()
+                          if (now - lastUiTimeUpdateRef.current < 80) return
+                          lastUiTimeUpdateRef.current = now
                           setCurrentTime(v.currentTime)
-                          const endT = previewEndRef.current
-                          if (endT == null || !(endT > 0) || v.currentTime < endT - 0.04) return
-                          const a = Math.min(selStartRef.current, selEndRef.current)
-                          const b = Math.max(selStartRef.current, selEndRef.current)
-                          if (loopSelectionRef.current && b - a >= 0.05 && !v.paused) {
-                            if (selectionLoopGuardRef.current) return
-                            selectionLoopGuardRef.current = true
-                            try {
-                              v.currentTime = a
-                            } catch {
-                              /* ignore */
-                            }
-                            setCurrentTime(a)
-                            previewEndRef.current = b
-                            window.setTimeout(() => {
-                              selectionLoopGuardRef.current = false
-                              const cur = videoRef.current
-                              if (!cur || cur.paused) return
-                              if (previewEndRef.current == null) return
-                              void cur.play().catch(() => undefined)
-                            }, 40)
-                            return
-                          }
-                          try {
-                            v.pause()
-                          } catch {
-                            /* ignore */
-                          }
-                          try {
-                            v.currentTime = endT
-                          } catch {
-                            /* ignore */
-                          }
-                          previewEndRef.current = null
-                          setCurrentTime(endT)
                         }}
                         onPlay={() => {
                           setStillFrameUrl(null)
@@ -5446,8 +5549,9 @@ export default function App(): React.JSX.Element {
                               setStillFrameUrl(null)
                             })
                             .catch(() => {
-                              /* ignore */
+                              /* ignore — 看门狗 / onError 负责回退 */
                             })
+                          ensurePlayableOrProxy()
                         }}
                         onError={() => {
                           const active = exportPreviewUrlRef.current || mediaUrlRef.current
@@ -5466,20 +5570,7 @@ export default function App(): React.JSX.Element {
                           }
                           const sourcePath = playSourcePathRef.current
                           if (sourcePath && !previewProxyTriedRef.current) {
-                            previewProxyTriedRef.current = true
-                            setStatus('正在生成兼容预览…')
-                            void (async () => {
-                              try {
-                                const proxy = await window.api.ensurePreviewProxy(sourcePath, true)
-                                const url = await window.api.getMediaUrl(proxy.path)
-                                setMediaUrl(url)
-                                showToast('已切换为兼容预览')
-                                setStatus('')
-                              } catch (err) {
-                                showToast(`视频无法播放：${String(err)}`)
-                                setStatus('视频加载失败')
-                              }
-                            })()
+                            void fallbackToPreviewProxy('error')
                             return
                           }
                           const err = v?.error
@@ -5517,25 +5608,56 @@ export default function App(): React.JSX.Element {
                           <div className="crop-draw-hint">按住拖拽框选裁切区域</div>
                         )}
                         {(cropCommitted || crop.width > 0.005 || crop.height > 0.005) && (
-                          <div
-                            className="crop-box"
-                            style={{
-                              left: `${crop.x * 100}%`,
-                              top: `${crop.y * 100}%`,
-                              width: `${Math.max(crop.width, 0.002) * 100}%`,
-                              height: `${Math.max(crop.height, 0.002) * 100}%`
-                            }}
-                            onMouseDown={cropCommitted ? startCropDrag('move') : undefined}
-                          >
-                            {cropCommitted && (
-                              <>
-                                <div className="crop-handle nw" onMouseDown={startCropDrag('nw')} />
-                                <div className="crop-handle ne" onMouseDown={startCropDrag('ne')} />
-                                <div className="crop-handle sw" onMouseDown={startCropDrag('sw')} />
-                                <div className="crop-handle se" onMouseDown={startCropDrag('se')} />
-                              </>
-                            )}
-                          </div>
+                          <>
+                            {/* 四边遮罩替代 9999px box-shadow，避免 Win 集显拖拽卡顿 */}
+                            <div
+                              className="crop-dim crop-dim-t"
+                              style={{ height: `${crop.y * 100}%` }}
+                            />
+                            <div
+                              className="crop-dim crop-dim-b"
+                              style={{
+                                top: `${(crop.y + crop.height) * 100}%`,
+                                height: `${Math.max(0, 1 - crop.y - crop.height) * 100}%`
+                              }}
+                            />
+                            <div
+                              className="crop-dim crop-dim-l"
+                              style={{
+                                top: `${crop.y * 100}%`,
+                                height: `${Math.max(crop.height, 0.002) * 100}%`,
+                                width: `${crop.x * 100}%`
+                              }}
+                            />
+                            <div
+                              className="crop-dim crop-dim-r"
+                              style={{
+                                top: `${crop.y * 100}%`,
+                                left: `${(crop.x + crop.width) * 100}%`,
+                                height: `${Math.max(crop.height, 0.002) * 100}%`,
+                                width: `${Math.max(0, 1 - crop.x - crop.width) * 100}%`
+                              }}
+                            />
+                            <div
+                              className="crop-box"
+                              style={{
+                                left: `${crop.x * 100}%`,
+                                top: `${crop.y * 100}%`,
+                                width: `${Math.max(crop.width, 0.002) * 100}%`,
+                                height: `${Math.max(crop.height, 0.002) * 100}%`
+                              }}
+                              onMouseDown={cropCommitted ? startCropDrag('move') : undefined}
+                            >
+                              {cropCommitted && (
+                                <>
+                                  <div className="crop-handle nw" onMouseDown={startCropDrag('nw')} />
+                                  <div className="crop-handle ne" onMouseDown={startCropDrag('ne')} />
+                                  <div className="crop-handle sw" onMouseDown={startCropDrag('sw')} />
+                                  <div className="crop-handle se" onMouseDown={startCropDrag('se')} />
+                                </>
+                              )}
+                            </div>
+                          </>
                         )}
                       </div>
                     )}
@@ -5561,13 +5683,13 @@ export default function App(): React.JSX.Element {
 
               {!currentIsImage && (
               <>
-              {/* 隐藏 scrub 视频：拖拽入出点时抓取附近帧 */}
+              {/* 隐藏 scrub 视频：拖拽入出点时抓取附近帧（metadata 避免与主播放器抢解码带宽） */}
               <video
                 ref={scrubVideoRef}
                 className="scrub-video-hidden"
                 src={mediaUrl || undefined}
                 muted
-                preload="auto"
+                preload="metadata"
                 playsInline
               />
               <div

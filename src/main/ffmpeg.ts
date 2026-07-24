@@ -170,29 +170,24 @@ interface ProbeInfo {
   fps: number
   /** ffprobe 视频编码名，如 hevc / h264 */
   videoCodec: string
-  /** Windows Chromium 等环境下需转码预览 */
+  /**
+   * 是否为 HEVC 等可能需兼容预览的编码。
+   * 仅作提示；实际是否转码由播放失败后 force 代理决定（不再开机即转）。
+   */
   needsPreviewProxy: boolean
 }
 
-/**
- * Chromium 对 HEVC 支持因平台而异：
- * - Windows：几乎总要 H.264 代理
- * - macOS：优先系统解码；播失败时由调用方 force 再生成代理
- */
-function codecNeedsPreviewProxy(codecName: string | undefined | null): boolean {
+/** HEVC 家族编码（与渲染进程 codecMayNeedProxyFallback 对齐） */
+function codecMayNeedProxyFallback(codecName: string | undefined | null): boolean {
   if (!codecName) return false
   const c = codecName.toLowerCase()
-  if (!(c.includes('hevc') || c.includes('h265') || c.includes('hev1') || c.includes('hvc1'))) {
-    return false
-  }
-  return process.platform === 'win32'
+  return c.includes('hevc') || c.includes('h265') || c.includes('hev1') || c.includes('hvc1')
 }
 
 /**
- * 有限并发：Win 多路 HEVC 代理可并行（默认 2），又避免无限 spawn。
- * activeChildren 跟踪全部子进程，取消时可整树杀掉。
+ * 有限并发：Mac 上缩略/代理可略放开；Win 仍限制以免杀软+软解打满。
  */
-const FFMPEG_MAX_CONCURRENT = process.platform === 'win32' ? 2 : 2
+const FFMPEG_MAX_CONCURRENT = process.platform === 'darwin' ? 3 : 2
 let ffmpegInFlight = 0
 const ffmpegWaiters: Array<() => void> = []
 
@@ -349,7 +344,7 @@ export async function probeVideo(filePath: string): Promise<ProbeInfo> {
     rotation,
     fps,
     videoCodec,
-    needsPreviewProxy: codecNeedsPreviewProxy(videoCodec)
+    needsPreviewProxy: codecMayNeedProxyFallback(videoCodec)
   }
   probeCache.set(cacheKey, { mtime, info })
   return info
@@ -690,13 +685,68 @@ export async function generateThumbnail(videoPath: string): Promise<string> {
   const tmp = path.join(cacheDir, `${hash}.tmp.jpg`)
   const isImage = isImageMediaPath(videoPath)
   const scale = "scale='min(480,iw)':-2"
+  // macOS：Videotoolbox 硬解 HEVC 抽帧明显更快
+  const hwaccel =
+    process.platform === 'darwin' && !isImage
+      ? (['-hwaccel', 'videotoolbox'] as string[])
+      : ([] as string[])
   /** 多组参数：HEVC/损坏时间戳在 Win 上对 -ss 位置敏感 */
   const attemptArgs: string[][] = isImage
     ? [['-y', '-i', videoPath, '-frames:v', '1', '-q:v', '5', '-vf', scale, '-f', 'image2', tmp]]
     : [
-        ['-y', '-ss', '0.5', '-i', videoPath, '-frames:v', '1', '-an', '-q:v', '5', '-vf', scale, '-f', 'image2', tmp],
-        ['-y', '-i', videoPath, '-ss', '0', '-frames:v', '1', '-an', '-q:v', '5', '-vf', scale, '-f', 'image2', tmp],
-        ['-y', '-ss', '0', '-i', videoPath, '-frames:v', '1', '-an', '-q:v', '5', '-vf', scale, '-f', 'image2', tmp]
+        [
+          '-y',
+          ...hwaccel,
+          '-ss',
+          '0.5',
+          '-i',
+          videoPath,
+          '-frames:v',
+          '1',
+          '-an',
+          '-q:v',
+          '5',
+          '-vf',
+          scale,
+          '-f',
+          'image2',
+          tmp
+        ],
+        [
+          '-y',
+          ...hwaccel,
+          '-i',
+          videoPath,
+          '-ss',
+          '0',
+          '-frames:v',
+          '1',
+          '-an',
+          '-q:v',
+          '5',
+          '-vf',
+          scale,
+          '-f',
+          'image2',
+          tmp
+        ],
+        [
+          '-y',
+          '-ss',
+          '0',
+          '-i',
+          videoPath,
+          '-frames:v',
+          '1',
+          '-an',
+          '-q:v',
+          '5',
+          '-vf',
+          scale,
+          '-f',
+          'image2',
+          tmp
+        ]
       ]
 
   let lastErr = ''
@@ -738,8 +788,9 @@ export async function generateThumbnail(videoPath: string): Promise<string> {
 const previewProxyInFlight = new Map<string, Promise<{ path: string; proxied: boolean }>>()
 
 /**
- * 为 Chromium 难以直出的编码生成 H.264 预览代理。
- * Windows 对 HEVC 默认需要；macOS 优先原片，force 时仍可生成（播失败回退）。
+ * 为 Chromium 难以直出的编码生成 / 复用 H.264 预览代理。
+ * - 无 force：若已有缓存代理则复用，否则返回原片（优先硬解）
+ * - force：重新生成代理（播失败 / 解不出帧时由渲染进程调用）
  */
 export async function ensurePreviewProxy(
   sourcePath: string,
@@ -749,10 +800,6 @@ export async function ensurePreviewProxy(
   if (!fs.existsSync(abs)) throw new Error('源视频不存在')
   if (isImageMediaPath(abs)) return { path: abs, proxied: false }
 
-  const probe = await probeVideo(abs)
-  const need = opts?.force || probe.needsPreviewProxy
-  if (!need) return { path: abs, proxied: false }
-
   const cacheDir = path.join(app.getPath('userData'), 'preview-proxy')
   fs.mkdirSync(cacheDir, { recursive: true })
   let mtime = 0
@@ -761,15 +808,18 @@ export async function ensurePreviewProxy(
   } catch {
     throw new Error('源视频不存在')
   }
-  const cacheKey =
-    process.platform === 'win32' ? abs.toLowerCase() : abs
-  // v3：临时文件必须为 *.part.mp4（勿用 *.mp4.part，Windows FFmpeg 无法识别 muxer）
-  const hash = crypto.createHash('md5').update(`${cacheKey}|${mtime}|v3`).digest('hex')
+  const cacheKey = process.platform === 'win32' ? abs.toLowerCase() : abs
+  // v5：Mac 预览代理优先 VideoToolbox；跨平台仍限 960p
+  const hash = crypto.createHash('md5').update(`${cacheKey}|${mtime}|v5`).digest('hex')
   const out = path.join(cacheDir, `${hash}.mp4`)
-  const flightKey = `${cacheKey}|${mtime}|v3|${opts?.force ? '1' : '0'}`
+  const flightKey = `${cacheKey}|${mtime}|v5|${opts?.force ? '1' : '0'}`
 
-  if (!opts?.force && fs.existsSync(out) && fs.statSync(out).size > 1024) {
+  if (fs.existsSync(out) && fs.statSync(out).size > 1024) {
     return { path: out, proxied: true }
+  }
+
+  if (!opts?.force) {
+    return { path: abs, proxied: false }
   }
 
   const existing = previewProxyInFlight.get(flightKey)
@@ -789,14 +839,11 @@ async function buildPreviewProxy(
   out: string,
   opts?: { force?: boolean; onProgress?: (msg: string) => void }
 ): Promise<{ path: string; proxied: boolean }> {
-  if (opts?.force) {
-    try {
-      if (fs.existsSync(out)) fs.unlinkSync(out)
-    } catch {
-      /* ignore */
-    }
-  } else if (fs.existsSync(out) && fs.statSync(out).size > 1024) {
-    return { path: out, proxied: true }
+  // force 路径：清掉旧缓存后重建
+  try {
+    if (fs.existsSync(out)) fs.unlinkSync(out)
+  } catch {
+    /* ignore */
   }
 
   opts?.onProgress?.('正在生成兼容预览（HEVC→H.264）…')
@@ -813,28 +860,37 @@ async function buildPreviewProxy(
     }
   }
 
-  const runProxy = async (withAudio: boolean): Promise<{ code: number; stderr: string }> => {
+  const runProxy = async (
+    withAudio: boolean,
+    mode: 'videotoolbox' | 'libx264'
+  ): Promise<{ code: number; stderr: string }> => {
+    // 仅作预览：限制分辨率；macOS 优先 VideoToolbox 硬编，失败再软编
     const args = [
       '-hide_banner',
       '-loglevel',
       'error',
       '-y',
+      ...(mode === 'videotoolbox' ? (['-hwaccel', 'videotoolbox'] as string[]) : []),
       '-i',
       abs,
       '-map',
       '0:v:0',
       ...(withAudio ? ['-map', '0:a?'] : ['-an']),
       '-vf',
-      "scale='min(1280,iw)':-2",
-      '-c:v',
-      'libx264',
-      '-preset',
-      'veryfast',
-      '-crf',
-      '23',
-      '-pix_fmt',
-      'yuv420p',
-      ...(withAudio ? ['-c:a', 'aac', '-b:a', '128k'] : []),
+      "scale='min(960,iw)':-2",
+      ...(mode === 'videotoolbox'
+        ? (['-c:v', 'h264_videotoolbox', '-b:v', '2500k', '-allow_sw', '1', '-pix_fmt', 'yuv420p'] as string[])
+        : ([
+            '-c:v',
+            'libx264',
+            '-preset',
+            'ultrafast',
+            '-crf',
+            '28',
+            '-pix_fmt',
+            'yuv420p'
+          ] as string[])),
+      ...(withAudio ? ['-c:a', 'aac', '-b:a', '96k'] : []),
       '-movflags',
       '+faststart',
       '-f',
@@ -844,18 +900,29 @@ async function buildPreviewProxy(
     return run(bin, args, undefined, 1_800_000)
   }
 
-  let { code, stderr } = await runProxy(true)
-  if (code !== 0 || !fs.existsSync(tmp) || fs.statSync(tmp).size < 1024) {
-    try {
-      if (fs.existsSync(tmp)) fs.unlinkSync(tmp)
-    } catch {
-      /* ignore */
+  const tryModes: Array<'videotoolbox' | 'libx264'> =
+    process.platform === 'darwin' ? ['videotoolbox', 'libx264'] : ['libx264']
+
+  let code = 1
+  let stderr = ''
+  let ok = false
+  for (const mode of tryModes) {
+    for (const withAudio of [true, false]) {
+      try {
+        if (fs.existsSync(tmp)) fs.unlinkSync(tmp)
+      } catch {
+        /* ignore */
+      }
+      ;({ code, stderr } = await runProxy(withAudio, mode))
+      if (code === 0 && fs.existsSync(tmp) && fs.statSync(tmp).size >= 1024) {
+        ok = true
+        break
+      }
     }
-    // 部分素材音频轨异常：无声再试一次仍可预览画面
-    ;({ code, stderr } = await runProxy(false))
+    if (ok) break
   }
 
-  if (code !== 0 || !fs.existsSync(tmp) || fs.statSync(tmp).size < 1024) {
+  if (!ok) {
     try {
       if (fs.existsSync(tmp)) fs.unlinkSync(tmp)
     } catch {

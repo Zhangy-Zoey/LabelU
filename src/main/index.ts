@@ -157,6 +157,19 @@ try {
   )
   app.commandLine.appendSwitch('enable-accelerated-video-decode')
   app.commandLine.appendSwitch('ignore-gpu-blocklist')
+  app.commandLine.appendSwitch('enable-gpu-rasterization')
+  if (process.platform === 'win32') {
+    // Win11 遮挡计算偶发导致窗口掉帧
+    app.commandLine.appendSwitch('disable-features', 'CalculateNativeWinOcclusion')
+    // 独显强制切换在部分驱动上会闪退；仅显式开启时启用
+    if (process.env.LABELU_FORCE_DGPU === '1') {
+      app.commandLine.appendSwitch('force_high_performance_gpu')
+    }
+  } else if (process.platform === 'darwin') {
+    // 减少后台标签/失焦时对解码与合成的节流，选帧拖拽更稳
+    app.commandLine.appendSwitch('disable-renderer-backgrounding')
+    app.commandLine.appendSwitch('disable-background-timer-throttling')
+  }
 } catch {
   /* ignore */
 }
@@ -630,7 +643,9 @@ function createWindow(): void {
       contextIsolation: true,
       nodeIntegration: false,
       sandbox: false,
-      webSecurity: true
+      webSecurity: true,
+      // 失焦时仍保持流畅播放/拖拽选帧（默认会降频）
+      backgroundThrottling: false
     }
   })
 
@@ -696,8 +711,19 @@ app.whenReady().then(() => {
     return 'application/octet-stream'
   }
 
+  // Range 请求极频繁：用异步 stat（勿 sync），避免卡住主进程；不长缓存以免文件被替换后 size 过期
+  const resolveMediaSize = async (filePath: string): Promise<number | null> => {
+    try {
+      const st = await fs.promises.stat(filePath)
+      if (!st.isFile()) return null
+      return st.size
+    } catch {
+      return null
+    }
+  }
+
   // 必须支持 Range，否则 video.currentTime 跳转会失败，看起来总像从片头播
-  protocol.handle('media', (request) => {
+  protocol.handle('media', async (request) => {
     try {
       const prefix = 'media://abs/'
       if (!request.url.startsWith(prefix)) {
@@ -707,12 +733,11 @@ app.whenReady().then(() => {
       if (!isPathAllowed(filePath)) {
         return new Response('Forbidden', { status: 403 })
       }
-      if (!fs.existsSync(filePath)) {
+      const size = await resolveMediaSize(filePath)
+      if (size == null) {
         return new Response('Not Found', { status: 404 })
       }
 
-      const stat = fs.statSync(filePath)
-      const size = stat.size
       const mime = mimeFor(filePath)
       const range = request.headers.get('Range') || request.headers.get('range')
 

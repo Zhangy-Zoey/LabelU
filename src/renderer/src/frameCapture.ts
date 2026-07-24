@@ -1,23 +1,24 @@
-/** 从已 seek 的 video 抓一帧为 JPEG dataURL（高清，供选区帧条） */
+/** 从已 seek 的 video 抓一帧为 JPEG dataURL（选区帧条） */
 export async function seekAndCaptureFrame(
   video: HTMLVideoElement,
   time: number,
-  width = 360
+  width = 240,
+  quality = 0.72
 ): Promise<string> {
   await seekVideo(video, time)
   const vw = video.videoWidth || 160
   const vh = video.videoHeight || 90
-  const dpr = typeof window !== 'undefined' ? Math.min(2, window.devicePixelRatio || 1) : 1
-  const targetW = Math.round(width * dpr)
+  // 帧条不需要 retina 倍图：Windows 上 dpr=2 会使 JPEG 编码成本翻倍
+  const targetW = Math.max(80, Math.round(width))
   const canvas = document.createElement('canvas')
   canvas.width = targetW
   canvas.height = Math.max(1, Math.round((targetW * vh) / vw))
-  const ctx = canvas.getContext('2d')
+  const ctx = canvas.getContext('2d', { alpha: false })
   if (!ctx) throw new Error('canvas unavailable')
   ctx.imageSmoothingEnabled = true
-  ctx.imageSmoothingQuality = 'high'
+  ctx.imageSmoothingQuality = 'medium'
   ctx.drawImage(video, 0, 0, canvas.width, canvas.height)
-  return canvas.toDataURL('image/jpeg', 0.92)
+  return canvas.toDataURL('image/jpeg', quality)
 }
 
 /** 可靠 seek：带超时，避免 media 协议偶发不触发 seeked 导致永久挂起 */

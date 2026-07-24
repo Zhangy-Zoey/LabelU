@@ -1159,10 +1159,38 @@ body.panning-video {
   white-space: nowrap;
 }
 
+.crop-dim {
+  position: absolute;
+  left: 0;
+  right: auto;
+  width: 100%;
+  background: rgba(0, 0, 0, 0.35);
+  pointer-events: none;
+}
+
+.crop-dim-t {
+  top: 0;
+  left: 0;
+  width: 100%;
+}
+
+.crop-dim-b {
+  left: 0;
+  width: 100%;
+}
+
+.crop-dim-l {
+  left: 0;
+}
+
+.crop-dim-r {
+  right: 0;
+  left: auto;
+}
+
 .crop-box {
   position: absolute;
   border: 2px solid var(--crop);
-  box-shadow: 0 0 0 9999px rgba(0, 0, 0, 0.35);
   pointer-events: auto;
   cursor: move;
 }

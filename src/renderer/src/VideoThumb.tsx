@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState } from 'react'
+import { codecMayNeedProxyFallback, waitForDecodedFrame } from './playbackHealth'
 
 const MOD_KEY = /Mac|Macintosh/i.test(navigator.userAgent) ? '⌘' : 'Ctrl'
 
@@ -59,6 +60,7 @@ export function VideoThumb({
   const [previewDuration, setPreviewDuration] = useState(0)
   /** macOS 等：原片 HEVC 播失败后强制走 H.264 代理 */
   const proxyForcedRef = useRef(false)
+  const decodeWatchGenRef = useRef(0)
   const previewing = previewActive && Boolean(previewUrl)
 
   useEffect(() => {
@@ -88,6 +90,7 @@ export function VideoThumb({
   }, [path])
 
   const stopPreviewMedia = (): void => {
+    decodeWatchGenRef.current++
     const v = videoRef.current
     if (v) {
       try {
@@ -104,22 +107,53 @@ export function VideoThumb({
     scrubbingRef.current = false
   }
 
+  const retryWithForcedProxy = (): void => {
+    if (proxyForcedRef.current || !previewActive) return
+    proxyForcedRef.current = true
+    const watchGen = ++decodeWatchGenRef.current
+    void (async () => {
+      try {
+        const proxy = await window.api.ensurePreviewProxy(path, true, true)
+        if (watchGen !== decodeWatchGenRef.current || !previewActive) return
+        setPreviewUrl(proxy.url)
+        setPreviewTime(0)
+        setPreviewDuration(0)
+        requestAnimationFrame(() => {
+          if (watchGen !== decodeWatchGenRef.current) return
+          const v = videoRef.current
+          if (!v) return
+          v.muted = true
+          v.currentTime = 0
+          void v.play().catch(() => undefined)
+        })
+      } catch {
+        if (watchGen !== decodeWatchGenRef.current) return
+        proxyForcedRef.current = false
+        stopPreviewMedia()
+      }
+    })()
+  }
+
   // 父组件控制开/关小窗预览
   useEffect(() => {
     let cancelled = false
     proxyForcedRef.current = false
+    decodeWatchGenRef.current++
     if (!previewActive) {
       stopPreviewMedia()
       return
     }
     void (async () => {
       try {
-        // 可播则返回原片 URL；Win HEVC 会生成代理。quiet 不抢全局 busy
+        // 无 force：有缓存代理则复用，否则原片。quiet 不抢全局 busy
         const proxy = await window.api.ensurePreviewProxy(path, false, true)
         if (cancelled) return
         setPreviewUrl(proxy.url)
         setPreviewTime(0)
         setPreviewDuration(0)
+        const alreadyProxied = proxy.proxied
+        if (alreadyProxied) proxyForcedRef.current = true
+        const watchGen = ++decodeWatchGenRef.current
         requestAnimationFrame(() => {
           if (cancelled) return
           const v = videoRef.current
@@ -127,6 +161,21 @@ export function VideoThumb({
           v.muted = true
           v.currentTime = 0
           void v.play().catch(() => undefined)
+          if (alreadyProxied) return
+          // 仅对可能需代理的编码做黑屏看门狗，避免 H.264 慢加载误转码
+          void (async () => {
+            let mayNeed = false
+            try {
+              const probe = await window.api.probe(path)
+              mayNeed = codecMayNeedProxyFallback(probe.videoCodec)
+            } catch {
+              mayNeed = false
+            }
+            if (cancelled || watchGen !== decodeWatchGenRef.current || !mayNeed) return
+            const ok = await waitForDecodedFrame(v, 2200)
+            if (cancelled || watchGen !== decodeWatchGenRef.current) return
+            if (!ok) retryWithForcedProxy()
+          })()
         })
       } catch {
         if (!cancelled) stopPreviewMedia()
@@ -138,28 +187,6 @@ export function VideoThumb({
     // path 变化时由父级关掉 previewActive 或重开
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [previewActive, path])
-
-  const retryWithForcedProxy = (): void => {
-    if (proxyForcedRef.current || !previewActive) return
-    proxyForcedRef.current = true
-    void (async () => {
-      try {
-        const proxy = await window.api.ensurePreviewProxy(path, true, true)
-        setPreviewUrl(proxy.url)
-        setPreviewTime(0)
-        setPreviewDuration(0)
-        requestAnimationFrame(() => {
-          const v = videoRef.current
-          if (!v) return
-          v.muted = true
-          v.currentTime = 0
-          void v.play().catch(() => undefined)
-        })
-      } catch {
-        stopPreviewMedia()
-      }
-    })()
-  }
 
   useEffect(
     () => () => {

@@ -123,7 +123,7 @@ export type LabeluApi = {
   consumeWorkspaceResume: () => Promise<WorkspaceResumeSnapshot | null>
   openAbout: (opts?: { autoUpdate?: boolean }) => Promise<boolean>
   getMediaUrl: (filePath: string) => Promise<string>
-  /** HEVC 等：Windows 默认转 H.264 代理；macOS 优先原片，播失败可 force */
+  /** HEVC 等：优先硬解；无 force 时复用已有代理缓存，播失败可 force */
   ensurePreviewProxy: (
     filePath: string,
     force?: boolean,
