@@ -75,4 +75,4 @@ npm run release:mac   # 在 macOS 上发布
 - 发版仍上传 GitHub Releases；`npm run release:*` 后可运行 `node scripts/sync-update-feed.js` 查看需同步到 OSS 的文件
 - 用户点「下载更新」→「重启安装」：卸旧装新（本平台安装包）
 - 首次打开新版本：弹出「更新内容」；异常日志 `exceptions.log` 会被覆盖清空
-- 顶栏「查看日志」：打开当前异常日志文件
+- 顶栏「查看日志」：打开操作日志 `operations.log`（给用户看）；异常写入 `exceptions.log` 并邮件上报

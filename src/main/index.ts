@@ -11,6 +11,7 @@ import path, { join } from 'path'
 import { Readable } from 'stream'
 import fs from 'fs'
 import { autoUpdater } from 'electron-updater'
+import { initMainSentry, flushErrorReports } from './sentry'
 import { resolveUpdateFeedUrl } from './updateFeed'
 import { scanPathsAsync, collectCategoryWhitelistPathsAsync, refreshCompletedFlags } from './scanner'
 import {
@@ -40,13 +41,9 @@ import {
   clearCompletedFlag,
   isCompleted,
   classifyWholeFileAsync,
-  appendBatchClassifyUndo,
-  clearBatchClassifyUndo,
-  takeBatchClassifyUndo,
-  restoreBatchClassifyUndo,
   undoBatchClassifyMoves,
-  peekBatchClassifyUndo,
   initBatchUndoStore,
+  moveFileVerified,
   beginCategoryScanCache,
   endCategoryScanCache,
   listCategoryDirectories,
@@ -68,11 +65,25 @@ import type {
 import { IMAGE_TIMELINE_SECONDS, isImagePath } from '../shared/types'
 import { computeRemainingFromExports, isMeaningfulCrop, totalDuration, validateClipSelection } from '../shared/utils'
 import {
-  applyCustomCategoryTags,
-  getCustomCategoryTags,
-  type ExtensibleGroupId
+  applyCategoryTagsPersistPayload,
+  getCategoryTagsPersistPayload,
+  type CategoryTagsPersistPayload
 } from '../shared/categories'
 import { appendLog, getLogDir, getExceptionLogPath, initLogger, logError } from './logger'
+import { initOpLog, openOperationsLog } from './opLog'
+import {
+  initHistoryStore,
+  historyPush,
+  historyPopUndo,
+  historyPopRedo,
+  historyRestoreFailedUndo,
+  historyRestoreFailedRedo,
+  historyPatchEntry,
+  historyRemoveEntry,
+  historySnapshot,
+  historyLogOnly
+} from './historyStore'
+import type { OpHistoryEntry, OpKind } from '../shared/opTypes'
 import { applyStartupVersionCheck, markWhatsNewSeen, type StartupVersionInfo } from './versionState'
 import {
   saveWorkspaceResume,
@@ -84,6 +95,13 @@ import {
 /** 推算段仅供回看展示，不参与可剪剩余区 / 工作区持久化 */
 function preciseExports(exports: ExportRecord[]): ExportRecord[] {
   return exports.filter((e) => !e.approx)
+}
+
+// 错误上报（邮件）尽量靠前
+try {
+  initMainSentry()
+} catch {
+  /* ignore */
 }
 
 /** 开发时父进程/终端管道断开后，console 写入会抛 EIO/EPIPE 并变成 Uncaught Exception */
@@ -116,8 +134,11 @@ function ignoreBrokenStdio(): void {
     } catch {
       /* ignore */
     }
-    // 非管道错误必须退出，否则会留下黑屏/空壳进程
-    process.exit(1)
+    // 尽量把错误邮件发出去再退出
+    void flushErrorReports(2000).finally(() => {
+      process.exit(1)
+    })
+    setTimeout(() => process.exit(1), 2500)
   })
   process.on('unhandledRejection', (reason) => {
     logError('unhandledRejection', reason)
@@ -309,6 +330,10 @@ function pathCompareKey(p: string): string {
   return process.platform === 'win32' ? abs.toLowerCase() : abs
 }
 
+function pathsEqualKey(a: string, b: string): boolean {
+  return pathCompareKey(a) === pathCompareKey(b)
+}
+
 function isUnderAllowedRoot(abs: string, root: string): boolean {
   const a = pathCompareKey(abs)
   const r = pathCompareKey(root)
@@ -384,7 +409,9 @@ function emitProgress(message: string): void {
   }
 }
 
-function enqueueThumbnail(filePath: string): Promise<string> {
+function enqueueThumbnail(
+  filePath: string
+): Promise<{ url: string; width: number; height: number }> {
   return new Promise((resolve, reject) => {
     const run = async (): Promise<void> => {
       while (thumbActive >= THUMB_MAX_CONCURRENT) {
@@ -397,8 +424,8 @@ function enqueueThumbnail(filePath: string): Promise<string> {
       }
       thumbActive++
       try {
-        const url = await generateThumbnail(filePath)
-        resolve(url)
+        const result = await generateThumbnail(filePath)
+        resolve(result)
       } catch (err) {
         reject(err)
       } finally {
@@ -570,8 +597,25 @@ function setupApplicationMenu(): void {
     {
       label: '编辑',
       submenu: [
-        { role: 'undo' },
-        { role: 'redo' },
+        // 不用 role:undo/redo：系统加速键会抢走渲染进程 ⌘/Ctrl+Z，导致业务撤销失效
+        {
+          label: '撤销',
+          accelerator: 'CommandOrControl+Z',
+          registerAccelerator: false,
+          click: () => {
+            const win = BrowserWindow.getFocusedWindow() || mainWindow
+            win?.webContents.send('app-undo')
+          }
+        },
+        {
+          label: '复原',
+          accelerator: 'CommandOrControl+Shift+Z',
+          registerAccelerator: false,
+          click: () => {
+            const win = BrowserWindow.getFocusedWindow() || mainWindow
+            win?.webContents.send('app-redo')
+          }
+        },
         { type: 'separator' },
         { role: 'cut' },
         { role: 'copy' },
@@ -690,6 +734,8 @@ function createWindow(): void {
 
 app.whenReady().then(() => {
   initLogger()
+  initOpLog()
+  initHistoryStore()
   const startupInfo = applyStartupVersionCheck()
 
   // 把启动信息挂到全局，供首屏 IPC 读取（避免重复跑版本逻辑）
@@ -812,7 +858,7 @@ app.whenReady().then(() => {
 
   createWindow()
   setupApplicationMenu()
-  // 窗口创建后再读撤回缓存 / 自定义标签 / 白名单种子，不挡首屏
+  // 窗口创建后再清理旧撤回缓存 / 加载自定义标签 / 白名单种子，不挡首屏
   setImmediate(() => {
     initBatchUndoStore()
     loadCustomCategoriesFromDisk()
@@ -835,10 +881,8 @@ function loadCustomCategoriesFromDisk(): void {
   try {
     const f = customCategoriesStorePath()
     if (!fs.existsSync(f)) return
-    const raw = JSON.parse(fs.readFileSync(f, 'utf8')) as Partial<
-      Record<ExtensibleGroupId, string[]>
-    >
-    applyCustomCategoryTags(raw)
+    const raw = JSON.parse(fs.readFileSync(f, 'utf8')) as CategoryTagsPersistPayload
+    applyCategoryTagsPersistPayload(raw)
   } catch {
     /* ignore */
   }
@@ -848,7 +892,7 @@ function persistCustomCategoriesToDisk(): void {
   try {
     fs.writeFileSync(
       customCategoriesStorePath(),
-      JSON.stringify(getCustomCategoryTags(), null, 2),
+      JSON.stringify(getCategoryTagsPersistPayload(), null, 2),
       'utf8'
     )
   } catch {
@@ -981,7 +1025,6 @@ function setupIpc(): void {
     setBusy(true)
     emitProgress('正在导入…')
     try {
-      clearBatchClassifyUndo()
       return await scanAndRememberAsync(paths)
     } finally {
       setBusy(false)
@@ -1094,7 +1137,6 @@ function setupIpc(): void {
       setBusy(true)
       emitProgress('正在导入…')
       try {
-        clearBatchClassifyUndo()
         return await scanAndRememberAsync(result.filePaths)
       } finally {
         setBusy(false)
@@ -1168,16 +1210,13 @@ function setupIpc(): void {
     return true
   })
 
-  ipcMain.handle(
-    'set-custom-categories',
-    (_e, map: Partial<Record<ExtensibleGroupId, string[]>>) => {
-      applyCustomCategoryTags(map)
-      persistCustomCategoriesToDisk()
-      return true
-    }
-  )
+  ipcMain.handle('set-custom-categories', (_e, map: CategoryTagsPersistPayload) => {
+    applyCategoryTagsPersistPayload(map)
+    persistCustomCategoriesToDisk()
+    return true
+  })
 
-  ipcMain.handle('get-custom-categories', () => getCustomCategoryTags())
+  ipcMain.handle('get-custom-categories', () => getCategoryTagsPersistPayload())
 
   ipcMain.handle('export-image', async (_e, req: ImageExportRequest) => {
     assertCanWork()
@@ -1401,7 +1440,7 @@ function setupIpc(): void {
         /* ignore */
       }
       const exports = preciseExports(
-        state.exports.filter((x) => x.path !== entry.exportPath)
+        state.exports.filter((x) => !pathsEqualKey(x.path, entry.exportPath))
       )
       const undoStack = state.undoStack.slice(0, -1)
       const remaining = computeRemainingFromExports(state.duration, exports)
@@ -1433,7 +1472,7 @@ function setupIpc(): void {
     try {
       const state = await loadSession(sourcePath)
       if (!state) throw new Error('没有会话记录')
-      const exp = state.exports.find((x) => x.path === exportPath)
+      const exp = state.exports.find((x) => pathsEqualKey(x.path, exportPath))
       if (!exp) throw new Error('找不到该分类片段')
       if (fs.existsSync(exportPath)) {
         fs.unlinkSync(exportPath)
@@ -1444,8 +1483,8 @@ function setupIpc(): void {
       } catch {
         /* ignore */
       }
-      const exports = preciseExports(state.exports.filter((x) => x.path !== exportPath))
-      const undoStack = state.undoStack.filter((u) => u.exportPath !== exportPath)
+      const exports = preciseExports(state.exports.filter((x) => !pathsEqualKey(x.path, exportPath)))
+      const undoStack = state.undoStack.filter((u) => !pathsEqualKey(u.exportPath, exportPath))
       const remaining = computeRemainingFromExports(state.duration, exports)
       const next: SessionState = {
         ...state,
@@ -1504,10 +1543,20 @@ function setupIpc(): void {
             const donePath = await markCompleted(sourcePath)
             rememberAllowedPath(donePath)
             clearSession(sourcePath)
+            historyLogOnly({
+              kind: 'finishVideo',
+              label: '标记完成',
+              detail: { sourcePath, path: donePath, markDone: true }
+            })
             return { action: 'kept' as const, path: donePath }
           }
           if (!hasExported) {
             clearSession(sourcePath)
+            historyLogOnly({
+              kind: 'finishVideo',
+              label: '完成（无导出）',
+              detail: { sourcePath }
+            })
             return { action: 'none' as const, path: sourcePath }
           }
           if (soft) {
@@ -1524,6 +1573,11 @@ function setupIpc(): void {
         const donePath = await markCompleted(sourcePath)
         rememberAllowedPath(donePath)
         clearSession(sourcePath)
+        historyLogOnly({
+          kind: 'finishVideo',
+          label: '标记完成',
+          detail: { sourcePath, path: donePath, exportCount }
+        })
         return { action: 'kept' as const, path: donePath }
       } finally {
         setBusy(false)
@@ -1552,6 +1606,11 @@ function setupIpc(): void {
     async (_e, sourcePath: string, deleteSourceFile: boolean) => {
       assertAllowedPath(sourcePath, '源文件')
       await removeFromWorkspace(sourcePath, Boolean(deleteSourceFile))
+      historyLogOnly({
+        kind: 'removeFromWorkspace',
+        label: deleteSourceFile ? '从工作区移除并删除源文件' : '从工作区移除',
+        detail: { sourcePath, deleteSourceFile: Boolean(deleteSourceFile) }
+      })
       return true
     }
   )
@@ -1565,12 +1624,16 @@ function setupIpc(): void {
         message?: string
         stack?: string
         extra?: unknown
+        forceMail?: boolean
       }
     ) => {
       const tag = String(payload?.tag || 'renderer')
       const message = String(payload?.message || 'unknown')
       const stack = payload?.stack ? String(payload.stack) : ''
-      appendLog('error', tag, stack ? `${message}\n${stack}` : message, payload?.extra)
+      // 每次写入异常日志都会发信；forceMail 跳过去重
+      appendLog('error', tag, stack ? `${message}\n${stack}` : message, payload?.extra, {
+        force: Boolean(payload?.forceMail)
+      })
       return {
         ok: true,
         logDir: getLogDir(),
@@ -1591,29 +1654,142 @@ function setupIpc(): void {
     return true
   })
 
-  ipcMain.handle('open-exception-log', async () => {
-    const file = getExceptionLogPath()
-    try {
-      if (!fs.existsSync(file)) {
-        fs.mkdirSync(path.dirname(file), { recursive: true })
-        fs.writeFileSync(file, '', 'utf8')
+  ipcMain.handle('open-operations-log', async () => openOperationsLog())
+
+  ipcMain.handle('op-history-state', () => historySnapshot())
+
+  ipcMain.handle(
+    'op-history-push',
+    (
+      _e,
+      payload: {
+        kind: OpKind
+        label: string
+        undo: unknown
+        redo: unknown
+        detail?: unknown
       }
-      const err = await shell.openPath(file)
-      if (err) {
-        // 个别环境无法直接打开文件时，退化为打开所在目录
-        await shell.openPath(path.dirname(file))
-        return { ok: false, path: file, error: err }
+    ) => {
+      if (!payload?.kind || !payload?.label) throw new Error('无效的历史记录')
+      const entry = historyPush({
+        kind: payload.kind,
+        label: String(payload.label),
+        undo: payload.undo,
+        redo: payload.redo,
+        detail: payload.detail
+      })
+      return { entry, state: historySnapshot() }
+    }
+  )
+
+  ipcMain.handle(
+    'op-history-log',
+    (_e, payload: { kind: string; label: string; detail?: unknown }) => {
+      historyLogOnly({
+        kind: String(payload?.kind || 'note'),
+        label: String(payload?.label || ''),
+        detail: payload?.detail
+      })
+      return true
+    }
+  )
+
+  ipcMain.handle('op-history-undo', () => {
+    const entry = historyPopUndo()
+    return { entry: entry as OpHistoryEntry | null, state: historySnapshot() }
+  })
+
+  ipcMain.handle('op-history-redo', () => {
+    const entry = historyPopRedo()
+    return { entry: entry as OpHistoryEntry | null, state: historySnapshot() }
+  })
+
+  ipcMain.handle('op-history-restore-undo', (_e, entry: OpHistoryEntry) => {
+    if (entry?.id) historyRestoreFailedUndo(entry)
+    return historySnapshot()
+  })
+
+  ipcMain.handle('op-history-restore-redo', (_e, entry: OpHistoryEntry) => {
+    if (entry?.id) historyRestoreFailedRedo(entry)
+    return historySnapshot()
+  })
+
+  ipcMain.handle(
+    'op-history-patch',
+    (_e, payload: { id: string; undo?: unknown; redo?: unknown }) => {
+      const ok = historyPatchEntry(String(payload?.id || ''), {
+        undo: payload?.undo,
+        redo: payload?.redo
+      })
+      return { ok, state: historySnapshot() }
+    }
+  )
+
+  ipcMain.handle('op-history-remove', (_e, id: string) => {
+    const ok = historyRemoveEntry(String(id || ''))
+    return { ok, state: historySnapshot() }
+  })
+
+  /** 按记录撤回批量移动（不依赖内存 lastBatch） */
+  ipcMain.handle(
+    'undo-batch-classify-moves',
+    async (_e, moves: { originalPath: string; newPath: string }[]) => {
+      assertCanWork()
+      if (!Array.isArray(moves) || moves.length === 0) {
+        return { restored: 0, errors: [] as string[] }
       }
-      return { ok: true, path: file }
-    } catch (e) {
-      logError('open-exception-log', e)
-      return {
-        ok: false,
-        path: file,
-        error: e instanceof Error ? e.message : String(e)
+      for (const m of moves) {
+        assertAllowedPath(m.newPath, '文件')
+        rememberAllowedPath(m.originalPath)
+      }
+      setBusy(true)
+      try {
+        return await undoBatchClassifyMoves(moves)
+      } finally {
+        setBusy(false)
       }
     }
-  })
+  )
+
+  /** 按记录再次执行批量移动（redo） */
+  ipcMain.handle(
+    'redo-batch-classify-moves',
+    async (_e, moves: { originalPath: string; newPath: string }[]) => {
+      assertCanWork()
+      if (!Array.isArray(moves) || moves.length === 0) {
+        return { restored: 0, errors: [] as string[] }
+      }
+      const errors: string[] = []
+      let restored = 0
+      setBusy(true)
+      try {
+        for (const { originalPath, newPath } of moves) {
+          try {
+            assertAllowedPath(originalPath, '文件')
+            if (!fs.existsSync(originalPath)) {
+              errors.push(
+                `当前文件已删除或不存在，无法复原：${path.basename(originalPath)}`
+              )
+              continue
+            }
+            if (fs.existsSync(newPath)) {
+              errors.push(`目标已存在，无法复原：${path.basename(newPath)}`)
+              continue
+            }
+            fs.mkdirSync(path.dirname(newPath), { recursive: true })
+            await moveFileVerified(originalPath, newPath)
+            rememberAllowedPath(newPath)
+            restored++
+          } catch (err) {
+            errors.push(err instanceof Error ? err.message : String(err))
+          }
+        }
+        return { restored, errors }
+      } finally {
+        setBusy(false)
+      }
+    }
+  )
 
   ipcMain.handle(
     'batch-classify',
@@ -1687,11 +1863,8 @@ function setupIpc(): void {
             })
           }
         }
-        if (moves.length > 0) {
-          appendBatchClassifyUndo(moves)
-        }
-        const canUndo = Boolean(peekBatchClassifyUndo()?.length)
-        return { results, canUndo, cancelled }
+        const canUndo = moves.length > 0
+        return { results, canUndo, cancelled, moves }
       } finally {
         setBusy(false)
         emitProgress('')
@@ -1712,31 +1885,6 @@ function setupIpc(): void {
       return result.filePaths[0]
     }
   )
-
-  ipcMain.handle('undo-batch-classify', async () => {
-    assertCanWork()
-    const moves = takeBatchClassifyUndo()
-    if (!moves?.length) throw new Error('没有可撤回的批量分类')
-    setBusy(true)
-    try {
-      emitProgress('正在撤回批量分类…')
-      for (const m of moves) {
-        assertAllowedPath(m.newPath, '视频')
-        rememberAllowedPath(m.originalPath)
-      }
-      const result = await undoBatchClassifyMoves(moves)
-      if (result.errors.length && result.restored < moves.length) {
-        const failed = moves.filter(
-          (m) => fs.existsSync(m.newPath) && !fs.existsSync(m.originalPath)
-        )
-        restoreBatchClassifyUndo(failed)
-      }
-      return result
-    } finally {
-      setBusy(false)
-      emitProgress('')
-    }
-  })
 
   ipcMain.handle('download-update', async () => {
     try {

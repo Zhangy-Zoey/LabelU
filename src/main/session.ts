@@ -754,15 +754,32 @@ export async function moveFileVerified(src: string, dest: string): Promise<void>
     /* EXDEV 等：回退为复制后删除 */
   }
   await copyFileVerified(src, dest)
-  try {
-    fs.unlinkSync(src)
-  } catch (err) {
-    try {
-      if (fs.existsSync(dest)) fs.unlinkSync(dest)
-    } catch {
-      /* ignore */
+  {
+    let lastUnlink: unknown
+    const attempts = process.platform === 'win32' ? 24 : 12
+    for (let i = 0; i < attempts; i++) {
+      try {
+        fs.unlinkSync(src)
+        lastUnlink = null
+        break
+      } catch (err) {
+        lastUnlink = err
+        const code = (err as NodeJS.ErrnoException)?.code
+        if (code === 'EBUSY' || code === 'EPERM' || code === 'EACCES') {
+          await sleepMs(40 + i * 35)
+          continue
+        }
+        break
+      }
     }
-    throw err instanceof Error ? err : new Error(String(err))
+    if (lastUnlink) {
+      try {
+        if (fs.existsSync(dest)) fs.unlinkSync(dest)
+      } catch {
+        /* ignore */
+      }
+      throw lastUnlink instanceof Error ? lastUnlink : new Error(String(lastUnlink))
+    }
   }
 }
 
@@ -778,48 +795,10 @@ function uniqueDestPath(categoryDir: string, base: string): string {
 
 export type BatchClassifyMove = { originalPath: string; newPath: string }
 
-function batchUndoStorePath(): string {
-  return path.join(app.getPath('userData'), 'batch-classify-undo.json')
-}
-
-/** 最近一次批量分类（仅当次进程内存，重启后不可撤） */
-let lastBatchClassifyUndo: BatchClassifyMove[] | null = null
-
-export function peekBatchClassifyUndo(): BatchClassifyMove[] | null {
-  return lastBatchClassifyUndo
-}
-
-/** 追加撤回记录（重试失败项时与上一次成功移动合并） */
-export function appendBatchClassifyUndo(moves: BatchClassifyMove[]): void {
-  if (!moves.length) return
-  const prev = lastBatchClassifyUndo || []
-  const byNew = new Map(prev.map((m) => [path.resolve(m.newPath), m]))
-  for (const m of moves) {
-    byNew.set(path.resolve(m.newPath), m)
-  }
-  lastBatchClassifyUndo = Array.from(byNew.values())
-}
-
-export function clearBatchClassifyUndo(): void {
-  lastBatchClassifyUndo = null
-}
-
-/** 取出并清除 */
-export function takeBatchClassifyUndo(): BatchClassifyMove[] | null {
-  const cur = lastBatchClassifyUndo
-  lastBatchClassifyUndo = null
-  return cur
-}
-
-export function restoreBatchClassifyUndo(moves: BatchClassifyMove[]): void {
-  lastBatchClassifyUndo = moves.length > 0 ? moves : null
-}
-
-/** 清除旧版落盘撤回文件；批量撤回不再跨重启保留 */
+/** 清除旧版落盘撤回文件（已改用统一 op-history，不再使用内存批量撤回栈） */
 export function initBatchUndoStore(): void {
-  lastBatchClassifyUndo = null
   try {
-    const f = batchUndoStorePath()
+    const f = path.join(app.getPath('userData'), 'batch-classify-undo.json')
     if (fs.existsSync(f)) fs.unlinkSync(f)
   } catch {
     /* ignore */
@@ -834,11 +813,13 @@ export async function undoBatchClassifyMoves(
   for (const { originalPath, newPath } of [...moves].reverse()) {
     try {
       if (!fs.existsSync(newPath)) {
-        errors.push(`找不到已分类文件：${path.basename(newPath)}`)
+        errors.push(
+          `当前文件已删除或不存在，无法撤回：${path.basename(newPath)}`
+        )
         continue
       }
       if (fs.existsSync(originalPath)) {
-        errors.push(`原路径已被占用：${path.basename(originalPath)}`)
+        errors.push(`原路径已被占用，无法移回：${path.basename(originalPath)}`)
         continue
       }
       fs.mkdirSync(path.dirname(originalPath), { recursive: true })

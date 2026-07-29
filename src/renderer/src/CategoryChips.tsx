@@ -3,8 +3,9 @@ import {
   type ExtensibleGroupId,
   EXTENSIBLE_IDS,
   findCustomCategoryGroup,
+  findVisibleCategoryGroup,
   getCategoryGroupsWithCustom,
-  getCustomCategoryTags,
+  getCategoryTagsPersistPayload,
   isBuiltinCategoryTag,
   saveCustomCategoryTags,
   tryAddCustomCategoryTag
@@ -15,7 +16,7 @@ type Props = {
   onSelect: (tag: string) => void
   /** 传入当前标签，避免 Enter 确认时读到尚未更新的 value */
   onConfirm?: (tag?: string) => void
-  /** 请求删除当前选中的自定义标签（由外层弹窗确认） */
+  /** 请求删除当前选中的标签（内置/自定义均可；由外层弹窗确认） */
   onRequestDelete?: (tag: string) => void
   /** 外部增删标签后递增，强制刷新列表 */
   refreshKey?: number
@@ -38,6 +39,11 @@ export function CategoryChips({ value, onSelect, onConfirm, onRequestDelete, ref
 
   const groups = useMemo(() => getCategoryGroupsWithCustom(), [revision])
 
+  const persistAndNotify = useCallback(() => {
+    saveCustomCategoryTags()
+    void window.api.setCustomCategories(getCategoryTagsPersistPayload())
+  }, [])
+
   const commitAdd = useCallback(
     (groupId: ExtensibleGroupId) => {
       const name = draft.trim()
@@ -52,21 +58,24 @@ export function CategoryChips({ value, onSelect, onConfirm, onRequestDelete, ref
         setAddError(result.error)
         return
       }
-      saveCustomCategoryTags()
-      void window.api.setCustomCategories(getCustomCategoryTags())
+      persistAndNotify()
+      void window.api.opHistoryLog({
+        kind: 'categoryTagAdd',
+        label: `添加标签「${result.name}」`,
+        detail: { name: result.name, groupId }
+      })
       setAddingGroup(null)
       setDraft('')
       setAddError(null)
       setRevision((n) => n + 1)
       onSelect(result.name)
     },
-    [draft, onSelect]
+    [draft, onSelect, persistAndNotify]
   )
 
   const requestDeleteSelected = useCallback(() => {
     if (!selected || !onRequestDelete) return
-    if (isBuiltinCategoryTag(selected)) return
-    if (!findCustomCategoryGroup(selected)) return
+    if (!findVisibleCategoryGroup(selected)) return
     onRequestDelete(selected)
   }, [selected, onRequestDelete])
 
@@ -94,6 +103,7 @@ export function CategoryChips({ value, onSelect, onConfirm, onRequestDelete, ref
               {group.tags.map((tag) => {
                 const active = selected === tag
                 const custom = Boolean(findCustomCategoryGroup(tag))
+                const builtin = isBuiltinCategoryTag(tag)
                 return (
                   <button
                     key={tag}
@@ -103,7 +113,9 @@ export function CategoryChips({ value, onSelect, onConfirm, onRequestDelete, ref
                     title={
                       custom
                         ? `${tag}（自定义 · 选中后按 Delete 删除）`
-                        : tag
+                        : builtin
+                          ? `${tag}（内置 · 选中后按 Delete 删除）`
+                          : tag
                     }
                     onClick={() => onSelect(tag)}
                     onKeyDown={(e) => {

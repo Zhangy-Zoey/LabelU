@@ -19,6 +19,8 @@ type Props = {
   previewActive: boolean
   isCategoryCopy?: boolean
   mediaKind?: 'video' | 'image'
+  /** 宽/高；未知时用默认横幅，加载后回写 */
+  aspectRatio?: number
   disabled?: boolean
   onOpen: () => void
   /** 双击打开主预览（不改选中） */
@@ -27,6 +29,8 @@ type Props = {
   onRangeSelect: () => void
   /** 点击播放键：父组件决定单播或多选同播 */
   onPlayClick: () => void
+  /** 探测到真实画面比例后通知父级（用于自适应缩略框） */
+  onAspectRatio?: (path: string, width: number, height: number) => void
 }
 
 export function VideoThumb({
@@ -42,12 +46,14 @@ export function VideoThumb({
   previewActive,
   isCategoryCopy,
   mediaKind,
+  aspectRatio,
   disabled,
   onOpen,
   onActivate,
   onToggleSelect,
   onRangeSelect,
-  onPlayClick
+  onPlayClick,
+  onAspectRatio
 }: Props): React.JSX.Element {
   const rootRef = useRef<HTMLDivElement>(null)
   const videoRef = useRef<HTMLVideoElement>(null)
@@ -73,8 +79,12 @@ export function VideoThumb({
         io.disconnect()
         void window.api
           .getThumbnail(path)
-          .then((url: string) => {
-            if (!cancelled) setSrc(url)
+          .then((result: { url: string; width: number; height: number }) => {
+            if (cancelled) return
+            setSrc(result.url)
+            if (result.width > 0 && result.height > 0) {
+              onAspectRatio?.(path, result.width, result.height)
+            }
           })
           .catch(() => {
             if (!cancelled) setFailed(true)
@@ -87,7 +97,7 @@ export function VideoThumb({
       cancelled = true
       io.disconnect()
     }
-  }, [path])
+  }, [path, onAspectRatio])
 
   const stopPreviewMedia = (): void => {
     decodeWatchGenRef.current++
@@ -234,6 +244,10 @@ export function VideoThumb({
   }
 
   const isImage = mediaKind === 'image'
+  const ar =
+    typeof aspectRatio === 'number' && aspectRatio > 0.05 && aspectRatio < 40
+      ? aspectRatio
+      : 16 / 10
 
   const progressPct =
     previewDuration > 0 ? Math.min(100, Math.max(0, (previewTime / previewDuration) * 100)) : 0
@@ -279,7 +293,10 @@ ${MOD_KEY}+单击仍可加减主选中`
         onActivate?.()
       }}
     >
-      <div className="thumb-media">
+      <div
+        className={`thumb-media${isImage ? ' is-image' : ''}`}
+        style={{ aspectRatio: `${ar}` }}
+      >
         {previewing && previewUrl ? (
           <video
             ref={videoRef}
@@ -292,6 +309,9 @@ ${MOD_KEY}+单击仍可加减主选中`
             onLoadedMetadata={(e) => {
               const d = e.currentTarget.duration
               if (Number.isFinite(d) && d > 0) setPreviewDuration(d)
+              const vw = e.currentTarget.videoWidth
+              const vh = e.currentTarget.videoHeight
+              if (vw > 0 && vh > 0) onAspectRatio?.(path, vw, vh)
             }}
             onTimeUpdate={(e) => {
               if (scrubbingRef.current) return

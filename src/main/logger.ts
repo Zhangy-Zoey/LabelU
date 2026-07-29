@@ -1,6 +1,7 @@
 import fs from 'fs'
 import path from 'path'
 import { app } from 'electron'
+import { captureMainError } from './sentry'
 
 let initialized = false
 
@@ -68,13 +69,14 @@ export function initLogger(): void {
 /**
  * 追加日志。异常日志只收录 warn/error；info 默认忽略（避免污染）。
  * 需要诊断信息时可传 force: true。
+ * 发信策略：error（及 force）强制发；warn 节流发送。
  */
 export function appendLog(
   level: 'info' | 'warn' | 'error',
   tag: string,
   message: string,
   extra?: unknown,
-  opts?: { force?: boolean }
+  opts?: { force?: boolean; mail?: boolean }
 ): void {
   try {
     if (level === 'info' && !opts?.force) return
@@ -90,6 +92,13 @@ export function appendLog(
     const extraText = extra === undefined ? '' : ` ${safeJson(extra)}`
     const line = `${new Date().toISOString()} [${level}] [${tag}] ${message}${extraText}\n`
     fs.appendFileSync(file, line, 'utf8')
+    if (opts?.mail === false) return
+    // warn / 普通 error：节流；显式 force（logError、崩溃、forceMail）强制发
+    if (level === 'warn' || level === 'error') {
+      const errForMail = new Error(message.split('\n')[0] || message)
+      if (message.includes('\n')) errForMail.stack = message
+      captureMainError(tag, errForMail, extra, { force: Boolean(opts?.force) })
+    }
   } catch {
     /* 日志失败不得影响主流程 */
   }
@@ -100,5 +109,6 @@ export function logError(tag: string, err: unknown, extra?: unknown): void {
     err instanceof Error
       ? `${err.name}: ${err.message}\n${err.stack || ''}`
       : String(err)
-  appendLog('error', tag, message, extra)
+  // 发信由 appendLog 统一触发；主进程 error 强制去重旁路，确保必达
+  appendLog('error', tag, message, extra, { force: true })
 }

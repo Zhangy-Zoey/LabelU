@@ -427,6 +427,7 @@ body.resizing-panes * {
   display: grid;
   grid-template-columns: repeat(auto-fill, minmax(var(--thumb-size, 128px), 1fr));
   gap: 10px;
+  align-items: start;
   align-content: start;
   will-change: transform;
 }
@@ -518,12 +519,13 @@ body.resizing-panes * {
   background: #3a3632;
   border-radius: 8px 8px 0 0;
   overflow: hidden;
+  flex-shrink: 0;
 }
 
 .thumb-media img {
   width: 100%;
   height: 100%;
-  object-fit: cover;
+  object-fit: contain;
   display: block;
   pointer-events: none;
 }
@@ -722,6 +724,20 @@ body.resizing-panes * {
 .thumb-caption {
   padding: 6px 8px 8px;
   color: #000;
+  flex-shrink: 0;
+  /* 与画面区分开，避免看起来像叠在图上 */
+  background: var(--bg-elevated);
+  border-radius: 0 0 8px 8px;
+}
+
+.video-thumb:hover .thumb-caption {
+  background: var(--bg-muted);
+}
+
+.video-thumb.active .thumb-caption,
+.video-thumb.selected .thumb-caption,
+.video-thumb.secondary-picked .thumb-caption {
+  background: transparent;
 }
 
 .thumb-caption .name {
@@ -2224,6 +2240,19 @@ body.dragging-sel-handle * {
   gap: 8px;
   flex-wrap: wrap;
   margin-top: 4px;
+}
+
+/** 危险操作靠左，关闭/确认靠右，降低误触 */
+.modal-actions.modal-actions-split {
+  justify-content: space-between;
+  align-items: center;
+}
+
+.modal-actions-split .modal-actions-end {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin-left: auto;
 }
 
 .modal.modal-save > .modal-actions {

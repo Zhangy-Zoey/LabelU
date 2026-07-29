@@ -1,14 +1,16 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import type { CropRect, ExportRecord, SessionState, TimeRange, VideoItem } from '../../shared/types'
-import type { WorkspaceResumeSnapshot, ReclassifyDestMode, ClassifyDestApiOpts } from '../../shared/labeluApi'
+import type { WorkspaceResumeSnapshot, ClassifyDestApiOpts } from '../../shared/labeluApi'
 import { IMAGE_TIMELINE_SECONDS, MIN_SELECTION_SECONDS, isImagePath } from '../../shared/types'
-import { clamp, computeRemainingFromExports, formatTime, formatTimecode, formatTimelineTime, frameDuration, frameIndex, isMeaningfulCrop, minSelectionGap, resolveClipSelection, selectionTolerance, snapToFrame, stepByFrames, totalDuration, sanitizeName, compareMediaPaths, joinMediaDir, mediaDirname, mediaBasename } from '../../shared/utils'
-import { isPresetCategory, applyCustomCategoryTags, getCustomCategoryTags, loadCustomCategoryTags, saveCustomCategoryTags, categoryShadeStyle, tryRemoveCustomCategoryTag, isBuiltinCategoryTag, findCustomCategoryGroup } from '../../shared/categories'
+import { clamp, computeRemainingFromExports, formatTime, formatTimecode, formatTimelineTime, frameDuration, frameIndex, isMeaningfulCrop, minSelectionGap, resolveClipSelection, selectionTolerance, snapToFrame, stepByFrames, totalDuration, sanitizeName, compareMediaPaths, joinMediaDir, mediaDirname, mediaBasename, withoutCompletedFileName } from '../../shared/utils'
+import { isPresetCategory, applyCategoryTagsPersistPayload, getCategoryTagsPersistPayload, loadCustomCategoryTags, saveCustomCategoryTags, categoryShadeStyle, tryRemoveCategoryTag, findVisibleCategoryGroup } from '../../shared/categories'
 import { filmstripOrder, seekAndCaptureFrame, seekVideo } from './frameCapture'
 import { codecMayNeedProxyFallback, waitForDecodedFrame } from './playbackHealth'
 import { CategoryChips } from './CategoryChips'
 import { VideoThumb } from './VideoThumb'
 import { hitTestThumbMarquee } from './thumbMarquee'
+import { pushOpHistory, logOp, patchOpHistory, snapshotUi } from './opHistory'
+import type { OpHistoryEntry } from '../../shared/opTypes'
 import appIcon from './assets/app-icon.png'
 /** 仅当上级目录名属于预设行为标签时，才作为默认分类名 */
 function defaultCategoryFromDir(dirName: string | undefined | null): string {
@@ -53,6 +55,7 @@ const VIEW_ZOOM_MAX = 5
 const PLAYBACK_RATES = [0.5, 1, 2, 4] as const
 /** 快捷键修饰键文案：macOS 用 ⌘，Windows/Linux 用 Ctrl（逻辑已同时认 metaKey/ctrlKey） */
 const MOD_KEY = /Mac|Macintosh/i.test(navigator.userAgent) ? '⌘' : 'Ctrl'
+const IS_MAC = /Mac|Macintosh/i.test(navigator.userAgent)
 const IS_WIN = /Windows/i.test(navigator.userAgent)
 /** Windows 上杀毒/索引常更久占用句柄；松开媒体后多等一会再 rename */
 const MEDIA_RELEASE_MS = IS_WIN ? 280 : 60
@@ -63,9 +66,9 @@ const LS_TIMELINE_ZOOM = 'labelu.timelineZoomOnSelect'
 const LS_LOOP_SELECTION = 'labelu.loopSelection'
 const LS_PLAYBACK_RATE = 'labelu.playbackRate'
 const LS_ONLY_INCOMPLETE = 'labelu.onlyIncomplete'
-/** 二次分类落点偏好 */
-const LS_RECLASSIFY_DONT_ASK = 'labelu.reclassifyDontAsk'
-const LS_RECLASSIFY_MODE = 'labelu.reclassifyMode'
+/** 分类保存根目录（跨重启）；批量与保存共用「根目录/类别名」 */
+const LS_SAVE_ROOT = 'labelu.categorySaveRoot'
+/** @deprecated 旧二次分类偏好，启动时迁移到 LS_SAVE_ROOT */
 const LS_RECLASSIFY_CUSTOM_DIR = 'labelu.reclassifyCustomDir'
 /** 选帧区高度：可拖大（占用播放区空间）；剪辑区按内容撑开且不可折叠 */
 const LS_FILMSTRIP_HEIGHT = 'labelu.filmstripHeight'
@@ -258,13 +261,51 @@ function selectionSpanFromRemaining(
 
 const FULL_CROP: CropRect = { x: 0, y: 0, width: 1, height: 1 }
 
-function reportClientError(tag: string, err: unknown, extra?: unknown): void {
+function reportClientError(
+  tag: string,
+  err: unknown,
+  extra?: unknown,
+  opts?: { forceMail?: boolean }
+): void {
   try {
     const message = err instanceof Error ? err.message : String(err)
     const stack = err instanceof Error ? err.stack : undefined
-    void window.api?.logClientError?.({ tag, message, stack, extra })
+    void window.api?.logClientError?.({
+      tag,
+      message,
+      stack,
+      extra,
+      forceMail: opts?.forceMail
+    })
   } catch {
     /* ignore */
+  }
+}
+
+/** 是否为可直接展示给用户的操作提示（短中文）；系统异常不展示原文 */
+function isUserFacingOpMessage(err: unknown): boolean {
+  const msg = (err instanceof Error ? err.message : String(err || '')).trim()
+  if (!msg || msg.length > 100 || msg.includes('\n')) return false
+  if (/ENOENT|EPERM|EBUSY|EACCES|EPIPE|TypeError|ReferenceError|Cannot |is not |undefined|null/i.test(msg)) {
+    return false
+  }
+  return /[\u4e00-\u9fff]/.test(msg)
+}
+
+/** 上报系统错误并提示用户；forceMail 时附带整份 error 日志强制发信 */
+function reportAndToast(
+  showToast: (msg: string) => void,
+  tag: string,
+  err: unknown,
+  fallback: string,
+  extra?: unknown,
+  opts?: { forceMail?: boolean }
+): void {
+  reportClientError(tag, err, extra, { forceMail: opts?.forceMail })
+  if (isUserFacingOpMessage(err)) {
+    showToast(err instanceof Error ? err.message : String(err))
+  } else if (fallback) {
+    showToast(fallback)
   }
 }
 
@@ -273,6 +314,13 @@ function normMediaPath(p: string): string {
   // Windows 路径大小写不敏感：统一小写，避免对话框/拖放大小写不一致导致匹配失败
   if (/Windows/i.test(navigator.userAgent)) s = s.toLowerCase()
   return s
+}
+
+/** 同一源媒体（忽略路径分隔符大小写，以及文件名 `_done` 后缀） */
+function sameMediaIdentity(a: string, b: string): boolean {
+  return (
+    normMediaPath(withoutCompletedFileName(a)) === normMediaPath(withoutCompletedFileName(b))
+  )
 }
 
 function fileNameOf(filePath: string): string {
@@ -343,13 +391,23 @@ type BatchResultModal = {
   results: BatchResultItem[]
   canUndo: boolean
   cancelled?: boolean
+  /** 本次成功移动记录，供「撤回本次移动」精确还原 */
+  moves: { originalPath: string; newPath: string }[]
+  items: VideoItem[]
+  historyId?: string | null
 }
 
-type ReclassifyDestModal = {
-  category: string
-  paths: string[]
-  categorizedCount: number
-}
+/** 会话内「不再显示」的弹窗键（重启清空） */
+type SessionModalSkipKey =
+  | 'batchResult'
+  | 'deleteCategoryTag'
+  | 'confirm'
+  | 'recover'
+  | 'update'
+  | 'importChoice'
+  | 'save'
+  | 'batch'
+
 
 type PendingSaveClip = {
   category: string
@@ -359,17 +417,31 @@ type PendingSaveClip = {
   duration: number
 }
 
-function loadReclassifyMode(): ReclassifyDestMode {
-  const v = localStorage.getItem(LS_RECLASSIFY_MODE)
-  if (v === 'underCurrent' || v === 'custom' || v === 'originalRoot') return v
-  return 'originalRoot'
+function loadPersistedSaveRoot(): string {
+  try {
+    const v = (localStorage.getItem(LS_SAVE_ROOT) || '').trim()
+    if (v) return v
+    // 迁移旧版批量自选目录
+    const legacy = (localStorage.getItem(LS_RECLASSIFY_CUSTOM_DIR) || '').trim()
+    if (legacy) {
+      localStorage.setItem(LS_SAVE_ROOT, legacy)
+      return legacy
+    }
+  } catch {
+    /* ignore */
+  }
+  return ''
 }
 
-function reclassifyModeLabel(mode: ReclassifyDestMode): string {
-  if (mode === 'underCurrent') return '当前目录下新建类别'
-  if (mode === 'custom') return '自选目标文件夹'
-  return '原目录对应类别'
+function persistSaveRoot(root: string): void {
+  try {
+    const r = root.trim()
+    if (r) localStorage.setItem(LS_SAVE_ROOT, r)
+  } catch {
+    /* ignore */
+  }
 }
+
 
 type TimelineMarker = {
   id: string
@@ -387,6 +459,22 @@ type UiUndoEntry =
       kind: 'markers'
       markers: TimelineMarker[]
       label: string
+    }
+  | {
+      kind: 'crop'
+      sourcePath: string
+      crop: CropRect
+      cropActive: boolean
+      cropCommitted: boolean
+    }
+  | {
+      kind: 'selectMedia'
+      path: string
+      index: number
+      /** 撤销切回该项时：若离开时做过 finish，需清 _done */
+      clearCompletedOnArrive?: boolean
+      /** 复原再切走时：离开当前项前先 finish（与 goToIndex 对称） */
+      finishBeforeLeave?: boolean
     }
 
 type RecoverModal = {
@@ -414,6 +502,23 @@ function dialogDefaultPathFor(current: VideoItem | null, videos: VideoItem[]): s
 
 function itemIsImage(v: VideoItem): boolean {
   return v.mediaKind === 'image' || isImagePath(v.path)
+}
+
+/** 正在打字的控件：方向键应留给输入，而不是切换媒体 */
+function isTextEditingKeyTarget(target: EventTarget | null): boolean {
+  const el = target as HTMLElement | null
+  if (!el) return false
+  if (el.isContentEditable) return true
+  const tag = el.tagName
+  if (tag === 'TEXTAREA') return true
+  if (tag === 'INPUT') {
+    const type = ((el as HTMLInputElement).type || 'text').toLowerCase()
+    // checkbox / range / button 等：方向键不应被全局快捷键直接丢掉
+    return !['checkbox', 'radio', 'range', 'button', 'submit', 'reset', 'file', 'color'].includes(
+      type
+    )
+  }
+  return false
 }
 
 /** 是否应在「只看未完成」列表中显示 */
@@ -470,15 +575,18 @@ export default function App(): React.JSX.Element {
   const [selStart, setSelStart] = useState(0)
   const [selEnd, setSelEnd] = useState(MIN_SELECTION_SECONDS)
   const [remaining, setRemaining] = useState<TimeRange[]>([])
+  const remainingRef = useRef<TimeRange[]>([])
+  remainingRef.current = remaining
   const [clipExports, setClipExports] = useState<ExportRecord[]>([])
   const [selectedExportPath, setSelectedExportPath] = useState<string | null>(null)
-  const [undoCount, setUndoCount] = useState(0)
   /** 选区循环预览（空格播放，到出点后回到入点） */
   const [loopSelection, setLoopSelection] = useState(() => loadStoredBool(LS_LOOP_SELECTION, false))
   const [edgeDragTime, setEdgeDragTime] = useState<number | null>(null)
   const [timelineMarkers, setTimelineMarkers] = useState<TimelineMarker[]>([])
   const [crop, setCrop] = useState<CropRect>(FULL_CROP)
   const [cropActive, setCropActive] = useState(false)
+  const cropActiveRef = useRef(false)
+  cropActiveRef.current = cropActive
   /** 用户已拖出裁切框（进入裁切后不预设框） */
   const [cropCommitted, setCropCommitted] = useState(false)
   const [mediaKindFilter, setMediaKindFilter] = useState<MediaKindFilter>('all')
@@ -493,20 +601,52 @@ export default function App(): React.JSX.Element {
   const [saveModal, setSaveModal] = useState<SaveModal | null>(null)
   /** 保存预览：相对选区起点的播放进度（秒） */
   const [savePreviewLocal, setSavePreviewLocal] = useState(0)
-  const [savePreviewPlaying, setSavePreviewPlaying] = useState(false)
   const [categoryInput, setCategoryInput] = useState('')
   /** 类别文件夹的源目录（实际写入 源目录/类别名/） */
   const [saveDestRoot, setSaveDestRoot] = useState('')
-  /** 本次运行内用户自定义的源目录；重启失效 */
-  const sessionCustomSaveRootRef = useRef<string | null>(null)
+  /** 跨重启记住的分类根目录；空则按当前文件推算默认 */
+  const sessionCustomSaveRootRef = useRef<string | null>(loadPersistedSaveRoot() || null)
+  const [batchDestRoot, setBatchDestRoot] = useState(() => loadPersistedSaveRoot())
+  const [historyCanUndo, setHistoryCanUndo] = useState(false)
+  const [historyCanRedo, setHistoryCanRedo] = useState(false)
   const [confirmModal, setConfirmModal] = useState<ConfirmModal | null>(null)
   const [recoverModal, setRecoverModal] = useState<RecoverModal | null>(null)
   const [deleteCategoryTagModal, setDeleteCategoryTagModal] = useState<DeleteCategoryTagModal | null>(
     null
   )
-  /** 本次运行内跳过删除自定义标签确认；重启后清空 */
-  const deleteCategoryTagSkipAskRef = useRef(false)
-  const [deleteCategoryTagDontAsk, setDeleteCategoryTagDontAsk] = useState(false)
+  /** 本次运行内跳过各弹窗（重启失效）；各键独立 */
+  const sessionModalSkipRef = useRef<Record<SessionModalSkipKey, boolean>>({
+    batchResult: false,
+    deleteCategoryTag: false,
+    confirm: false,
+    recover: false,
+    update: false,
+    importChoice: false,
+    save: false,
+    batch: false
+  })
+  /** 当前打开弹窗上「不再询问」勾选草稿 */
+  const [modalDontAskDraft, setModalDontAskDraft] = useState<
+    Partial<Record<SessionModalSkipKey, boolean>>
+  >({})
+  const commitModalDontAsk = useCallback((key: SessionModalSkipKey) => {
+    if (modalDontAskDraft[key]) sessionModalSkipRef.current[key] = true
+  }, [modalDontAskDraft])
+  const resetModalDontAsk = useCallback((key: SessionModalSkipKey) => {
+    setModalDontAskDraft((prev) => (prev[key] ? { ...prev, [key]: false } : prev))
+  }, [])
+  /** 确认框：若本会话已选不再询问则直接执行确定 */
+  const openConfirmModal = useCallback(
+    (modal: ConfirmModal) => {
+      if (sessionModalSkipRef.current.confirm) {
+        modal.onConfirm()
+        return
+      }
+      resetModalDontAsk('confirm')
+      setConfirmModal(modal)
+    },
+    [resetModalDontAsk]
+  )
   /** 自定义标签增删后刷新 CategoryChips */
   const [categoryTagsRevision, setCategoryTagsRevision] = useState(0)
   const [dragOver, setDragOver] = useState(false)
@@ -524,6 +664,36 @@ export default function App(): React.JSX.Element {
   const [thumbSize, setThumbSize] = useState(() =>
     loadStoredNumber(LS_THUMB, THUMB_SIZE_DEFAULT, THUMB_SIZE_MIN, THUMB_SIZE_MAX)
   )
+  /** 缩略图宽高比（宽/高），按路径缓存；竖图 < 1，横图 > 1 */
+  const [thumbAspectByPath, setThumbAspectByPath] = useState<Record<string, number>>({})
+  const rememberThumbAspect = useCallback((filePath: string, width: number, height: number) => {
+    if (!(width > 0) || !(height > 0)) return
+    const key = normMediaPath(filePath)
+    const ar = width / height
+    if (!(ar > 0.05) || !(ar < 40)) return
+    setThumbAspectByPath((prev) => {
+      const old = prev[key]
+      if (old != null && Math.abs(old - ar) < 0.002) return prev
+      return { ...prev, [key]: ar }
+    })
+  }, [])
+  /** finish/_done 改名后迁移缩略图比例缓存，避免短暂回落到 16:10 */
+  const migrateThumbAspectKey = useCallback((fromPath: string, toPath: string) => {
+    const from = normMediaPath(fromPath)
+    const to = normMediaPath(toPath)
+    if (!from || !to || from === to) return
+    setThumbAspectByPath((prev) => {
+      if (!(from in prev)) return prev
+      if (prev[to] === prev[from]) {
+        const next = { ...prev }
+        delete next[from]
+        return next
+      }
+      const next = { ...prev, [to]: prev[from] }
+      delete next[from]
+      return next
+    })
+  }, [])
   const [sidebarWidth, setSidebarWidth] = useState(() =>
     loadStoredNumber(LS_SIDEBAR, SIDEBAR_WIDTH_DEFAULT, 0, 4000)
   )
@@ -538,18 +708,11 @@ export default function App(): React.JSX.Element {
   const [batchModal, setBatchModal] = useState(false)
   const [batchCategory, setBatchCategory] = useState('')
   /** 最近一次批量移动的列表项，供 UI 一次撤回 */
-  const [batchUndoItems, setBatchUndoItems] = useState<VideoItem[] | null>(null)
   const [batchResultModal, setBatchResultModal] = useState<BatchResultModal | null>(null)
-  const [reclassifyDestModal, setReclassifyDestModal] = useState<ReclassifyDestModal | null>(null)
-  const [reclassifyMode, setReclassifyMode] = useState<ReclassifyDestMode>(() => loadReclassifyMode())
-  const [reclassifyCustomDir, setReclassifyCustomDir] = useState(
-    () => localStorage.getItem(LS_RECLASSIFY_CUSTOM_DIR) || ''
-  )
-  const [reclassifyDontAsk, setReclassifyDontAsk] = useState(false)
-  const [reclassifyPrefDontAsk, setReclassifyPrefDontAsk] = useState(() =>
-    loadStoredBool(LS_RECLASSIFY_DONT_ASK, false)
-  )
   const lastClassifyOptsRef = useRef<ClassifyDestApiOpts | undefined>(undefined)
+  /** 勾选「不再询问」后，下次保存/批量直接沿用的类别 */
+  const lastSaveCategoryRef = useRef('')
+  const lastBatchCategoryRef = useRef('')
   /** 更新说明弹窗关闭后再展示「恢复未完成会话」 */
   const pendingRecoverSessionsRef = useRef<SessionState[] | null>(null)
   /** 更新重启后的工作区快照；whatsNew 关闭后再恢复 */
@@ -566,7 +729,6 @@ export default function App(): React.JSX.Element {
   /** finishCurrent 最近一次成功写回的路径（可能已改名） */
   const lastFinishedPathRef = useRef<string | null>(null)
   const goRelativeRef = useRef<(dir: -1 | 1) => Promise<void>>(async () => {})
-  const [uiUndoStack, setUiUndoStack] = useState<UiUndoEntry[]>([])
   const selectAnchorRef = useRef<number | null>(null)
   /** 路径 → 剩余可剪秒数；用于「只看未完成」筛掉已全部打标但未点完成的项 */
   const remainingByPathRef = useRef<Map<string, number>>(new Map())
@@ -599,7 +761,6 @@ export default function App(): React.JSX.Element {
       confirmModal ||
       batchModal ||
       batchResultModal ||
-      reclassifyDestModal ||
       recoverModal ||
       deleteCategoryTagModal ||
       importChoiceModal ||
@@ -613,7 +774,6 @@ export default function App(): React.JSX.Element {
     deleteCategoryTag: false,
     save: false,
     batch: false,
-    reclassify: false,
     batchResult: false,
     confirm: null as ConfirmModal | null,
     importChoice: false,
@@ -649,6 +809,18 @@ export default function App(): React.JSX.Element {
   const timelineRef = useRef<HTMLDivElement>(null)
   const dirtyRef = useRef(false)
   const navigatingRef = useRef(false)
+  /** 与 busy state 同步，供 goToIndex 避免闭包里读到过期的 busy=true */
+  const busyRef = useRef(false)
+  busyRef.current = busy
+  const indexRef = useRef(index)
+  indexRef.current = index
+  const videosRef = useRef(videos)
+  videosRef.current = videos
+  const mediaKindFilterRef = useRef(mediaKindFilter)
+  mediaKindFilterRef.current = mediaKindFilter
+  const onlyIncompleteRef = useRef(onlyIncomplete)
+  onlyIncompleteRef.current = onlyIncomplete
+  const currentIsImageRef = useRef(false)
   const savingRef = useRef(false)
   /** 确认保存后短暂忽略 Enter，避免同一次回车/按住重复把保存窗又打开 */
   const ignoreEnterOpenUntilRef = useRef(0)
@@ -719,16 +891,24 @@ export default function App(): React.JSX.Element {
       /* ignore */
     }
     void window.api.getCustomCategories().then((map) => {
-      const hasMain = Object.values(map || {}).some((a) => Array.isArray(a) && a.length > 0)
+      const hasMain =
+        Object.entries(map || {}).some(([k, v]) => {
+          if (k === 'removedBuiltins') return Array.isArray(v) && v.length > 0
+          return Array.isArray(v) && v.length > 0
+        })
       if (hasMain) {
-        applyCustomCategoryTags(map)
+        applyCategoryTagsPersistPayload(map)
         saveCustomCategoryTags()
       } else {
-        const local = getCustomCategoryTags()
-        if (Object.values(local).some((a) => a.length > 0)) {
+        const local = getCategoryTagsPersistPayload()
+        const hasLocal =
+          Object.values(local).some((a) => Array.isArray(a) && a.length > 0) ||
+          (local.removedBuiltins && local.removedBuiltins.length > 0)
+        if (hasLocal) {
           void window.api.setCustomCategories(local)
         }
       }
+      setCategoryTagsRevision((n) => n + 1)
     })
   }, [])
 
@@ -772,9 +952,58 @@ export default function App(): React.JSX.Element {
     }
   }, [timelineZoomOnSelect])
 
-  const pushUiUndo = useCallback((entry: UiUndoEntry) => {
-    setUiUndoStack((prev) => [...prev.slice(-19), entry])
+  const refreshHistoryState = useCallback(async () => {
+    try {
+      const s = await window.api.opHistoryState()
+      setHistoryCanUndo(s.canUndo)
+      setHistoryCanRedo(s.canRedo)
+    } catch {
+      /* ignore */
+    }
   }, [])
+
+  useEffect(() => {
+    void refreshHistoryState()
+  }, [refreshHistoryState])
+
+  const pushUiUndo = useCallback(
+    (before: UiUndoEntry, after?: UiUndoEntry) => {
+      const sourcePath = playSourcePathRef.current || ''
+      let label = '调整选区'
+      let kind: 'uiSelection' | 'uiMarkers' | 'uiCrop' | 'uiSelectMedia' = 'uiSelection'
+      if (before.kind === 'markers') {
+        label = before.label || '时间轴标记'
+        kind = 'uiMarkers'
+      } else if (before.kind === 'crop') {
+        label = '调整裁切'
+        kind = 'uiCrop'
+      } else if (before.kind === 'selectMedia') {
+        label = '切换媒体'
+        kind = 'uiSelectMedia'
+      }
+      const redo: UiUndoEntry =
+        after ??
+        (before.kind === 'markers'
+          ? { kind: 'markers', markers: [], label: before.label }
+          : before.kind === 'crop'
+            ? {
+                kind: 'crop',
+                sourcePath: before.sourcePath || sourcePath,
+                crop: FULL_CROP,
+                cropActive: false,
+                cropCommitted: false
+              }
+            : before)
+      void pushOpHistory({
+        kind,
+        label,
+        undo: before,
+        redo,
+        detail: { before, after: redo, sourcePath }
+      }).then(() => refreshHistoryState())
+    },
+    [refreshHistoryState]
+  )
 
   const exitAllEditing = useCallback(() => {
     filmstripGenRef.current++
@@ -795,7 +1024,6 @@ export default function App(): React.JSX.Element {
     deleteCategoryTag: Boolean(deleteCategoryTagModal),
     save: Boolean(saveModal),
     batch: batchModal,
-    reclassify: Boolean(reclassifyDestModal),
     batchResult: Boolean(batchResultModal),
     confirm: confirmModal,
     importChoice: Boolean(importChoiceModal),
@@ -1513,6 +1741,7 @@ export default function App(): React.JSX.Element {
   const currentIsImage = Boolean(
     current && (current.mediaKind === 'image' || isImagePath(current.path))
   )
+  currentIsImageRef.current = currentIsImage
 
   const visibleIndices = useMemo(() => {
     return videos
@@ -1568,39 +1797,100 @@ export default function App(): React.JSX.Element {
 
   const thumbVirtual = useMemo(() => {
     const gap = 10
-    const caption = 44
+    // name 两行 + meta + padding，略留余量（含选中加粗边框）
+    const caption = 52
     const pad = 12
-    const itemH = thumbSize + caption + gap
     // 对齐 .thumb-virtual-window 的 repeat(auto-fill, minmax(thumbSize, 1fr))
     const cols = Math.max(1, Math.floor((thumbContentW + gap) / (thumbSize + gap)))
+    const cellW = Math.max(thumbSize, (thumbContentW - gap * (cols - 1)) / cols)
     const indices = visibleIndices
-    const rows = Math.ceil(indices.length / cols)
-    const totalH = Math.max(itemH, rows * itemH)
-    const startRow = Math.max(0, Math.floor(thumbScrollTop / itemH) - 1)
-    const endRow = Math.min(rows, Math.ceil((thumbScrollTop + thumbViewportH) / itemH) + 1)
+    const defaultAr = 16 / 10
+    const mediaHFor = (videoIndex: number): number => {
+      const v = videos[videoIndex]
+      const ar =
+        (v && thumbAspectByPath[normMediaPath(v.path)]) || defaultAr
+      const safe = ar > 0.05 && ar < 40 ? ar : defaultAr
+      return cellW / safe
+    }
+    const rows = Math.ceil(indices.length / cols) || 0
+    const rowYs: number[] = []
+    const rowHs: number[] = []
+    let y = 0
+    for (let r = 0; r < rows; r++) {
+      let maxMediaH = 0
+      for (let c = 0; c < cols; c++) {
+        const li = r * cols + c
+        if (li >= indices.length) break
+        maxMediaH = Math.max(maxMediaH, mediaHFor(indices[li]))
+      }
+      if (!(maxMediaH > 0)) maxMediaH = cellW / defaultAr
+      const rowH = maxMediaH + caption + gap
+      rowYs.push(y)
+      rowHs.push(rowH)
+      y += rowH
+    }
+    const totalH = Math.max(cellW / defaultAr + caption + gap, y)
+    let startRow = 0
+    while (startRow < rows - 1 && rowYs[startRow] + rowHs[startRow] < thumbScrollTop) {
+      startRow++
+    }
+    startRow = Math.max(0, startRow - 1)
+    let endRow = startRow
+    while (endRow < rows && rowYs[endRow] < thumbScrollTop + thumbViewportH) {
+      endRow++
+    }
+    endRow = Math.min(rows, endRow + 1)
     const start = startRow * cols
     const end = Math.min(indices.length, endRow * cols)
     const slice = indices.slice(start, end).map((videoIndex, local) => ({
       videoIndex,
       offset: start + local
     }))
-    return { cols, itemH, totalH, start, slice, gap, pad, caption }
-  }, [visibleIndices, thumbSize, thumbContentW, thumbScrollTop, thumbViewportH])
+    const offsetY = rowYs[startRow] ?? 0
+    // 兼容旧拖选字段：单行等高时的近似行高
+    const itemH = rowHs[0] ?? cellW / defaultAr + caption + gap
+    return {
+      cols,
+      itemH,
+      totalH,
+      start,
+      slice,
+      gap,
+      pad,
+      caption,
+      cellW,
+      offsetY,
+      rowYs,
+      rowHs
+    }
+  }, [
+    visibleIndices,
+    videos,
+    thumbSize,
+    thumbContentW,
+    thumbScrollTop,
+    thumbViewportH,
+    thumbAspectByPath
+  ])
 
   /** 拖选命中用：含滚出视口项的布局参数 */
   const thumbLayoutRef = useRef({
     cols: 1,
-    itemH: 180,
     gap: 10,
     pad: 12,
+    cellW: 128,
+    rowYs: [] as number[],
+    rowHs: [] as number[],
     visibleIndices: [] as number[],
     videos: [] as VideoItem[]
   })
   thumbLayoutRef.current = {
     cols: thumbVirtual.cols,
-    itemH: thumbVirtual.itemH,
     gap: thumbVirtual.gap,
     pad: thumbVirtual.pad,
+    cellW: thumbVirtual.cellW,
+    rowYs: thumbVirtual.rowYs,
+    rowHs: thumbVirtual.rowHs,
     visibleIndices,
     videos
   }
@@ -1828,12 +2118,15 @@ export default function App(): React.JSX.Element {
     window.addEventListener('mouseup', up)
   }
 
+  const undoAnyRef = useRef<() => Promise<void>>(async () => {})
+  const redoAnyRef = useRef<() => Promise<void>>(async () => {})
+
   useEffect(() => {
     const offBusy = window.api.onBusyChanged(setBusy)
     const offProgress = window.api.onBusyProgress(setBusyProgress)
     const offClose = window.api.onRequestClose(() => {
       if (dirtyRef.current) {
-        setConfirmModal({
+        openConfirmModal({
           title: '有未完成的编辑',
           message:
             '当前视频还有未点「完成」的剪辑会话。直接退出不会改写原片；下次打开可选择恢复或丢弃已导出片段。',
@@ -1865,13 +2158,18 @@ export default function App(): React.JSX.Element {
       })
     })
     const offUpdateError = window.api.onUpdateError((message) => {
-      // 主进程已过滤首发无 Release 等良性情况；此处再兜一层，避免误弹 toast
+      // 主进程已过滤首发无 Release 等良性情况；此处再兜一层，避免误报
       if (/No published versions on GitHub|404|ENOTFOUND|ETIMEDOUT|net::ERR_/i.test(message || '')) {
         return
       }
       setUpdateDownloadPercent(null)
       reportClientError('updater', message)
-      showToast(message ? `检查更新失败：${message}` : '检查更新失败')
+    })
+    const offAppUndo = window.api.onAppUndo(() => {
+      void undoAnyRef.current()
+    })
+    const offAppRedo = window.api.onAppRedo(() => {
+      void redoAnyRef.current()
     })
 
     void (async () => {
@@ -1912,12 +2210,14 @@ export default function App(): React.JSX.Element {
           pendingRecoverSessionsRef.current = null
           if (pending && pending.length > 0) {
             window.setTimeout(() => {
+              if (sessionModalSkipRef.current.recover) return
               setRecoverModal({ sessions: pending, index: 0 })
             }, 400)
           }
         } else if (pendingSessions.length > 0) {
           // 无更新说明时稍延后，避免挡首屏
           window.setTimeout(() => {
+            if (sessionModalSkipRef.current.recover) return
             setRecoverModal({ sessions: pendingSessions, index: 0 })
           }, 400)
         }
@@ -1949,6 +2249,8 @@ export default function App(): React.JSX.Element {
       offDownloaded()
       offUpdateProgress()
       offUpdateError()
+      offAppUndo()
+      offAppRedo()
     }
   }, [])
 
@@ -1997,7 +2299,6 @@ export default function App(): React.JSX.Element {
           syncRemainingHint(item.path, totalDuration(rem))
           setClipExports(session.exports)
           setSelectedExportPath(null)
-          setUndoCount(session.undoStack.length)
           // 仅当无可剪剩余时视为纯回看；已完成但仍有剩余段时应可继续编辑
           const reviewOnly = !isImage && rem.length === 0
           dirtyRef.current = false
@@ -2018,7 +2319,6 @@ export default function App(): React.JSX.Element {
           syncRemainingHint(item.path, totalDuration(rem))
           setClipExports([])
           setSelectedExportPath(null)
-          setUndoCount(0)
           dirtyRef.current = false
           completedRef.current = item.completed
           const span = selectionSpanFromRemaining(
@@ -2028,7 +2328,6 @@ export default function App(): React.JSX.Element {
           setSelStart(span.start)
           setSelEnd(span.end)
         }
-        setUiUndoStack([])
         setFineTuneWhich(null)
         setFilmstrip(null)
         setStillFrameUrl(null)
@@ -2097,7 +2396,6 @@ export default function App(): React.JSX.Element {
       setSecondarySelectMode(false)
       setThumbPreviewIds(new Set())
       selectAnchorRef.current = null
-      setBatchUndoItems(null)
 
       const prevSnapshot = videos
       const byPath = new Map(prevSnapshot.map((v) => [v.path, v]))
@@ -2176,6 +2474,11 @@ export default function App(): React.JSX.Element {
       const videoItems = items.filter((v) => !itemIsImage(v))
       const imageItems = items.filter((v) => itemIsImage(v))
       if (videoItems.length > 0 && imageItems.length > 0) {
+        if (sessionModalSkipRef.current.importChoice) {
+          await commitImportedList(items, 'all')
+          return
+        }
+        resetModalDontAsk('importChoice')
         setImportChoiceModal({
           items,
           videoCount: videoItems.length,
@@ -2185,13 +2488,14 @@ export default function App(): React.JSX.Element {
       }
       await commitImportedList(items, 'all')
     },
-    [commitImportedList, showToast]
+    [commitImportedList, showToast, resetModalDontAsk]
   )
 
   const resolveImportChoice = useCallback(
     async (choice: 'video' | 'image' | 'both') => {
       const modal = importChoiceModal
       if (!modal) return
+      commitModalDontAsk('importChoice')
       setImportChoiceModal(null)
       if (choice === 'video') {
         await commitImportedList(
@@ -2209,7 +2513,7 @@ export default function App(): React.JSX.Element {
       }
       await commitImportedList(modal.items, 'all')
     },
-    [importChoiceModal, commitImportedList]
+    [importChoiceModal, commitImportedList, commitModalDontAsk]
   )
 
   const importPaths = useCallback(
@@ -2420,36 +2724,35 @@ export default function App(): React.JSX.Element {
     [videos, index]
   )
 
-  const openBatchModal = useCallback(async () => {
-    if (secondarySelectMode) {
-      if (batchTargetVideos.length === 0) {
-        showToast('二次选择中：请单击已选中的卡片，挑出要批量分类的视频')
-        return
-      }
-    } else if (batchTargetVideos.length === 0) {
-      showToast(`请先多选视频（${MOD_KEY}+单击、Shift+单击或拖选）`)
-      return
-    }
-    const first = batchTargetVideos[0]
-    setBatchCategory(defaultCategoryFromDir(first.parentDirName))
-    setBatchModal(true)
-  }, [batchTargetVideos, secondarySelectMode, showToast])
-
   const runBatchClassify = useCallback(
     async (paths: string[], category: string, opts?: ClassifyDestApiOpts) => {
       if (busy || paths.length === 0) return
-      lastClassifyOptsRef.current = opts
-      setStatus(`正在批量分类 ${paths.length} 个视频…`)
+      const destOpts: ClassifyDestApiOpts = {
+        reclassifyMode: 'customRoot',
+        customDestDir: (
+          opts?.customDestDir ||
+          sessionCustomSaveRootRef.current ||
+          loadPersistedSaveRoot() ||
+          (paths[0] ? defaultSaveRootDir(paths[0]) : '')
+        ).trim()
+      }
+      if (!destOpts.customDestDir) {
+        showToast('请选择分类根目录')
+        return
+      }
+      persistSaveRoot(destOpts.customDestDir)
+      sessionCustomSaveRootRef.current = destOpts.customDestDir
+      lastClassifyOptsRef.current = destOpts
+      setStatus(`正在批量分类 ${paths.length} 个…`)
       try {
-        // 只释放将被移动的项（及当前主预览若命中），其它小窗可继续播
         await releaseMediaForPaths(paths)
 
         const pathSet = new Set(paths.map((p) => normMediaPath(p)))
         const selectedSnapshot = videos.filter((v) => pathSet.has(normMediaPath(v.path)))
-        const { results, canUndo, cancelled } = await window.api.batchClassify(
+        const { results, canUndo, cancelled, moves } = await window.api.batchClassify(
           paths,
           category,
-          opts
+          destOpts
         )
         const okPaths = new Set(
           results.filter((r) => r.ok).map((r) => normMediaPath(r.path))
@@ -2459,17 +2762,57 @@ export default function App(): React.JSX.Element {
           ? okPaths.has(normMediaPath(currentPath))
           : false
 
-        const restoredCandidates = selectedSnapshot.filter((v) =>
-          okPaths.has(normMediaPath(v.path))
-        )
-        if (canUndo) {
-          setBatchUndoItems((prev) => {
-            const map = new Map((prev || []).map((v) => [v.path, v]))
-            for (const v of restoredCandidates) map.set(v.path, v)
-            return Array.from(map.values())
+        const moveList = moves?.length
+          ? moves
+          : results
+              .filter((r) => r.ok && r.exportPath)
+              .map((r) => ({ originalPath: r.path, newPath: r.exportPath! }))
+
+        // 撤销后文件在 originalPath；列表项路径必须与之对齐（不能仍带 _done）
+        const itemsForHistory: VideoItem[] = moveList.map((m) => {
+          const snap =
+            selectedSnapshot.find((v) => sameMediaIdentity(v.path, m.originalPath)) ||
+            selectedSnapshot.find((v) =>
+              results.some(
+                (r) =>
+                  r.ok &&
+                  r.exportPath === m.newPath &&
+                  sameMediaIdentity(v.path, r.path)
+              )
+            )
+          const kind: 'image' | 'video' =
+            snap?.mediaKind === 'image' || isImagePath(m.originalPath) ? 'image' : 'video'
+          const parent = snap?.parentDirName || mediaBasename(mediaDirname(m.originalPath)) || ''
+          const item: VideoItem = {
+            id: snap?.id || m.originalPath,
+            path: m.originalPath,
+            name: fileNameOf(m.originalPath),
+            completed: false,
+            mediaKind: kind,
+            parentDirName: parent,
+            dirPath: snap?.dirPath || mediaDirname(m.originalPath),
+            isCategoryCopy: snap?.isCategoryCopy
+          }
+          return item
+        })
+
+        let historyId: string | null = null
+        if (moveList.length > 0) {
+          const entry = await pushOpHistory({
+            kind: 'batchClassify',
+            label: `批量分类→${category}（${moveList.length}）`,
+            undo: { moves: moveList, items: itemsForHistory, category, dest: destOpts },
+            redo: { moves: moveList, items: itemsForHistory, category, dest: destOpts },
+            detail: {
+              category,
+              dest: destOpts,
+              moves: moveList,
+              results,
+              cancelled
+            }
           })
-        } else {
-          setBatchUndoItems(null)
+          historyId = entry?.id ?? null
+          void refreshHistoryState()
         }
 
         const nextList = videos.filter((v) => !okPaths.has(normMediaPath(v.path)))
@@ -2487,12 +2830,20 @@ export default function App(): React.JSX.Element {
           return next
         })
 
-        setBatchResultModal({
-          category,
-          results,
-          canUndo,
-          cancelled
-        })
+        if (!sessionModalSkipRef.current.batchResult) {
+          resetModalDontAsk('batchResult')
+          setBatchResultModal({
+            category,
+            results,
+            canUndo: Boolean(canUndo && moveList.length > 0),
+            cancelled,
+            moves: moveList,
+            items: itemsForHistory,
+            historyId
+          })
+        } else if (moveList.length > 0) {
+          showToast(`批量分类完成：已移动 ${moveList.length} 个（结果窗已跳过）`)
+        }
 
         if (cancelled) {
           showToast(
@@ -2518,11 +2869,18 @@ export default function App(): React.JSX.Element {
           setStatus(cancelled ? '批量分类已取消' : '批量分类完成')
         }
       } catch (err) {
-        showToast(String(err))
+        reportAndToast(
+          showToast,
+          'batchClassify',
+          err,
+          '保存失败，别关页面，请立刻呼叫管理员',
+          { category, paths },
+          { forceMail: true }
+        )
         setStatus('批量分类失败')
       }
     },
-    [busy, videos, index, loadVideoAt, showToast, releaseMediaForPaths]
+    [busy, videos, index, loadVideoAt, showToast, releaseMediaForPaths, refreshHistoryState, resetModalDontAsk]
   )
 
   const confirmBatchClassify = useCallback(async () => {
@@ -2532,30 +2890,77 @@ export default function App(): React.JSX.Element {
       return
     }
     if (busy || batchTargetVideos.length === 0) return
-    const paths = batchTargetVideos.map((v) => v.path)
-    const categorizedCount = batchTargetVideos.filter((v) => v.isCategoryCopy).length
-    setBatchModal(false)
-
-    if (categorizedCount > 0) {
-      const savedMode = loadReclassifyMode()
-      const savedDir = localStorage.getItem(LS_RECLASSIFY_CUSTOM_DIR) || ''
-      const dontAsk = loadStoredBool(LS_RECLASSIFY_DONT_ASK, false)
-      if (dontAsk && (savedMode !== 'custom' || savedDir)) {
-        await runBatchClassify(paths, category, {
-          reclassifyMode: savedMode,
-          customDestDir: savedMode === 'custom' ? savedDir : undefined
-        })
-        return
-      }
-      setReclassifyMode(savedMode)
-      setReclassifyCustomDir(savedDir)
-      setReclassifyDontAsk(false)
-      setReclassifyDestModal({ category, paths, categorizedCount })
+    const root = (
+      batchDestRoot.trim() ||
+      sessionCustomSaveRootRef.current?.trim() ||
+      loadPersistedSaveRoot() ||
+      defaultSaveRootDir(batchTargetVideos[0].path)
+    ).trim()
+    if (!root) {
+      showToast('请选择分类根目录')
       return
     }
+    lastBatchCategoryRef.current = category
+    commitModalDontAsk('batch')
+    setBatchModal(false)
+    await runBatchClassify(
+      batchTargetVideos.map((v) => v.path),
+      category,
+      { reclassifyMode: 'customRoot', customDestDir: root }
+    )
+  }, [
+    batchCategory,
+    batchDestRoot,
+    busy,
+    batchTargetVideos,
+    showToast,
+    runBatchClassify,
+    commitModalDontAsk
+  ])
 
-    await runBatchClassify(paths, category)
-  }, [batchCategory, busy, batchTargetVideos, showToast, runBatchClassify])
+  const openBatchModal = useCallback(async () => {
+    if (secondarySelectMode) {
+      if (batchTargetVideos.length === 0) {
+        showToast('二次选择中：请单击已选中的卡片，挑出要批量分类的视频')
+        return
+      }
+    } else if (batchTargetVideos.length === 0) {
+      showToast(`请先多选视频（${MOD_KEY}+单击、Shift+单击或拖选）`)
+      return
+    }
+    const first = batchTargetVideos[0]
+    const category =
+      (lastBatchCategoryRef.current || defaultCategoryFromDir(first.parentDirName)).trim()
+    const root =
+      sessionCustomSaveRootRef.current?.trim() ||
+      loadPersistedSaveRoot() ||
+      defaultSaveRootDir(first.path)
+    setBatchCategory(category)
+    setBatchDestRoot(root)
+    if (sessionModalSkipRef.current.batch) {
+      if (!category) {
+        showToast('请先设置类别')
+        resetModalDontAsk('batch')
+        setBatchModal(true)
+        return
+      }
+      if (!root) {
+        showToast('请选择分类根目录')
+        resetModalDontAsk('batch')
+        setBatchModal(true)
+        return
+      }
+      lastBatchCategoryRef.current = category
+      await runBatchClassify(
+        batchTargetVideos.map((v) => v.path),
+        category,
+        { reclassifyMode: 'customRoot', customDestDir: root }
+      )
+      return
+    }
+    resetModalDontAsk('batch')
+    setBatchModal(true)
+  }, [batchTargetVideos, secondarySelectMode, showToast, resetModalDontAsk, runBatchClassify])
 
   const runSaveClipExport = useCallback(
     async (payload: PendingSaveClip, opts?: ClassifyDestApiOpts): Promise<void> => {
@@ -2568,6 +2973,7 @@ export default function App(): React.JSX.Element {
       ignoreEnterOpenUntilRef.current = performance.now() + 600
       setSaveModal(null)
       setStatus(isImage ? '正在保存图片…' : '正在导出片段…')
+      const remBefore = remainingRef.current.map((r) => ({ ...r }))
       try {
         const classifyFields = opts
           ? {
@@ -2605,12 +3011,67 @@ export default function App(): React.JSX.Element {
         setClipExports(session.exports)
         setSelectedExportPath(null)
         setExportPreviewUrl(null)
-        setUndoCount(session.undoStack.length)
         dirtyRef.current = true
         if (result.message) showToast(result.message)
         else showToast(`已保存：${result.outputPath}`)
         setStatus('导出完成')
         clearTimelineFocus()
+
+        void pushOpHistory({
+          kind: 'export',
+          label: isImage ? `保存图片→${category}` : `保存片段→${category}`,
+          undo: {
+            sourcePath,
+            exportPath: result.outputPath,
+            mediaKind: isImage ? 'image' : 'video',
+            category,
+            range: isImage
+              ? { start: 0, end: mediaDuration || IMAGE_TIMELINE_SECONDS }
+              : { start: modal.start, end: modal.end },
+            crop: modal.crop,
+            cropActive: modal.cropActive,
+            duration: mediaDuration,
+            dest: opts,
+            remainingBefore: remBefore,
+            remainingAfter: rem
+          },
+          redo: {
+            sourcePath,
+            exportPath: result.outputPath,
+            mediaKind: isImage ? 'image' : 'video',
+            category,
+            range: isImage
+              ? { start: 0, end: mediaDuration || IMAGE_TIMELINE_SECONDS }
+              : { start: modal.start, end: modal.end },
+            crop: modal.crop,
+            cropActive: modal.cropActive,
+            duration: mediaDuration,
+            dest: opts,
+            remainingBefore: remBefore,
+            remainingAfter: rem
+          },
+          detail: {
+            sourcePath,
+            outputPath: result.outputPath,
+            category,
+            crop: modal.crop,
+            cropActive: modal.cropActive,
+            start: modal.start,
+            end: modal.end,
+            dest: opts,
+            ui: snapshotUi({
+              sourcePath,
+              selStart: selStartRef.current,
+              selEnd: selEndRef.current,
+              fineTuneWhich: fineTuneWhichRef.current,
+              markers: timelineMarkersRef.current,
+              crop: cropRef.current,
+              cropActive: cropActiveRef.current,
+              selectedIds: [],
+              secondaryIds: []
+            })
+          }
+        }).then(() => refreshHistoryState())
 
         if (!isImage && totalDuration(rem) <= 0.05) {
           const ok = await finishCurrentRef.current()
@@ -2624,79 +3085,24 @@ export default function App(): React.JSX.Element {
           setCropCommitted(false)
         }
       } catch (err) {
-        reportClientError(isImage ? 'exportImage' : 'exportClip', err, {
-          path: sourcePath,
-          category
-        })
-        showToast(errText(err))
+        reportAndToast(
+          showToast,
+          isImage ? 'exportImage' : 'exportClip',
+          err,
+          '保存失败，别关页面，请立刻呼叫管理员',
+          { path: sourcePath, category },
+          { forceMail: true }
+        )
         setStatus('导出失败')
       } finally {
         savingRef.current = false
       }
     },
-    [busy, showToast, syncRemainingHint, clearTimelineFocus]
+    [busy, showToast, syncRemainingHint, clearTimelineFocus, refreshHistoryState]
   )
 
-  const confirmReclassifyDest = useCallback(async () => {
-    const modal = reclassifyDestModal
-    if (!modal || busy) return
-    if (reclassifyMode === 'custom' && !reclassifyCustomDir.trim()) {
-      showToast('请先选择目标文件夹')
-      return
-    }
-    const opts: ClassifyDestApiOpts = {
-      reclassifyMode,
-      customDestDir: reclassifyMode === 'custom' ? reclassifyCustomDir.trim() : undefined
-    }
-    try {
-      localStorage.setItem(LS_RECLASSIFY_MODE, reclassifyMode)
-      if (reclassifyCustomDir.trim()) {
-        localStorage.setItem(LS_RECLASSIFY_CUSTOM_DIR, reclassifyCustomDir.trim())
-      }
-      if (reclassifyDontAsk) {
-        localStorage.setItem(LS_RECLASSIFY_DONT_ASK, '1')
-        setReclassifyPrefDontAsk(true)
-      }
-    } catch {
-      /* ignore */
-    }
-    setReclassifyDestModal(null)
-    await runBatchClassify(modal.paths, modal.category, opts)
-  }, [
-    reclassifyDestModal,
-    busy,
-    reclassifyMode,
-    reclassifyCustomDir,
-    reclassifyDontAsk,
-    showToast,
-    runBatchClassify
-  ])
 
-  const pickReclassifyCustomDir = useCallback(async () => {
-    const defaultPath =
-      reclassifyCustomDir.trim() ||
-      dialogDefaultPathFor(current, videos) ||
-      undefined
-    try {
-      const dir = await window.api.pickDirectory({
-        title: '选择二次分类目标文件夹',
-        defaultPath
-      })
-      if (dir) setReclassifyCustomDir(dir)
-    } catch (err) {
-      showToast(String(err))
-    }
-  }, [reclassifyCustomDir, current, videos, showToast])
 
-  const clearReclassifyDontAsk = useCallback(() => {
-    try {
-      localStorage.setItem(LS_RECLASSIFY_DONT_ASK, '0')
-    } catch {
-      /* ignore */
-    }
-    setReclassifyPrefDontAsk(false)
-    showToast('已恢复二次分类落点询问')
-  }, [showToast])
 
   const retryBatchFailed = useCallback(
     async (failedPaths: string[], category: string) => {
@@ -2707,10 +3113,17 @@ export default function App(): React.JSX.Element {
         await releaseMediaForPaths(failedPaths)
 
         const currentPath = videos[index]?.path
-        const { results, canUndo, cancelled } = await window.api.batchClassify(
+        const destOpts: ClassifyDestApiOpts = lastClassifyOptsRef.current || {
+          reclassifyMode: 'customRoot',
+          customDestDir:
+            sessionCustomSaveRootRef.current?.trim() ||
+            loadPersistedSaveRoot() ||
+            (failedPaths[0] ? defaultSaveRootDir(failedPaths[0]) : '')
+        }
+        const { results, canUndo, cancelled, moves } = await window.api.batchClassify(
           failedPaths,
           category,
-          lastClassifyOptsRef.current
+          destOpts
         )
         const okPaths = new Set(
           results.filter((r) => r.ok).map((r) => normMediaPath(r.path))
@@ -2719,15 +3132,44 @@ export default function App(): React.JSX.Element {
         const currentMoved = currentPath
           ? okPaths.has(normMediaPath(currentPath))
           : false
-        if (canUndo) {
-          setBatchUndoItems((prev) => {
-            const map = new Map((prev || []).map((v) => [v.path, v]))
-            for (const v of okItems) map.set(v.path, v)
-            return Array.from(map.values())
+
+        const moveList = moves?.length
+          ? moves
+          : results
+              .filter((r) => r.ok && r.exportPath)
+              .map((r) => ({ originalPath: r.path, newPath: r.exportPath! }))
+        const itemsForHistory: VideoItem[] = moveList.map((m) => {
+          const snap =
+            okItems.find((v) => sameMediaIdentity(v.path, m.originalPath)) ||
+            okItems.find((v) => normMediaPath(v.path) === normMediaPath(m.originalPath))
+          const kind: 'image' | 'video' =
+            snap?.mediaKind === 'image' || isImagePath(m.originalPath) ? 'image' : 'video'
+          const parent = snap?.parentDirName || mediaBasename(mediaDirname(m.originalPath)) || ''
+          const item: VideoItem = {
+            id: snap?.id || m.originalPath,
+            path: m.originalPath,
+            name: fileNameOf(m.originalPath),
+            completed: false,
+            mediaKind: kind,
+            parentDirName: parent,
+            dirPath: snap?.dirPath || mediaDirname(m.originalPath),
+            isCategoryCopy: snap?.isCategoryCopy
+          }
+          return item
+        })
+        let historyId: string | null = null
+        if (moveList.length > 0) {
+          const entry = await pushOpHistory({
+            kind: 'batchClassify',
+            label: `重试批量分类→${category}（${moveList.length}）`,
+            undo: { moves: moveList, items: itemsForHistory, category, dest: destOpts },
+            redo: { moves: moveList, items: itemsForHistory, category, dest: destOpts },
+            detail: { category, dest: destOpts, moves: moveList, results, cancelled, retry: true }
           })
-        } else {
-          setBatchUndoItems(null)
+          historyId = entry?.id ?? null
+          void refreshHistoryState()
         }
+
         const nextList = videos.filter((v) => !okPaths.has(normMediaPath(v.path)))
         setVideos(nextList)
         setThumbPreviewIds((prev) => {
@@ -2738,12 +3180,20 @@ export default function App(): React.JSX.Element {
           }
           return next
         })
-        setBatchResultModal({
-          category,
-          results,
-          canUndo,
-          cancelled
-        })
+        if (!sessionModalSkipRef.current.batchResult) {
+          resetModalDontAsk('batchResult')
+          setBatchResultModal({
+            category,
+            results,
+            canUndo: Boolean(canUndo && moveList.length > 0),
+            cancelled,
+            moves: moveList,
+            items: itemsForHistory,
+            historyId
+          })
+        } else if (moveList.length > 0) {
+          showToast(`重试完成：已移动 ${moveList.length} 个（结果窗已跳过）`)
+        }
         if (currentMoved) {
           dirtyRef.current = false
           const nextIdx = nextList.findIndex((v) => !v.completed)
@@ -2756,49 +3206,74 @@ export default function App(): React.JSX.Element {
         }
         setStatus('重试完成')
       } catch (err) {
-        showToast(String(err))
+        reportAndToast(
+          showToast,
+          'retryBatchFailed',
+          err,
+          '保存失败，别关页面，请立刻呼叫管理员',
+          { category },
+          { forceMail: true }
+        )
         setStatus('重试失败')
       }
     },
-    [busy, videos, index, showToast, releaseMediaForPaths, loadVideoAt]
+    [busy, videos, index, showToast, releaseMediaForPaths, loadVideoAt, refreshHistoryState, resetModalDontAsk]
   )
-  const undoBatchClassify = useCallback(async () => {
-    if (busy || batchUndoItems === null) {
-      showToast('没有可撤回的批量分类')
+
+  /** 仅撤回结果弹窗对应的这一次批量移动（不依赖统一撤销栈顶） */
+  const undoThisBatchFromResult = useCallback(async () => {
+    const modal = batchResultModal
+    if (!modal || busy) return
+    const moves = modal.moves || []
+    if (moves.length === 0) {
+      showToast('没有可撤回的移动记录')
       return
     }
-    setStatus('正在撤回批量分类…')
+    commitModalDontAsk('batchResult')
+    setBatchResultModal(null)
     try {
-      const items = batchUndoItems
-      const releasePaths = [
-        ...items.map((v) => v.path),
+      await releaseMediaForPaths([
+        ...moves.map((m) => m.newPath),
         ...(current ? [current.path] : [])
-      ]
-      await releaseMediaForPaths(releasePaths)
-      const { restored, errors } = await window.api.undoBatchClassify()
-      setBatchUndoItems(null)
-      if (restored > 0 && items.length > 0) {
+      ])
+      const { restored, errors } = await window.api.undoBatchClassifyMoves(moves)
+      if (modal.historyId) {
+        try {
+          await window.api.opHistoryRemove(modal.historyId)
+        } catch {
+          /* ignore */
+        }
+      }
+      if (restored > 0 && modal.items.length > 0) {
         setVideos((prev) => {
           const have = new Set(prev.map((v) => normMediaPath(v.path)))
-          const add = items
+          const add = modal.items
             .filter((v) => !have.has(normMediaPath(v.path)))
             .map((v) => ({ ...v, completed: false }))
           return [...prev, ...add].sort((a, b) => compareMediaPaths(a.path, b.path))
         })
-      } else if (restored > 0 && items.length === 0) {
-        showToast(`已撤回 ${restored} 个到原目录，请重新打开文件夹以刷新列表`)
       }
-      if (errors.length) {
-        showToast(`已撤回 ${restored} 个，部分失败：${errors[0]}`)
-      } else if (items.length > 0) {
-        showToast(`已撤回 ${restored} 个视频到原目录`)
+      await refreshHistoryState()
+      if (restored === 0 && errors.length) {
+        showToast(errors[0])
+      } else if (errors.length) {
+        showToast(`已撤回本次 ${restored} 个，部分失败：${errors[0]}`)
+      } else {
+        showToast(`已撤回本次批量移动 ${restored} 个`)
       }
-      setStatus('')
     } catch (err) {
-      showToast(String(err))
-      setStatus('撤回失败')
+      reportAndToast(showToast, 'undoThisBatch', err, '撤回本次移动失败，请重试')
+      await refreshHistoryState()
     }
-  }, [busy, batchUndoItems, current, showToast, releaseMediaForPaths])
+  }, [
+    batchResultModal,
+    busy,
+    current,
+    releaseMediaForPaths,
+    showToast,
+    refreshHistoryState,
+    commitModalDontAsk
+  ])
 
   const onDrop = (e: React.DragEvent): void => {
     e.preventDefault()
@@ -2875,8 +3350,6 @@ export default function App(): React.JSX.Element {
         lastFinishedPathRef.current = newPath
         dirtyRef.current = false
         completedRef.current = true
-        setUndoCount(0)
-        setUiUndoStack([])
         setTimelineMarkers([])
         setVideos((prev) =>
           prev.map((v, i) =>
@@ -2886,6 +3359,7 @@ export default function App(): React.JSX.Element {
           )
         )
         if (newPath !== oldPath) {
+          migrateThumbAspectKey(oldPath, newPath)
           const oldSec = remainingByPathRef.current.get(oldPath)
           remainingByPathRef.current.delete(oldPath)
           if (oldSec !== undefined) remainingByPathRef.current.set(newPath, oldSec)
@@ -2917,8 +3391,7 @@ export default function App(): React.JSX.Element {
         }
         return true
       } catch (err) {
-        reportClientError('finishVideo', err, { path: oldPath })
-        showToast(String(err))
+        reportAndToast(showToast, 'finishVideo', err, '操作失败，请重试', { path: oldPath })
         // 失败时尽量恢复预览
         try {
           await reloadPlayableMedia(oldPath)
@@ -2935,7 +3408,8 @@ export default function App(): React.JSX.Element {
       showToast,
       syncRemainingHint,
       releaseMediaForPaths,
-      reloadPlayableMedia
+      reloadPlayableMedia,
+      migrateThumbAspectKey
     ]
   )
 
@@ -2968,6 +3442,7 @@ export default function App(): React.JSX.Element {
           )
         )
         if (newPath !== oldPath) {
+          migrateThumbAspectKey(oldPath, newPath)
           const oldSec = remainingByPathRef.current.get(oldPath)
           remainingByPathRef.current.delete(oldPath)
           if (oldSec !== undefined) remainingByPathRef.current.set(newPath, oldSec)
@@ -3005,7 +3480,7 @@ export default function App(): React.JSX.Element {
     })
     clearCompletedInflightRef.current = p
     return p
-  }, [current, releaseMediaForPaths, reloadPlayableMedia])
+  }, [current, releaseMediaForPaths, reloadPlayableMedia, migrateThumbAspectKey])
 
   const dismissWhatsNew = useCallback(() => {
     const modal = whatsNewModal
@@ -3020,16 +3495,20 @@ export default function App(): React.JSX.Element {
     const pending = pendingRecoverSessionsRef.current
     pendingRecoverSessionsRef.current = null
     const showRecover = (): void => {
-      if (pending && pending.length > 0) {
-        setRecoverModal({ sessions: pending, index: 0 })
+      if (!pending || pending.length === 0) return
+      if (sessionModalSkipRef.current.recover) {
+        showToast(`已跳过 ${pending.length} 个未完成会话提示（文件仍保留）`)
+        return
       }
+      resetModalDontAsk('recover')
+      setRecoverModal({ sessions: pending, index: 0 })
     }
     if (snap?.paths?.length) {
       void restoreWorkspaceResumeRef.current(snap).finally(showRecover)
     } else {
       showRecover()
     }
-  }, [whatsNewModal])
+  }, [whatsNewModal, resetModalDontAsk, showToast])
   dismissWhatsNewRef.current = dismissWhatsNew
 
   /** Esc：关闭最顶层弹窗 / 预览 / 编辑态；任意情况优先退出当前界面 */
@@ -3045,11 +3524,6 @@ export default function App(): React.JSX.Element {
     }
     if (o.batch) {
       setBatchModal(false)
-      return true
-    }
-    if (o.reclassify) {
-      setReclassifyDestModal(null)
-      setBatchModal(true)
       return true
     }
     if (o.batchResult) {
@@ -3115,44 +3589,108 @@ export default function App(): React.JSX.Element {
 
   const goToIndex = useCallback(
     async (nextIndex: number) => {
-      if (navigatingRef.current || busy || nextIndex === index) return
-      if (nextIndex < 0 || nextIndex >= videos.length) return
+      const list = videosRef.current
+      const fromIndex = indexRef.current
+      if (navigatingRef.current || busyRef.current || nextIndex === fromIndex) return
+      if (nextIndex < 0 || nextIndex >= list.length) return
+
+      const fromItem = list[fromIndex]
+      const toItem = list[nextIndex]
+      const fromPathBefore = fromItem?.path || ''
 
       navigatingRef.current = true
       try {
         // 切换前始终保存并标记已完成（有操作时）
+        lastFinishedPathRef.current = null
         const ok = await finishCurrent({ silent: true })
         if (!ok) return
+        // finish 可能把源文件改成 *_done；历史路径用完成后的真实路径
+        const fromPathAfter =
+          lastFinishedPathRef.current &&
+          fromPathBefore &&
+          sameMediaIdentity(lastFinishedPathRef.current, fromPathBefore)
+            ? lastFinishedPathRef.current
+            : fromPathBefore
         await loadVideoAt(nextIndex)
+        if (
+          fromItem &&
+          toItem &&
+          !sameMediaIdentity(fromPathAfter || fromItem.path, toItem.path)
+        ) {
+          const didFinish = Boolean(
+            lastFinishedPathRef.current &&
+              fromPathBefore &&
+              sameMediaIdentity(lastFinishedPathRef.current, fromPathBefore)
+          )
+          void pushOpHistory({
+            kind: 'uiSelectMedia',
+            label: `切换到 ${toItem.name}`,
+            undo: {
+              kind: 'selectMedia',
+              path: fromPathAfter || fromItem.path,
+              index: fromIndex,
+              clearCompletedOnArrive: didFinish
+            },
+            redo: {
+              kind: 'selectMedia',
+              path: toItem.path,
+              index: nextIndex,
+              finishBeforeLeave: didFinish
+            },
+            detail: {
+              from: fromPathAfter || fromItem.path,
+              to: toItem.path,
+              fromIndex,
+              toIndex: nextIndex,
+              didFinish
+            }
+          }).then(() => refreshHistoryState())
+        }
       } finally {
         navigatingRef.current = false
       }
     },
-    [busy, index, videos.length, loadVideoAt, finishCurrent]
+    [loadVideoAt, finishCurrent, refreshHistoryState]
   )
 
   const goRelative = useCallback(
     async (dir: -1 | 1) => {
-      if (!videos.length) return
-      let i = index
-      for (let step = 0; step < videos.length; step++) {
-        i = (i + dir + videos.length) % videos.length
+      const list = videosRef.current
+      if (!list.length) return
+      const fromIndex = indexRef.current
+      const kindFilter = mediaKindFilterRef.current
+      const incompleteOnly = onlyIncompleteRef.current
+      let i = fromIndex
+      for (let step = 0; step < list.length; step++) {
+        i = (i + dir + list.length) % list.length
         // 环绕回到自身时跳过，避免 goToIndex 因 next===index 静默 no-op
-        if (i === index) continue
-        // 下一个：可按「只看未完成」跳过；上一个：始终可回到刚处理好的视频回看分类
+        if (i === fromIndex) continue
+        const v = list[i]
+        if (!v) continue
+        // 与侧栏筛选一致：仅图片 / 仅视频时方向键只在同类间切换
+        if (kindFilter === 'image' && !itemIsImage(v)) continue
+        if (kindFilter === 'video' && itemIsImage(v)) continue
+        // 下一个：可按「只看未完成」跳过；上一个：始终可回到刚处理好的项回看分类
         if (
           dir === 1 &&
-          onlyIncomplete &&
-          videos[i] &&
-          !videoShowsAsIncomplete(videos[i], i, index, remainingByPathRef.current)
+          incompleteOnly &&
+          !videoShowsAsIncomplete(v, i, fromIndex, remainingByPathRef.current)
         )
           continue
         await goToIndex(i)
         return
       }
-      showToast(dir === 1 ? '没有更多未完成视频' : '没有上一个视频')
+      showToast(
+        dir === 1
+          ? kindFilter === 'image'
+            ? '没有更多未完成图片'
+            : '没有更多未完成视频'
+          : kindFilter === 'image'
+            ? '没有上一张图片'
+            : '没有上一个视频'
+      )
     },
-    [videos, index, onlyIncomplete, goToIndex, showToast]
+    [goToIndex, showToast]
   )
 
   finishCurrentRef.current = finishCurrent
@@ -3437,7 +3975,6 @@ export default function App(): React.JSX.Element {
       setSecondarySelectMode(false)
       setThumbPreviewIds(new Set())
       selectAnchorRef.current = null
-      setBatchUndoItems(null)
       setClipExports([])
       setRemaining([])
       setSaveModal(null)
@@ -3450,7 +3987,14 @@ export default function App(): React.JSX.Element {
       completedRef.current = false
       showToast('已保存并返回主界面')
     } catch (err) {
-      showToast(String(err))
+      reportAndToast(
+        showToast,
+        'saveAndBackHome',
+        err,
+        '保存失败，别关页面，请立刻呼叫管理员',
+        undefined,
+        { forceMail: true }
+      )
       setStatus('保存失败')
     }
   }, [busy, videos, current, finishCurrent, showToast])
@@ -3575,7 +4119,6 @@ export default function App(): React.JSX.Element {
         setSecondarySelectMode(false)
         setThumbPreviewIds(new Set())
         selectAnchorRef.current = null
-        setBatchUndoItems(null)
         setVideos(items)
         const focus = snap.currentPath ? normMediaPath(snap.currentPath) : ''
         let idx = focus ? items.findIndex((v) => normMediaPath(v.path) === focus) : -1
@@ -3596,8 +4139,7 @@ export default function App(): React.JSX.Element {
         showToast(`已恢复更新前的工作区（${items.length} 项）`)
         setStatus('')
       } catch (err) {
-        reportClientError('restoreWorkspaceResume', err)
-        showToast(err instanceof Error ? err.message : '恢复工作区失败')
+        reportAndToast(showToast, 'restoreWorkspaceResume', err, '恢复工作区失败')
         setStatus('恢复工作区失败')
       }
     },
@@ -3613,12 +4155,13 @@ export default function App(): React.JSX.Element {
     }
     const ver = updateModalRef.current?.version || ''
     const alreadyReady = updateModalRef.current?.phase === 'ready'
+    const detailDismissed = (): boolean => sessionModalSkipRef.current.update
 
     setUpdateModal({
       version: ver,
       phase: 'saving',
       progress: null,
-      dismissed: false
+      dismissed: detailDismissed()
     })
     setUpdateBanner(ver ? `正在保存并更新到 ${ver}…` : '正在保存并准备更新…')
 
@@ -3630,7 +4173,7 @@ export default function App(): React.JSX.Element {
           phase: 'error',
           progress: null,
           error: '保存当前工作失败，已取消更新',
-          dismissed: false
+          dismissed: detailDismissed()
         })
         return
       }
@@ -3640,7 +4183,7 @@ export default function App(): React.JSX.Element {
           version: ver,
           phase: 'downloading',
           progress: 0,
-          dismissed: false
+          dismissed: detailDismissed()
         })
         setUpdateDownloadPercent(0)
         setUpdateBanner(ver ? `正在下载更新 ${ver}（0%）` : '正在下载更新（0%）')
@@ -3663,7 +4206,7 @@ export default function App(): React.JSX.Element {
         version: ver,
         phase: 'installing',
         progress: 100,
-        dismissed: false
+        dismissed: detailDismissed()
       })
       setUpdateBanner('正在安装并重启…')
       setUpdateDownloadPercent(100)
@@ -3681,7 +4224,7 @@ export default function App(): React.JSX.Element {
           : /未签名|Code signature|ShipIt|应用程序/i.test(msg)
             ? msg
             : msg || '更新失败',
-        dismissed: false
+        dismissed: detailDismissed()
       })
       setUpdateBanner(ver ? `发现新版本 ${ver}` : '发现新版本')
       showToast(
@@ -3710,7 +4253,7 @@ export default function App(): React.JSX.Element {
     if (!isImage) {
       const check = resolveClipSelection(start, end, remaining, clipExports, stepFps)
       if (!check.ok) {
-        setConfirmModal({
+        openConfirmModal({
           title: '无法保存片段',
           message: check.reason,
           confirmText: '知道了',
@@ -3727,26 +4270,60 @@ export default function App(): React.JSX.Element {
         setSelEnd(end)
       }
     }
-    const initialCat = defaultCategoryFromDir(current.parentDirName)
+    const initialCat = (
+      lastSaveCategoryRef.current || defaultCategoryFromDir(current.parentDirName)
+    ).trim()
     setCategoryInput(initialCat)
-    setSaveDestRoot(
-      sessionCustomSaveRootRef.current?.trim() || defaultSaveRootDir(current.path)
-    )
+    const root =
+      sessionCustomSaveRootRef.current?.trim() ||
+      loadPersistedSaveRoot() ||
+      defaultSaveRootDir(current.path)
+    setSaveDestRoot(root)
     try {
       videoRef.current?.pause()
     } catch {
       /* ignore */
     }
     setSavePreviewLocal(0)
-    setSavePreviewPlaying(false)
     const cropOn = cropActive && cropCommitted && isMeaningfulCrop(crop)
-    setSaveModal({
+    const modal: SaveModal = {
       start,
       end,
       crop: cropOn ? crop : FULL_CROP,
       cropActive: cropOn,
       previewUrl: mediaUrl
-    })
+    }
+    if (sessionModalSkipRef.current.save) {
+      if (!initialCat) {
+        showToast('请先设置类别')
+        resetModalDontAsk('save')
+        setSaveModal(modal)
+        return
+      }
+      if (!root) {
+        showToast('请填写或选择保存路径')
+        resetModalDontAsk('save')
+        setSaveModal(modal)
+        return
+      }
+      lastSaveCategoryRef.current = initialCat
+      const isImage = current.mediaKind === 'image' || isImagePath(current.path)
+      await runSaveClipExport(
+        {
+          category: initialCat,
+          isImage,
+          saveModal: modal,
+          sourcePath: current.path,
+          duration
+        },
+        { reclassifyMode: 'customRoot', customDestDir: root }
+      )
+      persistSaveRoot(root)
+      sessionCustomSaveRootRef.current = root
+      return
+    }
+    resetModalDontAsk('save')
+    setSaveModal(modal)
   }, [
     current,
     busy,
@@ -3763,7 +4340,9 @@ export default function App(): React.JSX.Element {
     stepFps,
     showToast,
     clearCompletedMark,
-    setConfirmModal
+    openConfirmModal,
+    resetModalDontAsk,
+    runSaveClipExport
   ])
 
   /** 保存弹窗预览：必须先落到选区起点再播，不能 autoPlay 从片头开跑 */
@@ -3797,7 +4376,6 @@ export default function App(): React.JSX.Element {
         /* ignore */
       }
       setSavePreviewLocal(0)
-      setSavePreviewPlaying(false)
       const nudge =
         start < 0.12 ? Math.min(start + 0.15, Math.max(0, end - 0.05)) : Math.max(0, start - 0.12)
       await seekTo(v, nudge)
@@ -3807,7 +4385,6 @@ export default function App(): React.JSX.Element {
       setSavePreviewLocal(0)
       try {
         await v.play()
-        if (!cancelled) setSavePreviewPlaying(true)
       } catch {
         /* ignore autoplay policy */
       }
@@ -3861,6 +4438,8 @@ export default function App(): React.JSX.Element {
     }
     if (categoryOverride) setCategoryInput(category)
     setSaveDestRoot(root)
+    lastSaveCategoryRef.current = category
+    commitModalDontAsk('save')
     const isImage = current.mediaKind === 'image' || isImagePath(current.path)
     const pending: PendingSaveClip = {
       category,
@@ -3873,6 +4452,8 @@ export default function App(): React.JSX.Element {
       reclassifyMode: 'customRoot',
       customDestDir: root
     })
+    persistSaveRoot(root)
+    sessionCustomSaveRootRef.current = root
   }
   confirmSaveRef.current = confirmSave
 
@@ -3890,6 +4471,7 @@ export default function App(): React.JSX.Element {
       })
       if (dir) {
         sessionCustomSaveRootRef.current = dir
+        persistSaveRoot(dir)
         setSaveDestRoot(dir)
       }
     } catch (err) {
@@ -3909,6 +4491,7 @@ export default function App(): React.JSX.Element {
       root = mediaDirname(raw) || raw
     }
     sessionCustomSaveRootRef.current = root.trim() || null
+    if (root.trim()) persistSaveRoot(root.trim())
     setSaveDestRoot(root)
   }, [categoryInput])
 
@@ -3916,46 +4499,29 @@ export default function App(): React.JSX.Element {
     ? categoryDirUnderRoot(saveDestRoot, categoryInput)
     : saveDestRoot
 
-  const undo = async (): Promise<void> => {
-    if (!current || busy) return
-    try {
-      const pathAfter = await clearCompletedMark()
-      if (!pathAfter) {
-        showToast('无法撤销完成标记，请重试')
-        return
-      }
-      const session = await window.api.undoExport(pathAfter)
-      applySessionFromMain(session)
-      showToast('已撤销上一次保存')
-    } catch (err) {
-      showToast(String(err))
-    }
-  }
+  const applySessionFromMainRef = useRef<(session: SessionState) => void>(() => {})
 
-  const undoAny = useCallback(async () => {
-    // 当前视频有剪辑可撤时优先，避免批量撤回盖过正在编辑的撤销
-    if (undoCount > 0) {
-      await undo()
-      return
-    }
-    if (batchUndoItems !== null) {
-      await undoBatchClassify()
-      return
-    }
-    setUiUndoStack((stack) => {
-      if (stack.length === 0) {
-        showToast('没有可撤回的操作')
-        return stack
-      }
-      const next = [...stack]
-      const entry = next.pop()!
+  const applyUiHistoryEntry = useCallback(
+    (entry: UiUndoEntry) => {
       if (entry.kind === 'markers') {
         setTimelineMarkers(entry.markers)
         setStatus(`已恢复标记（${entry.markers.length}）`)
-        return next
+        return
+      }
+      if (entry.kind === 'crop') {
+        setCrop(entry.crop)
+        setCropActive(entry.cropActive)
+        setCropCommitted(entry.cropCommitted)
+        setStatus(entry.cropActive ? '已恢复裁切' : '已取消裁切')
+        return
+      }
+      if (entry.kind === 'selectMedia') {
+        return
       }
       setSelStart(entry.selStart)
       setSelEnd(entry.selEnd)
+      selStartRef.current = entry.selStart
+      selEndRef.current = entry.selEnd
       setFineTuneWhich(entry.fineTuneWhich)
       if (entry.fineTuneWhich) {
         scheduleFilmstrip(
@@ -3963,10 +4529,319 @@ export default function App(): React.JSX.Element {
           entry.fineTuneWhich === 'in' ? entry.selStart : entry.selEnd
         )
       }
-      setStatus('已撤回选区')
-      return next
-    })
-  }, [batchUndoItems, undoBatchClassify, undoCount, showToast, scheduleFilmstrip, current, busy])
+      setStatus('已恢复选区')
+    },
+    [scheduleFilmstrip]
+  )
+
+  /** 历史回放：确保目标媒体已加载；若已 _done 则清标记。返回可编辑路径。 */
+  const ensureMediaLoaded = useCallback(
+    async (sourcePath: string): Promise<string> => {
+      const key = String(sourcePath || '')
+      if (!key) throw new Error('缺少源路径')
+      if (current && sameMediaIdentity(current.path, key)) {
+        const pathAfter = await clearCompletedMark()
+        if (!pathAfter) throw new Error('无法撤销完成标记，请重试')
+        return pathAfter
+      }
+      const idx = videos.findIndex((v) => sameMediaIdentity(v.path, key))
+      if (idx < 0) throw new Error('列表中找不到对应媒体')
+      await loadVideoAt(idx, videos)
+      const pathAfter = await clearCompletedMark()
+      if (!pathAfter) throw new Error('无法撤销完成标记，请重试')
+      return pathAfter
+    },
+    [current, videos, loadVideoAt, clearCompletedMark]
+  )
+
+  const applySessionIfCurrent = useCallback((session: SessionState): void => {
+    const play = playSourcePathRef.current
+    if (play && !sameMediaIdentity(play, session.sourcePath)) {
+      // 撤销的是别的媒体：只改磁盘/会话，不覆盖当前预览状态
+      return
+    }
+    applySessionFromMainRef.current(session)
+  }, [])
+
+  const applyHistoryEntry = useCallback(
+    async (entry: OpHistoryEntry, direction: 'undo' | 'redo') => {
+      const payload = (direction === 'undo' ? entry.undo : entry.redo) as Record<string, unknown>
+      if (
+        entry.kind === 'uiSelection' ||
+        entry.kind === 'uiMarkers' ||
+        entry.kind === 'uiCrop'
+      ) {
+        if (entry.kind === 'uiCrop') {
+          const src = String((payload as { sourcePath?: string }).sourcePath || '')
+          if (src) await ensureMediaLoaded(src)
+        }
+        applyUiHistoryEntry(payload as unknown as UiUndoEntry)
+        return
+      }
+      if (entry.kind === 'uiSelectMedia') {
+        const path = String(payload.path || '')
+        const list = videos
+        // 复原切换：先对当前项 finish，与正向 goToIndex 对称
+        if (direction === 'redo' && payload.finishBeforeLeave) {
+          const ok = await finishCurrent({ silent: true })
+          if (!ok) throw new Error('无法完成当前项，复原切换失败')
+        }
+        let idx = list.findIndex((v) => sameMediaIdentity(v.path, path))
+        if (idx < 0) {
+          const hint = Number(payload.index)
+          if (Number.isFinite(hint) && hint >= 0 && hint < list.length) idx = hint
+        }
+        if (idx < 0) {
+          showToast('列表中找不到该媒体，无法切换')
+          throw new Error('列表中找不到该媒体，无法切换')
+        }
+        await loadVideoAt(idx, list)
+        // 撤销切换回来：若离开时做过 finish，清掉 _done，恢复可编辑
+        if (direction === 'undo' && payload.clearCompletedOnArrive) {
+          const cleared = await clearCompletedMark()
+          if (!cleared) throw new Error('无法撤销完成标记')
+        }
+        setStatus('已切换媒体')
+        return
+      }
+      if (entry.kind === 'deleteExport') {
+        const sourcePath = String(payload.sourcePath || '')
+        if (!sourcePath) throw new Error('缺少源路径')
+        if (direction === 'undo') {
+          // 撤销删除 = 重新导出该片段；并把新路径写回 redo，保证复原可精确再删
+          const pathForExport = await ensureMediaLoaded(sourcePath)
+          const mediaKind = payload.mediaKind === 'image' ? 'image' : 'video'
+          const category = String(payload.category || '')
+          const crop = (payload.crop as CropRect | null) ?? null
+          const cropActive = Boolean(payload.cropActive)
+          const dest = payload.dest as ClassifyDestApiOpts | undefined
+          await releaseMediaForPaths([pathForExport])
+          let outputPath = ''
+          if (mediaKind === 'image') {
+            const result = await window.api.exportImage({
+              sourcePath: pathForExport,
+              category,
+              crop,
+              cropActive,
+              ...(dest || {})
+            })
+            outputPath = result.outputPath
+            applySessionIfCurrent(result.session)
+          } else {
+            const range = payload.range as { start: number; end: number }
+            const result = await window.api.exportClip({
+              sourcePath: pathForExport,
+              start: range.start,
+              end: range.end,
+              category,
+              crop,
+              cropActive,
+              duration: Number(payload.duration) || 0,
+              ...(dest || {})
+            })
+            outputPath = result.outputPath
+            applySessionIfCurrent(result.session)
+          }
+          const nextRedo = {
+            ...(typeof entry.redo === 'object' && entry.redo ? entry.redo : {}),
+            sourcePath: pathForExport,
+            exportPath: outputPath,
+            category,
+            start: Number(payload.start ?? (payload.range as { start?: number })?.start),
+            end: Number(payload.end ?? (payload.range as { end?: number })?.end),
+            mediaKind,
+            crop,
+            cropActive,
+            duration: Number(payload.duration) || 0,
+            dest
+          }
+          await patchOpHistory(entry.id, { redo: nextRedo })
+          showToast('已恢复删除的分类片段')
+        } else {
+          // 复原删除：优先用回写后的精确 exportPath
+          const undoPath = await ensureMediaLoaded(sourcePath)
+          const session = await window.api.loadSession(undoPath)
+          const exportPathHint = String(payload.exportPath || '')
+          const category = String(payload.category || '')
+          const start = Number(payload.start)
+          const end = Number(payload.end)
+          const match =
+            (exportPathHint
+              ? session?.exports.find((e) => e.path === exportPathHint)
+              : undefined) ||
+            session?.exports.find(
+              (e) =>
+                e.category === category &&
+                Number.isFinite(start) &&
+                Number.isFinite(end) &&
+                Math.abs(e.start - start) < 0.05 &&
+                Math.abs(e.end - end) < 0.05
+            )
+          if (!match) throw new Error('找不到可再次删除的分类片段')
+          await releaseMediaForPaths([undoPath, match.path])
+          const next = await window.api.deleteExport(undoPath, match.path)
+          applySessionIfCurrent(next)
+          showToast('已再次删除分类片段')
+        }
+        return
+      }
+      if (entry.kind === 'export') {
+        const sourcePath = String(payload.sourcePath || '')
+        if (!sourcePath) throw new Error('缺少源路径')
+        if (direction === 'undo') {
+          const undoPath = await ensureMediaLoaded(sourcePath)
+          await releaseMediaForPaths([undoPath, String(payload.exportPath || '')])
+          const session = await window.api.undoExport(undoPath)
+          applySessionIfCurrent(session)
+          showToast('已撤销保存')
+        } else {
+          const pathForExport = await ensureMediaLoaded(sourcePath)
+          const mediaKind = payload.mediaKind === 'image' ? 'image' : 'video'
+          const category = String(payload.category || '')
+          const crop = (payload.crop as CropRect | null) ?? null
+          const cropActive = Boolean(payload.cropActive)
+          const dest = payload.dest as ClassifyDestApiOpts | undefined
+          await releaseMediaForPaths([pathForExport])
+          let outputPath = ''
+          if (mediaKind === 'image') {
+            const result = await window.api.exportImage({
+              sourcePath: pathForExport,
+              category,
+              crop,
+              cropActive,
+              ...(dest || {})
+            })
+            outputPath = result.outputPath
+            applySessionIfCurrent(result.session)
+          } else {
+            const range = payload.range as { start: number; end: number }
+            const result = await window.api.exportClip({
+              sourcePath: pathForExport,
+              start: range.start,
+              end: range.end,
+              category,
+              crop,
+              cropActive,
+              duration: Number(payload.duration) || 0,
+              ...(dest || {})
+            })
+            outputPath = result.outputPath
+            applySessionIfCurrent(result.session)
+          }
+          // 复原导出后路径可能变化：回写 undo.exportPath，便于再次撤销精确删文件
+          await patchOpHistory(entry.id, {
+            undo: {
+              ...(typeof entry.undo === 'object' && entry.undo ? entry.undo : {}),
+              sourcePath: pathForExport,
+              exportPath: outputPath
+            }
+          })
+          showToast('已复原保存')
+        }
+        return
+      }
+      if (entry.kind === 'batchClassify') {
+        const moves = (payload.moves || []) as { originalPath: string; newPath: string }[]
+        const items = (payload.items || []) as VideoItem[]
+        if (direction === 'undo') {
+          await releaseMediaForPaths([
+            ...moves.map((m) => m.newPath),
+            ...(current ? [current.path] : [])
+          ])
+          const { restored, errors } = await window.api.undoBatchClassifyMoves(moves)
+          if (restored > 0 && items.length > 0) {
+            setVideos((prev) => {
+              const have = new Set(prev.map((v) => normMediaPath(v.path)))
+              const add = items
+                .filter((v) => !have.has(normMediaPath(v.path)))
+                .map((v) => ({ ...v, completed: false }))
+              return [...prev, ...add].sort((a, b) => compareMediaPaths(a.path, b.path))
+            })
+          }
+          if (restored === 0 && errors.length) {
+            showToast(errors[0])
+          } else if (errors.length) {
+            showToast(`已撤回 ${restored} 个，部分失败：${errors[0]}`)
+          } else {
+            showToast(`已撤回 ${restored} 个到原目录`)
+          }
+        } else {
+          await releaseMediaForPaths(moves.map((m) => m.originalPath))
+          const { restored, errors } = await window.api.redoBatchClassifyMoves(moves)
+          if (restored > 0) {
+            const moved = new Set(moves.map((m) => normMediaPath(m.originalPath)))
+            setVideos((prev) => prev.filter((v) => !moved.has(normMediaPath(v.path))))
+          }
+          if (restored === 0 && errors.length) {
+            showToast(errors[0])
+          } else if (errors.length) {
+            showToast(`已复原 ${restored} 个，部分失败：${errors[0]}`)
+          } else {
+            showToast(`已复原批量分类 ${restored} 个`)
+          }
+        }
+        return
+      }
+      showToast(direction === 'undo' ? '无法撤销该操作' : '无法复原该操作')
+    },
+    [applyUiHistoryEntry, releaseMediaForPaths, current, showToast, clearCompletedMark, videos, loadVideoAt, ensureMediaLoaded, finishCurrent]
+  )
+
+  const undoAny = useCallback(async () => {
+    if (busy) return
+    let entry: OpHistoryEntry | null = null
+    try {
+      const r = await window.api.opHistoryUndo()
+      entry = r.entry
+      if (!entry) {
+        showToast('没有可撤回的操作')
+        await refreshHistoryState()
+        return
+      }
+      await applyHistoryEntry(entry, 'undo')
+      await refreshHistoryState()
+    } catch (err) {
+      if (entry) {
+        try {
+          await window.api.opHistoryRestoreUndo(entry)
+        } catch {
+          /* ignore */
+        }
+      }
+      reportAndToast(showToast, 'opHistoryUndo', err, '撤销失败，请重试')
+      await refreshHistoryState()
+    }
+  }, [busy, showToast, applyHistoryEntry, refreshHistoryState])
+
+  const redoAny = useCallback(async () => {
+    if (busy) return
+    let entry: OpHistoryEntry | null = null
+    try {
+      const r = await window.api.opHistoryRedo()
+      entry = r.entry
+      if (!entry) {
+        showToast('没有可复原的操作')
+        await refreshHistoryState()
+        return
+      }
+      await applyHistoryEntry(entry, 'redo')
+      await refreshHistoryState()
+    } catch (err) {
+      if (entry) {
+        try {
+          await window.api.opHistoryRestoreRedo(entry)
+        } catch {
+          /* ignore */
+        }
+      }
+      reportAndToast(showToast, 'opHistoryRedo', err, '复原失败，请重试')
+      await refreshHistoryState()
+    }
+  }, [busy, showToast, applyHistoryEntry, refreshHistoryState])
+  undoAnyRef.current = undoAny
+  redoAnyRef.current = redoAny
+
+  /* history helpers above; applySessionFromMain wired via ref below */
 
   const snapEdgeToNearbyMarker = useCallback(
     (t: number, lo: number, hi: number): { time: number; snapped: boolean } => {
@@ -3998,11 +4873,14 @@ export default function App(): React.JSX.Element {
       showToast('没有标记可清除')
       return
     }
-    pushUiUndo({
-      kind: 'markers',
-      markers: prev.map((m) => ({ ...m })),
-      label: `清除 ${prev.length} 个标记`
-    })
+    pushUiUndo(
+      {
+        kind: 'markers',
+        markers: prev.map((m) => ({ ...m })),
+        label: `清除 ${prev.length} 个标记`
+      },
+      { kind: 'markers', markers: [], label: `清除 ${prev.length} 个标记` }
+    )
     setTimelineMarkers([])
     setStatus('已清除标记（可撤回）')
   }, [pushUiUndo, showToast])
@@ -4012,11 +4890,18 @@ export default function App(): React.JSX.Element {
       const prev = timelineMarkersRef.current
       const target = prev.find((m) => m.id === id)
       if (!target) return
-      pushUiUndo({
-        kind: 'markers',
-        markers: prev.map((m) => ({ ...m })),
-        label: `删除标记 ${formatTimecode(target.time, stepFpsRef.current)}`
-      })
+      pushUiUndo(
+        {
+          kind: 'markers',
+          markers: prev.map((m) => ({ ...m })),
+          label: `删除标记 ${formatTimecode(target.time, stepFpsRef.current)}`
+        },
+        {
+          kind: 'markers',
+          markers: prev.filter((m) => m.id !== id).map((m) => ({ ...m })),
+          label: `删除标记 ${formatTimecode(target.time, stepFpsRef.current)}`
+        }
+      )
       setTimelineMarkers((list) => list.filter((m) => m.id !== id))
       setStatus('已删除标记（可撤回）')
     },
@@ -4037,12 +4922,12 @@ export default function App(): React.JSX.Element {
     setClipExports(session.exports)
     setSelectedExportPath(null)
     setExportPreviewUrl(null)
-    setUndoCount(session.undoStack.length)
     dirtyRef.current = precise.length > 0
     const span = selectionSpanFromRemaining(rem)
     setSelStart(span.start)
     setSelEnd(span.end)
   }, [syncRemainingHint])
+  applySessionFromMainRef.current = applySessionFromMain
 
   const syncSelectionToRemaining = useCallback(() => {
     if (!current || selectedExportPath) return
@@ -4150,18 +5035,73 @@ export default function App(): React.JSX.Element {
   const deleteSelectedExport = useCallback(async () => {
     if (!current || busy || !selectedExportPath) return
     try {
+      const exp = clipExports.find((e) => e.path === selectedExportPath)
+      if (!exp) {
+        showToast('找不到该分类片段')
+        return
+      }
       const pathAfter = await clearCompletedMark()
       if (!pathAfter) {
         showToast('无法撤销完成标记，请重试')
         return
       }
+      const isImage = current.mediaKind === 'image' || isImagePath(current.path)
+      const crop = exp.crop ?? null
+      const cropActive = Boolean(crop && isMeaningfulCrop(crop))
+      const dest: ClassifyDestApiOpts | undefined = lastClassifyOptsRef.current
       const session = await window.api.deleteExport(pathAfter, selectedExportPath)
       applySessionFromMain(session)
+      void pushOpHistory({
+        kind: 'deleteExport',
+        label: `删除分类「${exp.category}」`,
+        undo: {
+          sourcePath: pathAfter,
+          mediaKind: isImage ? 'image' : 'video',
+          category: exp.category,
+          range: { start: exp.start, end: exp.end },
+          crop,
+          cropActive,
+          duration,
+          dest,
+          exportPath: selectedExportPath,
+          start: exp.start,
+          end: exp.end
+        },
+        redo: {
+          sourcePath: pathAfter,
+          exportPath: selectedExportPath,
+          category: exp.category,
+          start: exp.start,
+          end: exp.end,
+          mediaKind: isImage ? 'image' : 'video',
+          crop,
+          cropActive,
+          duration,
+          dest
+        },
+        detail: {
+          sourcePath: pathAfter,
+          exportPath: selectedExportPath,
+          category: exp.category,
+          start: exp.start,
+          end: exp.end
+        }
+      }).then(() => refreshHistoryState())
       showToast('已删除分类片段，该时段可重新裁剪')
     } catch (err) {
       showToast(String(err))
     }
-  }, [current, busy, selectedExportPath, applySessionFromMain, showToast, clearCompletedMark])
+  }, [
+    current,
+    busy,
+    selectedExportPath,
+    clipExports,
+    applySessionFromMain,
+    showToast,
+    clearCompletedMark,
+    duration,
+    refreshHistoryState
+  ])
 
   const removeFromWorkspaceItems = useCallback(
     async (targets: VideoItem[]) => {
@@ -4233,54 +5173,64 @@ export default function App(): React.JSX.Element {
     (tag: string) => {
       const name = tag.trim()
       if (!name) return
-      if (isBuiltinCategoryTag(name)) {
-        showToast('预设标签不可删除')
+      if (!findVisibleCategoryGroup(name)) {
+        showToast('未找到该标签')
         return
       }
-      if (!findCustomCategoryGroup(name)) {
-        showToast('只能删除手动添加的标签')
-        return
-      }
-      if (deleteCategoryTagSkipAskRef.current) {
-        const result = tryRemoveCustomCategoryTag(name)
+      if (sessionModalSkipRef.current.deleteCategoryTag) {
+        const result = tryRemoveCategoryTag(name)
         if (!result.ok) {
           showToast(result.error)
           return
         }
         saveCustomCategoryTags()
-        void window.api.setCustomCategories(getCustomCategoryTags())
+        void window.api.setCustomCategories(getCategoryTagsPersistPayload())
+        void logOp('categoryTagRemove', `删除标签「${name}」`, {
+          name,
+          groupId: result.groupId,
+          source: result.source
+        })
         setCategoryTagsRevision((n) => n + 1)
         if (categoryInput.trim() === name) setCategoryInput('')
         if (batchCategory.trim() === name) setBatchCategory('')
         showToast(`已删除标签「${name}」`)
         return
       }
-      setDeleteCategoryTagDontAsk(false)
+      resetModalDontAsk('deleteCategoryTag')
       setDeleteCategoryTagModal({ tag: name })
     },
-    [showToast, categoryInput, batchCategory]
+    [showToast, categoryInput, batchCategory, resetModalDontAsk]
   )
 
   const confirmDeleteCategoryTag = useCallback(() => {
     const modal = deleteCategoryTagModal
     if (!modal) return
     const name = modal.tag
-    if (deleteCategoryTagDontAsk) {
-      deleteCategoryTagSkipAskRef.current = true
-    }
+    commitModalDontAsk('deleteCategoryTag')
     setDeleteCategoryTagModal(null)
-    const result = tryRemoveCustomCategoryTag(name)
+    const result = tryRemoveCategoryTag(name)
     if (!result.ok) {
       showToast(result.error)
       return
     }
     saveCustomCategoryTags()
-    void window.api.setCustomCategories(getCustomCategoryTags())
+    void window.api.setCustomCategories(getCategoryTagsPersistPayload())
+    void logOp('categoryTagRemove', `删除标签「${name}」`, {
+      name,
+      groupId: result.groupId,
+      source: result.source
+    })
     setCategoryTagsRevision((n) => n + 1)
     if (categoryInput.trim() === name) setCategoryInput('')
     if (batchCategory.trim() === name) setBatchCategory('')
     showToast(`已删除标签「${name}」`)
-  }, [deleteCategoryTagModal, deleteCategoryTagDontAsk, showToast, categoryInput, batchCategory])
+  }, [
+    deleteCategoryTagModal,
+    showToast,
+    categoryInput,
+    batchCategory,
+    commitModalDontAsk
+  ])
 
   const selectExportClip = useCallback(
     (exp: ExportRecord) => {
@@ -4344,11 +5294,12 @@ export default function App(): React.JSX.Element {
         return
       }
 
-      // 保存/批量弹窗：Delete 删除当前选中的自定义分类标签
+      // 保存/批量弹窗：Delete 删除当前选中的分类标签（内置/自定义均可）
       if (
         (e.key === 'Delete' || e.key === 'Backspace') &&
         (saveModalOpenRef.current || batchModal) &&
-        !(tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT')
+        !isTextEditingKeyTarget(e.target) &&
+        (e.target as HTMLElement)?.tagName !== 'SELECT'
       ) {
         const tagName = (saveModalOpenRef.current ? categoryInput : batchCategory).trim()
         if (tagName) {
@@ -4359,7 +5310,8 @@ export default function App(): React.JSX.Element {
         }
       }
 
-      if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT') return
+      // 文本输入中不抢快捷键；checkbox/range/select 上的方向键仍可切换媒体
+      if (isTextEditingKeyTarget(e.target)) return
 
       // 任意弹窗打开时，不响应导航/剪辑快捷键（避免误切视频、误保存）
       if (modalOpenRef.current) return
@@ -4391,18 +5343,26 @@ export default function App(): React.JSX.Element {
 
       if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'z') {
         e.preventDefault()
-        void undoAny()
+        if (e.shiftKey) void redoAny()
+        else void undoAny()
+        return
+      }
+      if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'y') {
+        e.preventDefault()
+        void redoAny()
         return
       }
 
       // 图片模式：无播放/时间轴相关快捷键，仅保留导航、保存、删除、撤回
-      if (currentIsImage) {
+      if (currentIsImageRef.current) {
         if (e.key === 'ArrowLeft' && !e.shiftKey && !e.altKey) {
           e.preventDefault()
-          void goRelative(-1)
+          ;(e.target as HTMLElement)?.blur?.()
+          void goRelativeRef.current(-1)
         } else if (e.key === 'ArrowRight' && !e.shiftKey && !e.altKey) {
           e.preventDefault()
-          void goRelative(1)
+          ;(e.target as HTMLElement)?.blur?.()
+          void goRelativeRef.current(1)
         }
         return
       }
@@ -4433,12 +5393,14 @@ export default function App(): React.JSX.Element {
 
       if (e.key === 'ArrowLeft' && !e.shiftKey && !e.altKey) {
         e.preventDefault()
-        void goRelative(-1)
+        ;(e.target as HTMLElement)?.blur?.()
+        void goRelativeRef.current(-1)
         return
       }
       if (e.key === 'ArrowRight' && !e.shiftKey && !e.altKey) {
         e.preventDefault()
-        void goRelative(1)
+        ;(e.target as HTMLElement)?.blur?.()
+        void goRelativeRef.current(1)
         return
       }
       if (selectedExportPath) return
@@ -4515,12 +5477,11 @@ export default function App(): React.JSX.Element {
     openSaveModal,
     nudgeFineTune,
     undoAny,
-    goRelative,
+    redoAny,
     applyFineTuneEdge,
     addTimelineMarker,
     clearTimelineMarkers,
-    toggleSelectionPlayback,
-    currentIsImage
+    toggleSelectionPlayback
   ])
 
   // timeline interaction
@@ -4730,7 +5691,7 @@ export default function App(): React.JSX.Element {
         selEndRef.current = undoEnd
         setSelStart(undoStart)
         setSelEnd(undoEnd)
-        setConfirmModal({
+        openConfirmModal({
           title: which === 'in' ? '无法调整入点' : '无法调整出点',
           message: lastFailReason || finalCheck.reason,
           confirmText: '知道了',
@@ -4746,12 +5707,20 @@ export default function App(): React.JSX.Element {
       selEndRef.current = liveEnd
       setSelStart(liveStart)
       setSelEnd(liveEnd)
-      pushUiUndo({
-        kind: 'selection',
-        selStart: undoStart,
-        selEnd: undoEnd,
-        fineTuneWhich: null
-      })
+      pushUiUndo(
+        {
+          kind: 'selection',
+          selStart: undoStart,
+          selEnd: undoEnd,
+          fineTuneWhich: null
+        },
+        {
+          kind: 'selection',
+          selStart: liveStart,
+          selEnd: liveEnd,
+          fineTuneWhich: which
+        }
+      )
       refocusTimelineToSelection(liveStart, liveEnd)
       setFineTuneWhich(which)
       const afterPlayToken = ++filmstripAfterPlayTokenRef.current
@@ -4854,6 +5823,14 @@ export default function App(): React.JSX.Element {
         height: Math.abs(cy - oy)
       })
     }
+    const src = playSourcePathRef.current || current?.path || ''
+    const before = {
+      kind: 'crop' as const,
+      sourcePath: src,
+      crop: { ...FULL_CROP },
+      cropActive: true,
+      cropCommitted: false
+    }
     const up = (): void => {
       window.removeEventListener('mousemove', move)
       window.removeEventListener('mouseup', up)
@@ -4866,6 +5843,13 @@ export default function App(): React.JSX.Element {
       }
       setCropCommitted(true)
       setStatus('可拖动裁切框或四角微调；再点「取消裁切」可重画')
+      pushUiUndo(before, {
+        kind: 'crop',
+        sourcePath: src,
+        crop: { ...c },
+        cropActive: true,
+        cropCommitted: true
+      })
     }
     window.addEventListener('mousemove', move)
     window.addEventListener('mouseup', up)
@@ -4908,9 +5892,33 @@ export default function App(): React.JSX.Element {
       }
       setCrop(next)
     }
+    const src = playSourcePathRef.current || current?.path || ''
+    const before = {
+      kind: 'crop' as const,
+      sourcePath: src,
+      crop: { ...origin },
+      cropActive: true,
+      cropCommitted: true
+    }
     const up = (): void => {
       window.removeEventListener('mousemove', move)
       window.removeEventListener('mouseup', up)
+      const afterCrop = cropRef.current
+      if (
+        Math.abs(afterCrop.x - origin.x) < 1e-6 &&
+        Math.abs(afterCrop.y - origin.y) < 1e-6 &&
+        Math.abs(afterCrop.width - origin.width) < 1e-6 &&
+        Math.abs(afterCrop.height - origin.height) < 1e-6
+      ) {
+        return
+      }
+      pushUiUndo(before, {
+        kind: 'crop',
+        sourcePath: src,
+        crop: { ...afterCrop },
+        cropActive: true,
+        cropCommitted: true
+      })
     }
     window.addEventListener('mousemove', move)
     window.addEventListener('mouseup', up)
@@ -4932,19 +5940,58 @@ export default function App(): React.JSX.Element {
         /* ignore */
       }
       setStillFrameUrl(null)
+      const src = playSourcePathRef.current || ''
+      // 重进裁切会丢掉当前框：记入历史，便于完美撤销
+      if (cropActive || cropCommitted) {
+        pushUiUndo(
+          {
+            kind: 'crop',
+            sourcePath: src,
+            crop: { ...cropRef.current },
+            cropActive,
+            cropCommitted
+          },
+          {
+            kind: 'crop',
+            sourcePath: src,
+            crop: { ...FULL_CROP },
+            cropActive: true,
+            cropCommitted: false
+          }
+        )
+      }
       setCrop(FULL_CROP)
       setCropCommitted(false)
       setCropActive(true)
       setStatus('在画面上按住并拖拽，框选裁切区域')
     })()
-  }, [selectedExportPath, showToast, clearCompletedMark])
+  }, [selectedExportPath, showToast, clearCompletedMark, cropActive, cropCommitted, pushUiUndo])
 
   const cancelCropMode = useCallback((): void => {
+    if (cropActive || cropCommitted) {
+      const src = playSourcePathRef.current || ''
+      pushUiUndo(
+        {
+          kind: 'crop',
+          sourcePath: src,
+          crop: { ...cropRef.current },
+          cropActive,
+          cropCommitted
+        },
+        {
+          kind: 'crop',
+          sourcePath: src,
+          crop: { ...FULL_CROP },
+          cropActive: false,
+          cropCommitted: false
+        }
+      )
+    }
     setCrop(FULL_CROP)
     setCropActive(false)
     setCropCommitted(false)
     setStatus('')
-  }, [])
+  }, [cropActive, cropCommitted, pushUiUndo])
 
   const selLen = Math.abs(selEnd - selStart)
   const selectionMeta = useMemo(() => {
@@ -5010,7 +6057,9 @@ export default function App(): React.JSX.Element {
                 }}
               >
                 {updateBanner.includes('已下载') || updateModal?.phase === 'ready'
-                  ? '一键安装重启'
+                  ? IS_MAC
+                    ? '打开安装包'
+                    : '一键安装重启'
                   : '一键更新'}
               </button>
             ) : null}
@@ -5114,11 +6163,18 @@ export default function App(): React.JSX.Element {
                 : ''}
           </button>
           <button
-            disabled={busy || batchUndoItems === null}
-            onClick={() => void undoBatchClassify()}
-            title={`将最近一次批量分类的视频移回原目录（仅当次有效，${MOD_KEY}+Z 也可）`}
+            disabled={busy || !historyCanUndo}
+            onClick={() => void undoAny()}
+            title={`撤销上一步（${MOD_KEY}+Z），跨重启仍可用`}
           >
-            撤回批量
+            撤销
+          </button>
+          <button
+            disabled={busy || !historyCanRedo}
+            onClick={() => void redoAny()}
+            title={`复原（${MOD_KEY}+Shift+Z）`}
+          >
+            复原
           </button>
           <button
             disabled={busy || (selectedIds.size === 0 && secondaryIds.size === 0)}
@@ -5153,8 +6209,12 @@ export default function App(): React.JSX.Element {
             }
             onClick={() => {
               void window.api.openAbout({ autoUpdate: true }).catch((err: unknown) => {
-                reportClientError('openAbout', err)
-                showToast(err instanceof Error ? err.message : '无法打开关于窗口')
+                reportAndToast(
+                  showToast,
+                  'openAbout',
+                  err,
+                  '无法打开关于窗口'
+                )
               })
             }}
           >
@@ -5164,15 +6224,14 @@ export default function App(): React.JSX.Element {
           <button
             type="button"
             disabled={busy}
-            title={appVersion ? `打开异常日志（v${appVersion}）` : '打开异常日志'}
+            title={appVersion ? `打开操作日志（v${appVersion}）` : '打开操作日志'}
             onClick={() => {
               void (async () => {
                 try {
-                  const r = await window.api.openExceptionLog()
+                  const r = await window.api.openOperationsLog()
                   if (!r?.ok && r?.error) showToast(`无法打开日志：${r.error}`)
                 } catch (err) {
-                  reportClientError('openExceptionLog', err)
-                  showToast(String(err))
+                  reportAndToast(showToast, 'openOperationsLog', err, '无法打开日志')
                 }
               })()
             }}
@@ -5212,6 +6271,8 @@ export default function App(): React.JSX.Element {
                 setSecondaryIds(new Set())
                 setSecondarySelectMode(false)
                 selectAnchorRef.current = null
+                // 失焦，避免方向键继续改筛选而不是切媒体
+                e.currentTarget.blur()
                 // 切到筛选后首个可见项
                 window.setTimeout(() => {
                   const indices = videos
@@ -5278,7 +6339,7 @@ export default function App(): React.JSX.Element {
               <div
                 className="thumb-virtual-window"
                 style={{
-                  transform: `translateY(${Math.floor(thumbVirtual.start / thumbVirtual.cols) * thumbVirtual.itemH}px)`
+                  transform: `translateY(${thumbVirtual.offsetY}px)`
                 }}
               >
                 {thumbVirtual.slice.map(({ videoIndex }) => {
@@ -5294,6 +6355,7 @@ export default function App(): React.JSX.Element {
                       completed={v.completed}
                       isCategoryCopy={v.isCategoryCopy}
                       mediaKind={v.mediaKind}
+                      aspectRatio={thumbAspectByPath[normMediaPath(v.path)]}
                       active={videoIndex === index}
                       selected={selectedIds.has(v.id)}
                       secondaryPicked={secondaryIds.has(v.id)}
@@ -5305,6 +6367,7 @@ export default function App(): React.JSX.Element {
                       onToggleSelect={() => toggleSelect(v.id, videoIndex)}
                       onRangeSelect={() => rangeSelect(videoIndex)}
                       onPlayClick={() => handleThumbPlay(v.id)}
+                      onAspectRatio={rememberThumbAspect}
                     />
                   )
                 })}
@@ -6191,14 +7254,11 @@ export default function App(): React.JSX.Element {
                           const v = savePreviewRef.current
                           if (!v) return
                           if (v.paused) {
-                            void v.play().then(() => setSavePreviewPlaying(true)).catch(() => undefined)
+                            void v.play().catch(() => undefined)
                           } else {
                             v.pause()
-                            setSavePreviewPlaying(false)
                           }
                         }}
-                        onPlay={() => setSavePreviewPlaying(true)}
-                        onPause={() => setSavePreviewPlaying(false)}
                         onTimeUpdate={(e) => {
                           const v = e.currentTarget
                           const a = saveModal.start
@@ -6296,8 +7356,18 @@ export default function App(): React.JSX.Element {
               </button>
             </div>
             <p className="save-dest-hint">
-              自定义的是类别文件夹的源目录，实际保存到「源目录/类别名/」。自定义后本次运行内一直沿用，重启后恢复默认
+              自定义的是类别文件夹的源目录，实际保存到「源目录/类别名/」。与批量分类共用，跨重启记住
             </p>
+            <label className="checkbox-row">
+              <input
+                type="checkbox"
+                checked={Boolean(modalDontAskDraft.save)}
+                onChange={(e) =>
+                  setModalDontAskDraft((prev) => ({ ...prev, save: e.target.checked }))
+                }
+              />
+              本次运行不再询问（下次直接按本次类别与路径保存）
+            </label>
             <div className="modal-actions">
               <button type="button" onClick={() => setSaveModal(null)}>
                 取消
@@ -6317,24 +7387,7 @@ export default function App(): React.JSX.Element {
             <p>
               将
               {secondarySelectMode ? '二次选中' : '选中'}的 {batchTargetVideos.length}{' '}
-              个视频移动到类别文件夹（原目录不再保留）。支持一次撤回。
-              {batchTargetVideos.some((v) => v.isCategoryCopy) ? (
-                <>
-                  <br />
-                  含已归类项：确认后将选择二次分类落点
-                  {reclassifyPrefDontAsk
-                    ? `（当前默认：${reclassifyModeLabel(reclassifyMode)}）`
-                    : ''}
-                  {reclassifyPrefDontAsk ? (
-                    <>
-                      {' '}
-                      <button type="button" className="linkish" onClick={clearReclassifyDontAsk}>
-                        更改
-                      </button>
-                    </>
-                  ) : null}
-                </>
-              ) : null}
+              个文件移动到「根目录/类别名/」（原目录不再保留）。可撤销/复原。
             </p>
             <label>类别</label>
             <input
@@ -6356,6 +7409,64 @@ export default function App(): React.JSX.Element {
               onRequestDelete={requestDeleteCategoryTag}
               refreshKey={categoryTagsRevision}
             />
+            <label className="save-dest-label">分类根目录</label>
+            <div className="reclassify-custom-row save-dest-row">
+              <input
+                value={
+                  batchCategory.trim()
+                    ? categoryDirUnderRoot(batchDestRoot, batchCategory)
+                    : batchDestRoot
+                }
+                onChange={(e) => {
+                  const cat = batchCategory.trim()
+                  const san = cat ? sanitizeName(cat) : ''
+                  let root = e.target.value
+                  if (
+                    san &&
+                    san !== 'unnamed' &&
+                    (mediaBasename(root) === san || mediaBasename(root) === cat)
+                  ) {
+                    root = mediaDirname(root) || root
+                  }
+                  setBatchDestRoot(root)
+                  sessionCustomSaveRootRef.current = root.trim() || null
+                  if (root.trim()) persistSaveRoot(root.trim())
+                }}
+                placeholder="源目录/类别名；可改源目录或点右侧选择"
+                title={batchDestRoot || undefined}
+              />
+              <button
+                type="button"
+                onClick={() => {
+                  void (async () => {
+                    const dir = await window.api.pickDirectory({
+                      title: '选择类别文件夹的源目录',
+                      defaultPath: batchDestRoot || undefined
+                    })
+                    if (dir) {
+                      setBatchDestRoot(dir)
+                      sessionCustomSaveRootRef.current = dir
+                      persistSaveRoot(dir)
+                    }
+                  })()
+                }}
+              >
+                选择…
+              </button>
+            </div>
+            <p className="save-dest-hint">
+              与保存分类相同：自选根目录后按「根目录/类别名/」落盘，并跨重启记住
+            </p>
+            <label className="checkbox-row">
+              <input
+                type="checkbox"
+                checked={Boolean(modalDontAskDraft.batch)}
+                onChange={(e) =>
+                  setModalDontAskDraft((prev) => ({ ...prev, batch: e.target.checked }))
+                }
+              />
+              本次运行不再询问（下次直接按本次类别与路径归类）
+            </label>
             <div className="modal-actions">
               <button onClick={() => setBatchModal(false)}>取消</button>
               <button className="primary" disabled={busy} onClick={() => void confirmBatchClassify()}>
@@ -6366,305 +7477,6 @@ export default function App(): React.JSX.Element {
         </div>
       )}
 
-      {reclassifyDestModal && (
-        <div className="modal-backdrop">
-          <div className="modal modal-reclassify">
-            <h2>二次分类落点</h2>
-            <p>
-              选中项中有 {reclassifyDestModal.categorizedCount} 个已在类别文件夹内。
-              请选择再次归类到「{reclassifyDestModal.category}」时的目标位置。
-              未归类项仍移到各自所在目录下的类别文件夹。
-            </p>
-            <div className="radio-stack" role="radiogroup" aria-label="二次分类落点">
-              <label className="radio-row">
-                <input
-                  type="radio"
-                  name="reclassify-dest"
-                  checked={reclassifyMode === 'originalRoot'}
-                  onChange={() => setReclassifyMode('originalRoot')}
-                />
-                <span>
-                  <strong>原目录对应类别</strong>
-                  <span className="muted">
-                    例：/素材库/走路/… → /素材库/{reclassifyDestModal.category}/…
-                  </span>
-                </span>
-              </label>
-              <label className="radio-row">
-                <input
-                  type="radio"
-                  name="reclassify-dest"
-                  checked={reclassifyMode === 'underCurrent'}
-                  onChange={() => setReclassifyMode('underCurrent')}
-                />
-                <span>
-                  <strong>当前目录下新建类别</strong>
-                  <span className="muted">
-                    例：/素材库/走路/… → /素材库/走路/{reclassifyDestModal.category}/…
-                  </span>
-                </span>
-              </label>
-              <label className="radio-row">
-                <input
-                  type="radio"
-                  name="reclassify-dest"
-                  checked={reclassifyMode === 'custom'}
-                  onChange={() => setReclassifyMode('custom')}
-                />
-                <span>
-                  <strong>自选目标文件夹</strong>
-                  <span className="muted">直接写入所选目录，不再套一层类别名</span>
-                </span>
-              </label>
-            </div>
-            {reclassifyMode === 'custom' ? (
-              <div className="reclassify-custom-row">
-                <input
-                  readOnly
-                  value={reclassifyCustomDir}
-                  placeholder="尚未选择目标文件夹"
-                />
-                <button type="button" onClick={() => void pickReclassifyCustomDir()}>
-                  选择…
-                </button>
-              </div>
-            ) : null}
-            <label className="checkbox-row">
-              <input
-                type="checkbox"
-                checked={reclassifyDontAsk}
-                onChange={(e) => setReclassifyDontAsk(e.target.checked)}
-              />
-              不再询问（记住本次选择）
-            </label>
-            <div className="modal-actions">
-              <button
-                type="button"
-                onClick={() => {
-                  setReclassifyDestModal(null)
-                  setBatchModal(true)
-                }}
-              >
-                返回
-              </button>
-              <button
-                type="button"
-                className="primary"
-                disabled={busy}
-                onClick={() => void confirmReclassifyDest()}
-              >
-                确认移动
-              </button>
-            </div>
-          </div>
-        </div>
-      )}
-
-      {deleteCategoryTagModal && (
-        <div className="modal-backdrop">
-          <div className="modal">
-            <h2>删除分类标签</h2>
-            <p>
-              确定删除自定义标签「<strong>{deleteCategoryTagModal.tag}</strong>」？
-              <br />
-              <span style={{ color: 'var(--text-secondary)', fontSize: 12 }}>
-                仅从标签列表移除，已导出的分类文件不会被删除。
-                <br />
-                勾选「不再询问」后，本次运行期间将直接删除；重启应用后恢复询问。
-              </span>
-            </p>
-            <label className="checkbox-row">
-              <input
-                type="checkbox"
-                checked={deleteCategoryTagDontAsk}
-                onChange={(e) => setDeleteCategoryTagDontAsk(e.target.checked)}
-              />
-              不再询问
-            </label>
-            <div className="modal-actions">
-              <button
-                onClick={() => {
-                  setDeleteCategoryTagDontAsk(false)
-                  setDeleteCategoryTagModal(null)
-                }}
-              >
-                取消
-              </button>
-              <button className="danger" onClick={confirmDeleteCategoryTag}>
-                删除标签
-              </button>
-            </div>
-          </div>
-        </div>
-      )}
-
-      {whatsNewModal && (
-        <div className="modal-backdrop">
-          <div className="modal">
-            <h2>{whatsNewModal.title}</h2>
-            <p>本版本更新内容：</p>
-            <ul className="whats-new-list">
-              {whatsNewModal.lines.map((line) => (
-                <li key={line}>{line}</li>
-              ))}
-            </ul>
-            <div className="modal-actions">
-              <button
-                type="button"
-                className="primary"
-                onClick={() => dismissWhatsNew()}
-              >
-                知道了
-              </button>
-            </div>
-          </div>
-        </div>
-      )}
-
-      {updateModal && !updateModal.dismissed && (
-        <div className="modal-backdrop">
-          <div className="modal modal-update">
-            <h2>
-              {updateModal.phase === 'error'
-                ? '更新失败'
-                : updateModal.phase === 'installing'
-                  ? '正在安装更新'
-                  : updateModal.phase === 'downloading' || updateModal.phase === 'saving'
-                    ? '正在准备更新'
-                    : updateModal.phase === 'ready'
-                      ? '更新已就绪'
-                      : '发现新版本'}
-            </h2>
-            <p>
-              {updateModal.phase === 'error'
-                ? updateModal.error || '更新失败，请稍后重试'
-                : updateModal.phase === 'saving'
-                  ? '正在保存当前全部操作，随后下载并安装更新…'
-                  : updateModal.phase === 'downloading'
-                    ? `正在下载${updateModal.version ? ` ${updateModal.version}` : '新版本'}，完成后将自动安装并重启。重启后会恢复当前工作区。`
-                    : updateModal.phase === 'installing'
-                      ? '安装包已就绪，正在重启应用…'
-                      : updateModal.phase === 'ready'
-                        ? `新版本${updateModal.version ? ` ${updateModal.version}` : ''}已下载。点击一键更新将先保存当前工作，再安装并重启；重启后自动恢复工作区。`
-                        : `检测到新版本${updateModal.version ? ` ${updateModal.version}` : ''}。点击「一键更新」将：保存当前全部操作 → 下载安装包 → 安装并重启 → 自动恢复工作区。`}
-            </p>
-            {(updateModal.phase === 'downloading' || updateModal.phase === 'saving') &&
-            updateModal.progress != null ? (
-              <div
-                className="update-progress update-progress-modal"
-                role="progressbar"
-                aria-valuemin={0}
-                aria-valuemax={100}
-                aria-valuenow={Math.round(updateModal.progress)}
-              >
-                <div
-                  className="update-progress-fill"
-                  style={{ width: `${Math.max(2, Math.round(updateModal.progress))}%` }}
-                />
-                <span className="update-progress-label">
-                  {updateModal.phase === 'saving'
-                    ? '保存中…'
-                    : `${Math.round(updateModal.progress)}%`}
-                </span>
-              </div>
-            ) : null}
-            <div className="modal-actions">
-              {updateModal.phase === 'available' ||
-              updateModal.phase === 'ready' ||
-              updateModal.phase === 'error' ? (
-                <>
-                  <button
-                    type="button"
-                    onClick={() =>
-                      setUpdateModal((prev) => (prev ? { ...prev, dismissed: true } : prev))
-                    }
-                  >
-                    稍后
-                  </button>
-                  <button
-                    type="button"
-                    className="primary"
-                    onClick={() => {
-                      void applyOneClickUpdate()
-                    }}
-                  >
-                    {updateModal.phase === 'ready' ? '一键安装重启' : '一键更新'}
-                  </button>
-                </>
-              ) : (
-                <button type="button" disabled>
-                  {updateModal.phase === 'saving'
-                    ? '正在保存…'
-                    : updateModal.phase === 'downloading'
-                      ? '正在下载…'
-                      : '正在安装…'}
-                </button>
-              )}
-            </div>
-          </div>
-        </div>
-      )}
-
-      {confirmModal && (
-        <div className="modal-backdrop">
-          <div className="modal">
-            <h2>{confirmModal.title}</h2>
-            <p>{confirmModal.message}</p>
-            <div className="modal-actions">
-              <button
-                onClick={() => {
-                  const cancel = confirmModal.onCancel
-                  setConfirmModal(null)
-                  cancel?.()
-                }}
-              >
-                取消
-              </button>
-              <button
-                className="primary"
-                onClick={() => {
-                  const fn = confirmModal.onConfirm
-                  setConfirmModal(null)
-                  fn()
-                }}
-              >
-                {confirmModal.confirmText || '确认'}
-              </button>
-            </div>
-          </div>
-        </div>
-      )}
-
-      {importChoiceModal && (
-        <div className="modal-backdrop">
-          <div className="modal modal-import-choice">
-            <h2>选择加载内容</h2>
-            <p>
-              检测到该目录同时包含{' '}
-              <strong>{importChoiceModal.videoCount}</strong> 个视频与{' '}
-              <strong>{importChoiceModal.imageCount}</strong> 张图片，请选择要加载的范围：
-            </p>
-            <div className="modal-actions modal-actions-stack">
-              <button
-                type="button"
-                className="primary"
-                onClick={() => void resolveImportChoice('both')}
-              >
-                都加载（之后可在列表筛选）
-              </button>
-              <button type="button" onClick={() => void resolveImportChoice('video')}>
-                只加载视频（{importChoiceModal.videoCount}）
-              </button>
-              <button type="button" onClick={() => void resolveImportChoice('image')}>
-                只加载图片（{importChoiceModal.imageCount}）
-              </button>
-              <button type="button" onClick={() => setImportChoiceModal(null)}>
-                取消
-              </button>
-            </div>
-          </div>
-        </div>
-      )}
 
       {batchResultModal && (
         <div className="modal-backdrop">
@@ -6672,7 +7484,7 @@ export default function App(): React.JSX.Element {
             <h2>批量分类结果 · {batchResultModal.category}</h2>
             {batchResultModal.cancelled && (
               <p className="batch-result-note">
-                已中止。已成功移动的项仍在目标目录，可用「撤回批量分类」或 {MOD_KEY}+Z 还原；未处理项未改动。
+                已中止。已成功移动的项仍在目标目录，可用「撤销」或 {MOD_KEY}+Z 还原；未处理项未改动。
               </p>
             )}
             <div className="batch-result-lists">
@@ -6701,30 +7513,59 @@ export default function App(): React.JSX.Element {
                 </ul>
               </div>
             </div>
-            <div className="modal-actions">
-              <button onClick={() => setBatchResultModal(null)}>关闭</button>
-              {batchResultModal.canUndo && (
+            <label className="checkbox-row">
+              <input
+                type="checkbox"
+                checked={Boolean(modalDontAskDraft.batchResult)}
+                onChange={(e) =>
+                  setModalDontAskDraft((prev) => ({
+                    ...prev,
+                    batchResult: e.target.checked
+                  }))
+                }
+              />
+              本次运行不再显示此结果窗
+            </label>
+            <div className="modal-actions modal-actions-split">
+              {batchResultModal.canUndo && batchResultModal.moves.length > 0 ? (
                 <button
-                  onClick={() => {
-                    setBatchResultModal(null)
-                    void undoBatchClassify()
-                  }}
+                  type="button"
+                  className="danger"
+                  disabled={busy}
+                  onClick={() => void undoThisBatchFromResult()}
+                  title="只撤回这一次批量移动的文件，与之后其它操作无关"
                 >
                   撤回本次移动
                 </button>
+              ) : (
+                <span />
               )}
-              {batchResultModal.results.some((r) => !r.ok) && (
+              <div className="modal-actions-end">
                 <button
-                  className="primary"
-                  disabled={busy}
+                  type="button"
                   onClick={() => {
-                    const failed = batchResultModal.results.filter((r) => !r.ok).map((r) => r.path)
-                    void retryBatchFailed(failed, batchResultModal.category)
+                    commitModalDontAsk('batchResult')
+                    setBatchResultModal(null)
                   }}
                 >
-                  重试失败项
+                  关闭
                 </button>
-              )}
+                {batchResultModal.results.some((r) => !r.ok) && (
+                  <button
+                    className="primary"
+                    disabled={busy}
+                    onClick={() => {
+                      commitModalDontAsk('batchResult')
+                      const failed = batchResultModal.results
+                        .filter((r) => !r.ok)
+                        .map((r) => r.path)
+                      void retryBatchFailed(failed, batchResultModal.category)
+                    }}
+                  >
+                    重试失败项
+                  </button>
+                )}
+              </div>
             </div>
           </div>
         </div>
@@ -6743,9 +7584,20 @@ export default function App(): React.JSX.Element {
                 若源视频已移动或删除：请丢弃会话后，用「打开」重新选择所在目录；已导出片段仍保留在分类目录中。
               </span>
             </p>
+            <label className="checkbox-row">
+              <input
+                type="checkbox"
+                checked={Boolean(modalDontAskDraft.recover)}
+                onChange={(e) =>
+                  setModalDontAskDraft((prev) => ({ ...prev, recover: e.target.checked }))
+                }
+              />
+              本次运行不再显示未完成会话提示
+            </label>
             <div className="modal-actions">
               <button
                 onClick={() => {
+                  commitModalDontAsk('recover')
                   void window.api
                     .discardSession(recoverCurrent, false)
                     .then(() => {
@@ -6760,6 +7612,7 @@ export default function App(): React.JSX.Element {
               <button
                 className="danger"
                 onClick={() => {
+                  commitModalDontAsk('recover')
                   void window.api
                     .discardSession(recoverCurrent, true)
                     .then(() => {
@@ -6774,6 +7627,7 @@ export default function App(): React.JSX.Element {
               <button
                 className="primary"
                 onClick={() => {
+                  commitModalDontAsk('recover')
                   void (async () => {
                     try {
                       const src = recoverCurrent.sourcePath
@@ -6819,6 +7673,247 @@ export default function App(): React.JSX.Element {
                 }}
               >
                 继续处理
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {deleteCategoryTagModal && (
+        <div className="modal-backdrop">
+          <div className="modal">
+            <h2>删除标签</h2>
+            <p>
+              确定删除标签「{deleteCategoryTagModal.tag}」？仅从标签列表移除，不会改动已导出的文件。
+            </p>
+            <label className="checkbox-row">
+              <input
+                type="checkbox"
+                checked={Boolean(modalDontAskDraft.deleteCategoryTag)}
+                onChange={(e) =>
+                  setModalDontAskDraft((prev) => ({
+                    ...prev,
+                    deleteCategoryTag: e.target.checked
+                  }))
+                }
+              />
+              本次运行不再询问
+            </label>
+            <div className="modal-actions">
+              <button onClick={() => setDeleteCategoryTagModal(null)}>取消</button>
+              <button className="danger" onClick={confirmDeleteCategoryTag}>
+                删除
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {whatsNewModal && (
+        <div className="modal-backdrop">
+          <div className="modal">
+            <h2>{whatsNewModal.title}</h2>
+            <p>本版本更新内容：</p>
+            <ul className="whats-new-list">
+              {whatsNewModal.lines.map((line) => (
+                <li key={line}>{line}</li>
+              ))}
+            </ul>
+            <div className="modal-actions">
+              <button type="button" className="primary" onClick={() => dismissWhatsNew()}>
+                知道了
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {updateModal && !updateModal.dismissed && (
+        <div className="modal-backdrop">
+          <div className="modal modal-update">
+            <h2>
+              {updateModal.phase === 'error'
+                ? '更新失败'
+                : updateModal.phase === 'installing'
+                  ? '正在安装更新'
+                  : updateModal.phase === 'downloading' || updateModal.phase === 'saving'
+                    ? '正在准备更新'
+                    : updateModal.phase === 'ready'
+                      ? '更新已就绪'
+                      : '发现新版本'}
+            </h2>
+            <p>
+              {updateModal.phase === 'error'
+                ? updateModal.error || '更新失败，请稍后重试'
+                : updateModal.phase === 'saving'
+                  ? '正在保存当前全部操作，随后下载并安装更新…'
+                  : updateModal.phase === 'downloading'
+                    ? IS_MAC
+                      ? `正在下载${updateModal.version ? ` ${updateModal.version}` : '新版本'}。完成后将打开安装包；请拖到「应用程序」覆盖安装，再重新打开（可恢复工作区）。`
+                      : `正在下载${updateModal.version ? ` ${updateModal.version}` : '新版本'}，完成后将自动安装并重启。重启后会恢复当前工作区。`
+                    : updateModal.phase === 'installing'
+                      ? IS_MAC
+                        ? '安装包已就绪，正在打开…请拖到「应用程序」后重新打开本应用'
+                        : '安装包已就绪，正在重启应用…'
+                      : updateModal.phase === 'ready'
+                        ? IS_MAC
+                          ? `新版本${updateModal.version ? ` ${updateModal.version}` : ''}已下载。将先保存当前工作，再打开安装包；请拖到「应用程序」覆盖后重新打开。`
+                          : `新版本${updateModal.version ? ` ${updateModal.version}` : ''}已下载。点击一键更新将先保存当前工作，再安装并重启；重启后自动恢复工作区。`
+                        : IS_MAC
+                          ? `检测到新版本${updateModal.version ? ` ${updateModal.version}` : ''}。将：保存当前工作 → 下载安装包 → 打开安装包（请拖到「应用程序」）→ 重新打开后恢复工作区。当前 macOS 包未签名，无法静默覆盖安装。`
+                          : `检测到新版本${updateModal.version ? ` ${updateModal.version}` : ''}。点击「一键更新」将：保存当前全部操作 → 下载安装包 → 安装并重启 → 自动恢复工作区。`}
+            </p>
+            {(updateModal.phase === 'downloading' || updateModal.phase === 'saving') &&
+            updateModal.progress != null ? (
+              <div
+                className="update-progress update-progress-modal"
+                role="progressbar"
+                aria-valuemin={0}
+                aria-valuemax={100}
+                aria-valuenow={Math.round(updateModal.progress)}
+              >
+                <div
+                  className="update-progress-fill"
+                  style={{ width: `${Math.max(2, Math.round(updateModal.progress))}%` }}
+                />
+                <span className="update-progress-label">
+                  {updateModal.phase === 'saving'
+                    ? '保存中…'
+                    : `${Math.round(updateModal.progress)}%`}
+                </span>
+              </div>
+            ) : null}
+            <label className="checkbox-row">
+              <input
+                type="checkbox"
+                checked={Boolean(modalDontAskDraft.update)}
+                onChange={(e) =>
+                  setModalDontAskDraft((prev) => ({ ...prev, update: e.target.checked }))
+                }
+              />
+              本次运行不再弹出更新详情窗
+            </label>
+            <div className="modal-actions">
+              {updateModal.phase === 'available' ||
+              updateModal.phase === 'ready' ||
+              updateModal.phase === 'error' ? (
+                <>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      commitModalDontAsk('update')
+                      setUpdateModal((prev) => (prev ? { ...prev, dismissed: true } : prev))
+                    }}
+                  >
+                    稍后
+                  </button>
+                  <button
+                    type="button"
+                    className="primary"
+                    onClick={() => {
+                      void applyOneClickUpdate()
+                    }}
+                  >
+                    {updateModal.phase === 'ready'
+                      ? IS_MAC
+                        ? '打开安装包'
+                        : '一键安装重启'
+                      : '一键更新'}
+                  </button>
+                </>
+              ) : (
+                <button type="button" disabled>
+                  {updateModal.phase === 'saving'
+                    ? '正在保存…'
+                    : updateModal.phase === 'downloading'
+                      ? '正在下载…'
+                      : '正在安装…'}
+                </button>
+              )}
+            </div>
+          </div>
+        </div>
+      )}
+
+      {confirmModal && (
+        <div className="modal-backdrop">
+          <div className="modal">
+            <h2>{confirmModal.title}</h2>
+            <p style={{ whiteSpace: 'pre-wrap' }}>{confirmModal.message}</p>
+            <label className="checkbox-row">
+              <input
+                type="checkbox"
+                checked={Boolean(modalDontAskDraft.confirm)}
+                onChange={(e) =>
+                  setModalDontAskDraft((prev) => ({ ...prev, confirm: e.target.checked }))
+                }
+              />
+              本次运行不再询问（将自动执行「确定」）
+            </label>
+            <div className="modal-actions">
+              <button
+                onClick={() => {
+                  const cancel = confirmModal.onCancel
+                  setConfirmModal(null)
+                  cancel?.()
+                }}
+              >
+                取消
+              </button>
+              <button
+                className="primary"
+                onClick={() => {
+                  commitModalDontAsk('confirm')
+                  const go = confirmModal.onConfirm
+                  setConfirmModal(null)
+                  go()
+                }}
+              >
+                {confirmModal.confirmText || '确定'}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {importChoiceModal && (
+        <div className="modal-backdrop">
+          <div className="modal modal-import-choice">
+            <h2>选择加载内容</h2>
+            <p>
+              检测到该目录同时包含{' '}
+              <strong>{importChoiceModal.videoCount}</strong> 个视频与{' '}
+              <strong>{importChoiceModal.imageCount}</strong> 张图片，请选择要加载的范围：
+            </p>
+            <label className="checkbox-row">
+              <input
+                type="checkbox"
+                checked={Boolean(modalDontAskDraft.importChoice)}
+                onChange={(e) =>
+                  setModalDontAskDraft((prev) => ({
+                    ...prev,
+                    importChoice: e.target.checked
+                  }))
+                }
+              />
+              本次运行不再询问（默认都加载）
+            </label>
+            <div className="modal-actions modal-actions-stack">
+              <button
+                type="button"
+                className="primary"
+                onClick={() => void resolveImportChoice('both')}
+              >
+                都加载（之后可在列表筛选）
+              </button>
+              <button type="button" onClick={() => void resolveImportChoice('video')}>
+                只加载视频（{importChoiceModal.videoCount}）
+              </button>
+              <button type="button" onClick={() => void resolveImportChoice('image')}>
+                只加载图片（{importChoiceModal.imageCount}）
+              </button>
+              <button type="button" onClick={() => setImportChoiceModal(null)}>
+                取消
               </button>
             </div>
           </div>

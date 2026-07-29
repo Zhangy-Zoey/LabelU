@@ -53,6 +53,7 @@ export type ExtensibleGroupId = CategoryGroupId
 export const EXTENSIBLE_IDS: ExtensibleGroupId[] = ['normal', 'abnormal', 'danger', 'other']
 
 const LS_CUSTOM_CATEGORIES = 'labelu.customCategoryTags'
+const LS_REMOVED_BUILTINS = 'labelu.removedBuiltinCategoryTags'
 
 /** 用户在各大类下手动添加的标签（内存；渲染进程会从 localStorage 加载） */
 const customByGroup: Record<ExtensibleGroupId, string[]> = {
@@ -61,6 +62,9 @@ const customByGroup: Record<ExtensibleGroupId, string[]> = {
   danger: [],
   other: []
 }
+
+/** 用户删除的内置标签名（仅隐藏列表，不改已导出文件） */
+const removedBuiltins = new Set<string>()
 
 let knownTagSet = new Set(CATEGORY_GROUPS.flatMap((g) => g.tags))
 
@@ -76,7 +80,10 @@ function addTagVariants(set: Set<string>, tag: string): void {
 function rebuildKnownTagSet(): void {
   knownTagSet = new Set<string>()
   for (const g of CATEGORY_GROUPS) {
-    for (const t of g.tags) addTagVariants(knownTagSet, t)
+    for (const t of g.tags) {
+      if (removedBuiltins.has(t)) continue
+      addTagVariants(knownTagSet, t)
+    }
   }
   for (const id of EXTENSIBLE_IDS) {
     for (const t of customByGroup[id]) addTagVariants(knownTagSet, t)
@@ -95,6 +102,33 @@ export function getCustomCategoryTags(): Record<ExtensibleGroupId, string[]> {
   }
 }
 
+export function getRemovedBuiltinTags(): string[] {
+  return Array.from(removedBuiltins)
+}
+
+/** 持久化 / IPC 共用载荷：自定义标签 + 已删内置标签 */
+export type CategoryTagsPersistPayload = Partial<Record<ExtensibleGroupId, string[]>> & {
+  removedBuiltins?: string[]
+}
+
+export function getCategoryTagsPersistPayload(): CategoryTagsPersistPayload {
+  return {
+    ...getCustomCategoryTags(),
+    removedBuiltins: getRemovedBuiltinTags()
+  }
+}
+
+export function applyRemovedBuiltinTags(names: string[] | null | undefined): void {
+  removedBuiltins.clear()
+  if (Array.isArray(names)) {
+    for (const n of names) {
+      const t = String(n || '').trim()
+      if (t) removedBuiltins.add(t)
+    }
+  }
+  rebuildKnownTagSet()
+}
+
 /** 主/渲染进程共用：用完整 map 覆盖内存中的自定义标签 */
 export function applyCustomCategoryTags(
   map: Partial<Record<ExtensibleGroupId, string[]>> | null | undefined
@@ -108,13 +142,28 @@ export function applyCustomCategoryTags(
   rebuildKnownTagSet()
 }
 
-/** 从 localStorage 加载自定义标签（仅渲染进程调用） */
+/** 一次应用自定义 + 已删内置（磁盘 / IPC） */
+export function applyCategoryTagsPersistPayload(
+  map: CategoryTagsPersistPayload | null | undefined
+): void {
+  applyCustomCategoryTags(map)
+  if (map && Array.isArray(map.removedBuiltins)) {
+    applyRemovedBuiltinTags(map.removedBuiltins)
+  }
+}
+
+/** 从 localStorage 加载自定义标签与已删内置（仅渲染进程调用） */
 export function loadCustomCategoryTags(): void {
   try {
     if (typeof localStorage === 'undefined') return
     const raw = localStorage.getItem(LS_CUSTOM_CATEGORIES)
-    if (!raw) return
-    applyCustomCategoryTags(JSON.parse(raw) as Partial<Record<ExtensibleGroupId, string[]>>)
+    if (raw) {
+      applyCustomCategoryTags(JSON.parse(raw) as Partial<Record<ExtensibleGroupId, string[]>>)
+    }
+    const removedRaw = localStorage.getItem(LS_REMOVED_BUILTINS)
+    if (removedRaw) {
+      applyRemovedBuiltinTags(JSON.parse(removedRaw) as string[])
+    }
   } catch {
     /* ignore */
   }
@@ -124,6 +173,7 @@ export function saveCustomCategoryTags(): void {
   try {
     if (typeof localStorage === 'undefined') return
     localStorage.setItem(LS_CUSTOM_CATEGORIES, JSON.stringify(getCustomCategoryTags()))
+    localStorage.setItem(LS_REMOVED_BUILTINS, JSON.stringify(getRemovedBuiltinTags()))
   } catch {
     /* ignore */
   }
@@ -131,9 +181,10 @@ export function saveCustomCategoryTags(): void {
 
 export function getCategoryGroupsWithCustom(): CategoryGroup[] {
   return CATEGORY_GROUPS.map((g) => {
+    const base = g.tags.filter((t) => !removedBuiltins.has(t))
     const extras = customByGroup[g.id]
-    if (!extras.length) return g
-    const tags = [...g.tags]
+    if (!extras.length) return { ...g, tags: base }
+    const tags = [...base]
     for (const t of extras) {
       if (!tags.includes(t)) tags.push(t)
     }
@@ -153,13 +204,19 @@ export function tryAddCustomCategoryTag(
   const name = sanitizeName(trimmed)
   if (!name || name === 'unnamed') return { ok: false, error: '标签名无效' }
   if (name.length > 32) return { ok: false, error: '标签名过长' }
+  // 若曾删除同名内置标签，再添加时先从「已删内置」移除，恢复为内置展示
+  if (removedBuiltins.has(name) && CATEGORY_GROUPS.some((g) => g.tags.includes(name))) {
+    removedBuiltins.delete(name)
+    rebuildKnownTagSet()
+    return { ok: true, name }
+  }
   if (knownTagSet.has(name)) return { ok: false, error: '该标签已存在' }
   customByGroup[groupId].push(name)
   rebuildKnownTagSet()
   return { ok: true, name }
 }
 
-/** 是否为内置预设标签（不可删除） */
+/** 是否为内置预设标签（原始列表，含已被用户隐藏的） */
 export function isBuiltinCategoryTag(name: string): boolean {
   const key = name.trim()
   if (!key) return false
@@ -176,17 +233,44 @@ export function findCustomCategoryGroup(name: string): ExtensibleGroupId | null 
   return null
 }
 
-export function tryRemoveCustomCategoryTag(
+/** 当前可见标签所在分组（内置或自定义） */
+export function findVisibleCategoryGroup(name: string): ExtensibleGroupId | null {
+  const key = name.trim()
+  if (!key) return null
+  for (const g of getCategoryGroupsWithCustom()) {
+    if (g.tags.includes(key)) return g.id
+  }
+  return null
+}
+
+/**
+ * 删除标签（内置或自定义均可）。
+ * 仅从标签列表移除；不改动已导出文件。
+ */
+export function tryRemoveCategoryTag(
   rawName: string
-): { ok: true; name: string; groupId: ExtensibleGroupId } | { ok: false; error: string } {
+):
+  | { ok: true; name: string; groupId: ExtensibleGroupId; source: 'custom' | 'builtin' }
+  | { ok: false; error: string } {
   const name = rawName.trim()
   if (!name) return { ok: false, error: '未选中标签' }
-  if (isBuiltinCategoryTag(name)) return { ok: false, error: '预设标签不可删除' }
-  const groupId = findCustomCategoryGroup(name)
-  if (!groupId) return { ok: false, error: '只能删除手动添加的标签' }
-  customByGroup[groupId] = customByGroup[groupId].filter((t) => t !== name)
-  rebuildKnownTagSet()
-  return { ok: true, name, groupId }
+
+  const customGroup = findCustomCategoryGroup(name)
+  if (customGroup) {
+    customByGroup[customGroup] = customByGroup[customGroup].filter((t) => t !== name)
+    rebuildKnownTagSet()
+    return { ok: true, name, groupId: customGroup, source: 'custom' }
+  }
+
+  const builtinGroup = CATEGORY_GROUPS.find((g) => g.tags.includes(name))
+  if (builtinGroup) {
+    if (removedBuiltins.has(name)) return { ok: false, error: '该标签已删除' }
+    removedBuiltins.add(name)
+    rebuildKnownTagSet()
+    return { ok: true, name, groupId: builtinGroup.id, source: 'builtin' }
+  }
+
+  return { ok: false, error: '未找到该标签' }
 }
 
 const CATEGORY_PALETTE = [

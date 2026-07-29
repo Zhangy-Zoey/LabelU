@@ -96,8 +96,9 @@ export async function scanPathsAsync(
       if (isMediaFile(p) && !p.includes('.labelu.tmp') && !p.endsWith('.labelu.bak')) {
         const abs = path.resolve(p)
         if (!allowClipExports && isClipExportArtifact(abs)) return
-        if (!seen.has(abs)) {
-          seen.add(abs)
+        const key = process.platform === 'win32' ? abs.toLowerCase() : abs
+        if (!seen.has(key)) {
+          seen.add(key)
           files.push(abs)
         }
       }

@@ -33,10 +33,20 @@ const api: LabeluApi = {
   logClientError: (payload) => ipcRenderer.invoke('log-client-error', payload),
   getStartupInfo: () => ipcRenderer.invoke('get-startup-info'),
   markWhatsNewSeen: (version) => ipcRenderer.invoke('mark-whats-new-seen', version),
-  openExceptionLog: () => ipcRenderer.invoke('open-exception-log'),
+  openOperationsLog: () => ipcRenderer.invoke('open-operations-log'),
+  opHistoryState: () => ipcRenderer.invoke('op-history-state'),
+  opHistoryPush: (payload) => ipcRenderer.invoke('op-history-push', payload),
+  opHistoryLog: (payload) => ipcRenderer.invoke('op-history-log', payload),
+  opHistoryUndo: () => ipcRenderer.invoke('op-history-undo'),
+  opHistoryRedo: () => ipcRenderer.invoke('op-history-redo'),
+  opHistoryRestoreUndo: (entry) => ipcRenderer.invoke('op-history-restore-undo', entry),
+  opHistoryRestoreRedo: (entry) => ipcRenderer.invoke('op-history-restore-redo', entry),
+  opHistoryPatch: (payload) => ipcRenderer.invoke('op-history-patch', payload),
+  opHistoryRemove: (id) => ipcRenderer.invoke('op-history-remove', id),
+  undoBatchClassifyMoves: (moves) => ipcRenderer.invoke('undo-batch-classify-moves', moves),
+  redoBatchClassifyMoves: (moves) => ipcRenderer.invoke('redo-batch-classify-moves', moves),
   batchClassify: (paths, category, opts) =>
     ipcRenderer.invoke('batch-classify', paths, category, opts),
-  undoBatchClassify: () => ipcRenderer.invoke('undo-batch-classify'),
   pickDirectory: (opts) => ipcRenderer.invoke('pick-directory', opts ?? {}),
   cancelBusyWork: () => ipcRenderer.invoke('cancel-busy-work'),
   downloadUpdate: () => ipcRenderer.invoke('download-update'),
@@ -89,6 +99,16 @@ const api: LabeluApi = {
     const listener = (): void => cb()
     ipcRenderer.on('about-auto-update', listener)
     return () => ipcRenderer.removeListener('about-auto-update', listener)
+  },
+  onAppUndo: (cb) => {
+    const listener = (): void => cb()
+    ipcRenderer.on('app-undo', listener)
+    return () => ipcRenderer.removeListener('app-undo', listener)
+  },
+  onAppRedo: (cb) => {
+    const listener = (): void => cb()
+    ipcRenderer.on('app-redo', listener)
+    return () => ipcRenderer.removeListener('app-redo', listener)
   }
 }
 

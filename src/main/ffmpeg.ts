@@ -662,8 +662,10 @@ export async function exportImageCrop(options: {
   return { message: needCrop ? '已裁切保存图片' : '已保存图片到类别目录' }
 }
 
-/** 生成并缓存缩略图，返回 media:// URL（缓存键含 mtime） */
-export async function generateThumbnail(videoPath: string): Promise<string> {
+/** 生成并缓存缩略图，返回 media:// URL 与源画面尺寸（缓存键含 mtime） */
+export async function generateThumbnail(
+  videoPath: string
+): Promise<{ url: string; width: number; height: number }> {
   const cacheDir = path.join(app.getPath('userData'), 'thumbnails')
   fs.mkdirSync(cacheDir, { recursive: true })
   let mtime = 0
@@ -672,12 +674,25 @@ export async function generateThumbnail(videoPath: string): Promise<string> {
   } catch {
     throw new Error('文件不存在')
   }
+  let width = 0
+  let height = 0
+  try {
+    const probe = await probeVideo(videoPath)
+    width = probe.width > 0 ? probe.width : 0
+    height = probe.height > 0 ? probe.height : 0
+  } catch {
+    /* 尺寸失败仍可出缩略图 */
+  }
+  const dims = (): { width: number; height: number } => ({
+    width: width > 0 ? width : 16,
+    height: height > 0 ? height : 10
+  })
   const cacheKey =
     process.platform === 'win32' ? path.resolve(videoPath).toLowerCase() : path.resolve(videoPath)
   const hash = crypto.createHash('md5').update(`${cacheKey}|${mtime}`).digest('hex')
   const out = path.join(cacheDir, `${hash}.jpg`)
   if (fs.existsSync(out) && fs.statSync(out).size > 100) {
-    return toMediaUrl(out)
+    return { url: toMediaUrl(out), ...dims() }
   }
 
   const { ffmpeg: bin } = ensureBins()
@@ -685,10 +700,16 @@ export async function generateThumbnail(videoPath: string): Promise<string> {
   const tmp = path.join(cacheDir, `${hash}.tmp.jpg`)
   const isImage = isImageMediaPath(videoPath)
   const scale = "scale='min(480,iw)':-2"
-  // macOS：Videotoolbox 硬解 HEVC 抽帧明显更快
+  // macOS：Videotoolbox；Windows：D3D11VA/DXVA2 硬解 HEVC 抽帧
   const hwaccel =
-    process.platform === 'darwin' && !isImage
+    !isImage && process.platform === 'darwin'
       ? (['-hwaccel', 'videotoolbox'] as string[])
+      : !isImage && process.platform === 'win32'
+        ? (['-hwaccel', 'd3d11va'] as string[])
+        : ([] as string[])
+  const hwaccelFallback =
+    !isImage && process.platform === 'win32'
+      ? (['-hwaccel', 'dxva2'] as string[])
       : ([] as string[])
   /** 多组参数：HEVC/损坏时间戳在 Win 上对 -ss 位置敏感 */
   const attemptArgs: string[][] = isImage
@@ -730,6 +751,28 @@ export async function generateThumbnail(videoPath: string): Promise<string> {
           'image2',
           tmp
         ],
+        ...(hwaccelFallback.length
+          ? [
+              [
+                '-y',
+                ...hwaccelFallback,
+                '-ss',
+                '0.5',
+                '-i',
+                videoPath,
+                '-frames:v',
+                '1',
+                '-an',
+                '-q:v',
+                '5',
+                '-vf',
+                scale,
+                '-f',
+                'image2',
+                tmp
+              ] as string[]
+            ]
+          : []),
         [
           '-y',
           '-ss',
@@ -770,7 +813,7 @@ export async function generateThumbnail(videoPath: string): Promise<string> {
             /* ignore */
           }
         }
-        return toMediaUrl(out)
+        return { url: toMediaUrl(out), ...dims() }
       }
       lastErr = result.stderr.slice(-400) || `code=${result.code}`
     } catch (err) {
@@ -862,15 +905,64 @@ async function buildPreviewProxy(
 
   const runProxy = async (
     withAudio: boolean,
-    mode: 'videotoolbox' | 'libx264'
+    mode:
+      | 'videotoolbox'
+      | 'd3d11va-x264'
+      | 'dxva2-x264'
+      | 'nvenc'
+      | 'amf'
+      | 'qsv'
+      | 'libx264'
   ): Promise<{ code: number; stderr: string }> => {
-    // 仅作预览：限制分辨率；macOS 优先 VideoToolbox 硬编，失败再软编
+    // 仅作预览：限制分辨率；优先硬解/硬编，失败再软编
+    const decodeArgs =
+      mode === 'videotoolbox'
+        ? (['-hwaccel', 'videotoolbox'] as string[])
+        : mode === 'd3d11va-x264'
+          ? (['-hwaccel', 'd3d11va'] as string[])
+          : mode === 'dxva2-x264'
+            ? (['-hwaccel', 'dxva2'] as string[])
+            : mode === 'nvenc'
+              ? (['-hwaccel', 'cuda'] as string[])
+              : mode === 'qsv'
+                ? (['-hwaccel', 'qsv'] as string[])
+                : ([] as string[])
+
+    const encodeArgs =
+      mode === 'videotoolbox'
+        ? (['-c:v', 'h264_videotoolbox', '-b:v', '2500k', '-allow_sw', '1', '-pix_fmt', 'yuv420p'] as string[])
+        : mode === 'nvenc'
+          ? ([
+              '-c:v',
+              'h264_nvenc',
+              '-preset',
+              'p4',
+              '-b:v',
+              '2500k',
+              '-pix_fmt',
+              'yuv420p'
+            ] as string[])
+          : mode === 'amf'
+            ? (['-c:v', 'h264_amf', '-quality', 'speed', '-b:v', '2500k', '-pix_fmt', 'yuv420p'] as string[])
+            : mode === 'qsv'
+              ? (['-c:v', 'h264_qsv', '-global_quality', '28', '-pix_fmt', 'nv12'] as string[])
+              : ([
+                  '-c:v',
+                  'libx264',
+                  '-preset',
+                  'ultrafast',
+                  '-crf',
+                  '28',
+                  '-pix_fmt',
+                  'yuv420p'
+                ] as string[])
+
     const args = [
       '-hide_banner',
       '-loglevel',
       'error',
       '-y',
-      ...(mode === 'videotoolbox' ? (['-hwaccel', 'videotoolbox'] as string[]) : []),
+      ...decodeArgs,
       '-i',
       abs,
       '-map',
@@ -878,18 +970,7 @@ async function buildPreviewProxy(
       ...(withAudio ? ['-map', '0:a?'] : ['-an']),
       '-vf',
       "scale='min(960,iw)':-2",
-      ...(mode === 'videotoolbox'
-        ? (['-c:v', 'h264_videotoolbox', '-b:v', '2500k', '-allow_sw', '1', '-pix_fmt', 'yuv420p'] as string[])
-        : ([
-            '-c:v',
-            'libx264',
-            '-preset',
-            'ultrafast',
-            '-crf',
-            '28',
-            '-pix_fmt',
-            'yuv420p'
-          ] as string[])),
+      ...encodeArgs,
       ...(withAudio ? ['-c:a', 'aac', '-b:a', '96k'] : []),
       '-movflags',
       '+faststart',
@@ -900,8 +981,22 @@ async function buildPreviewProxy(
     return run(bin, args, undefined, 1_800_000)
   }
 
-  const tryModes: Array<'videotoolbox' | 'libx264'> =
-    process.platform === 'darwin' ? ['videotoolbox', 'libx264'] : ['libx264']
+  type ProxyMode =
+    | 'videotoolbox'
+    | 'd3d11va-x264'
+    | 'dxva2-x264'
+    | 'nvenc'
+    | 'amf'
+    | 'qsv'
+    | 'libx264'
+
+  // Windows：先 D3D11/DXVA 硬解 + x264，再试各厂硬编，最后软编
+  const tryModes: ProxyMode[] =
+    process.platform === 'darwin'
+      ? ['videotoolbox', 'libx264']
+      : process.platform === 'win32'
+        ? ['d3d11va-x264', 'dxva2-x264', 'nvenc', 'amf', 'qsv', 'libx264']
+        : ['libx264']
 
   let code = 1
   let stderr = ''
