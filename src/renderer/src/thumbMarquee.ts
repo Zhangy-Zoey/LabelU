@@ -1,17 +1,13 @@
 /**
  * 缩略图虚拟列表拖选：按布局几何命中（含滚出视口项）。
- * 与 App 中 thumbVirtual 的分行高度布局保持一致。
+ * 与 App 中 thumbVirtual / CSS auto-fill 列计算保持一致。
  */
 
 export type ThumbMarqueeLayout = {
   cols: number
+  itemH: number
   gap: number
   pad: number
-  cellW: number
-  /** 每一行顶部 y（内容坐标） */
-  rowYs: number[]
-  /** 每一行高度（含行底 gap） */
-  rowHs: number[]
   /** 可见列表在全量 videos 中的下标 */
   visibleIndices: number[]
   videos: { id: string }[]
@@ -31,9 +27,9 @@ export function hitTestThumbMarquee(
   y1: number,
   opts?: { onlyInPool?: Set<string> }
 ): Set<string> {
-  const { cols, gap, pad, cellW, rowYs, rowHs, visibleIndices: indices, videos: list } = layout
+  const { cols, itemH, gap, pad, visibleIndices: indices, videos: list } = layout
   const hit = new Set<string>()
-  if (cols < 1 || indices.length === 0 || cellW <= 0) return hit
+  if (cols < 1 || indices.length === 0) return hit
 
   const gridRect = grid.getBoundingClientRect()
   const contentLeft = Math.min(x0, x1) - gridRect.left + grid.scrollLeft - pad
@@ -41,19 +37,18 @@ export function hitTestThumbMarquee(
   const contentTop = Math.min(y0, y1) - gridRect.top + grid.scrollTop - pad
   const contentBottom = Math.max(y0, y1) - gridRect.top + grid.scrollTop - pad
 
+  const contentW = Math.max(1, grid.clientWidth - pad * 2)
+  const cellW = Math.max(1, (contentW - gap * Math.max(0, cols - 1)) / cols)
   const strideX = cellW + gap
   const pool = opts?.onlyInPool
 
   for (let i = 0; i < indices.length; i++) {
     const row = Math.floor(i / cols)
     const col = i % cols
-    const rowY = rowYs[row]
-    const rowH = rowHs[row]
-    if (rowY == null || rowH == null) continue
     const cellL = col * strideX
-    const cellT = rowY
+    const cellT = row * itemH
     const cellR = cellL + cellW
-    const cellB = cellT + rowH - gap
+    const cellB = cellT + itemH - gap
     const overlaps =
       cellL < contentRight &&
       cellR > contentLeft &&

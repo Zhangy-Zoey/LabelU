@@ -160,7 +160,7 @@ export function saveSession(state: SessionState): void {
   ensureSessionDir()
   state.updatedAt = new Date().toISOString()
   fs.writeFileSync(sessionFileFor(state.sourcePath), JSON.stringify(state, null, 2), 'utf8')
-  // 同步持久化导出索引，完成清会话后仍可回看（含 customRoot）
+  // 同步持久化导出索引，完成清会话后仍可回看（含源树外的自选根目录）
   saveExportCatalog(state.sourcePath, state.exports || [])
 }
 
@@ -318,7 +318,7 @@ async function loadSidecarSession(sourcePath: string): Promise<SessionState | nu
     })
   }
 
-  // 导出目录索引（含源树外的 customRoot 落点）
+  // 导出目录索引（含源树外的自选根目录落点）
   for (const e of loadExportCatalog(sourcePath)) {
     const key = path.resolve(e.path)
     if (byPath.has(key)) continue
@@ -649,7 +649,7 @@ export function listCategoryExportFiles(sourcePath: string): string[] {
     }
   }
 
-  // customRoot 等落在源树外的导出：完成清会话后仍靠索引回看
+  // 自选根目录等落在源树外的导出：完成清会话后仍靠索引回看
   for (const e of loadExportCatalog(sourcePath)) {
     add(e.path)
   }
@@ -843,21 +843,16 @@ export async function classifyWholeFileAsync(
   if (!fs.existsSync(sourcePath)) throw new Error('文件不存在')
 
   const categoryDir = resolveClassifyDestDir(sourcePath, cat, opts)
-  const mode = opts?.reclassifyMode ?? 'originalRoot'
-  const customFinal = mode === 'custom'
-
-  if (!customFinal) {
-    const root = path.dirname(categoryDir)
-    const resolvedRoot = path.resolve(root)
-    const resolvedCat = path.resolve(categoryDir)
-    const catOk =
-      process.platform === 'win32'
-        ? resolvedCat.toLowerCase() === resolvedRoot.toLowerCase() ||
-          resolvedCat.toLowerCase().startsWith(resolvedRoot.toLowerCase() + path.sep)
-        : resolvedCat === resolvedRoot || resolvedCat.startsWith(resolvedRoot + path.sep)
-    if (!catOk) {
-      throw new Error('类别名无效')
-    }
+  const root = path.dirname(categoryDir)
+  const resolvedRoot = path.resolve(root)
+  const resolvedCat = path.resolve(categoryDir)
+  const catOk =
+    process.platform === 'win32'
+      ? resolvedCat.toLowerCase() === resolvedRoot.toLowerCase() ||
+        resolvedCat.toLowerCase().startsWith(resolvedRoot.toLowerCase() + path.sep)
+      : resolvedCat === resolvedRoot || resolvedCat.startsWith(resolvedRoot + path.sep)
+  if (!catOk) {
+    throw new Error('类别名无效')
   }
 
   fs.mkdirSync(categoryDir, { recursive: true })

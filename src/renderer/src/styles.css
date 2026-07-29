@@ -519,15 +519,16 @@ body.resizing-panes * {
   background: #3a3632;
   border-radius: 8px 8px 0 0;
   overflow: hidden;
-  flex-shrink: 0;
 }
 
 .thumb-media img {
   width: 100%;
   height: 100%;
+  /* contain：竖图/方图完整可见；cover 会裁掉上下或左右 */
   object-fit: contain;
   display: block;
   pointer-events: none;
+  background: #1a1816;
 }
 
 .thumb-preview-video {
@@ -1821,15 +1822,6 @@ body.dragging-sel-handle * {
   padding: 18px 20px 14px;
 }
 
-.modal.modal-reclassify {
-  width: min(520px, calc(100vw - 32px));
-  max-height: min(88vh, 720px);
-  display: flex;
-  flex-direction: column;
-  overflow: auto;
-  padding: 18px 20px 14px;
-}
-
 .modal h2 {
   margin: 0 0 8px;
   font-family: var(--font-display);
@@ -1952,14 +1944,14 @@ body.dragging-sel-handle * {
   white-space: nowrap;
 }
 
-.modal > label:not(.checkbox-row):not(.radio-row) {
+.modal > label:not(.checkbox-row) {
   display: block;
   margin-bottom: 6px;
   font-size: 12px;
   color: #000;
 }
 
-.modal.modal-save > label:not(.checkbox-row):not(.radio-row) {
+.modal.modal-save > label:not(.checkbox-row) {
   flex: 0 0 auto;
 }
 
@@ -2290,60 +2282,6 @@ body.dragging-sel-handle * {
   padding: 0;
   flex-shrink: 0;
   accent-color: var(--accent);
-}
-
-.radio-stack {
-  display: flex;
-  flex-direction: column;
-  gap: 10px;
-  margin: 4px 0 14px;
-  width: 100%;
-  min-width: 0;
-  flex: 0 0 auto;
-}
-
-.radio-row {
-  display: flex;
-  flex-direction: row;
-  align-items: flex-start;
-  gap: 10px;
-  box-sizing: border-box;
-  width: 100%;
-  min-width: 0;
-  margin: 0;
-  padding: 10px 12px;
-  border: 1px solid var(--border);
-  border-radius: 10px;
-  cursor: pointer;
-  color: #000;
-  font-size: 13px;
-  line-height: 1.45;
-  background: rgba(255, 255, 255, 0.45);
-}
-
-.radio-row input[type='radio'] {
-  width: 16px;
-  height: 16px;
-  margin: 3px 0 0;
-  padding: 0;
-  flex: 0 0 auto;
-  accent-color: var(--accent);
-}
-
-.radio-row > span {
-  flex: 1 1 auto;
-  min-width: 0;
-  writing-mode: horizontal-tb;
-  word-break: break-word;
-  overflow-wrap: anywhere;
-}
-
-.radio-row .muted {
-  display: block;
-  margin-top: 4px;
-  opacity: 0.65;
-  font-size: 12px;
-  line-height: 1.4;
 }
 
 .whats-new-list {

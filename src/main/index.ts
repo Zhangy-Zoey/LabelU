@@ -1237,13 +1237,9 @@ function setupIpc(): void {
       const ext = preferredImageExportExt(req.sourcePath)
       // 图片用固定虚拟时段写入文件名，便于与视频导出命名一致；剩余区间保持全幅以支持多次裁切
       const range = { start: 0, end: duration }
-      const classifyOpts =
-        req.reclassifyMode || req.customDestDir
-          ? {
-              reclassifyMode: req.reclassifyMode,
-              customDestDir: req.customDestDir
-            }
-          : undefined
+      const classifyOpts = req.customDestDir
+        ? { customDestDir: req.customDestDir }
+        : undefined
       outputPath = await nextExportPath(
         req.sourcePath,
         req.category,
@@ -1340,13 +1336,9 @@ function setupIpc(): void {
 
       const cropForName =
         req.cropActive && req.crop && isMeaningfulCrop(req.crop) ? req.crop : null
-      const classifyOpts =
-        req.reclassifyMode || req.customDestDir
-          ? {
-              reclassifyMode: req.reclassifyMode,
-              customDestDir: req.customDestDir
-            }
-          : undefined
+      const classifyOpts = req.customDestDir
+        ? { customDestDir: req.customDestDir }
+        : undefined
       outputPath = await nextExportPath(
         req.sourcePath,
         req.category,
@@ -1799,11 +1791,8 @@ function setupIpc(): void {
       if (!cat) throw new Error('请输入类别')
       if (!Array.isArray(paths) || paths.length === 0) throw new Error('未选择视频')
       for (const p of paths) assertAllowedPath(p, '视频')
-      const classifyOpts: ClassifyDestOptions | undefined = opts
-        ? {
-            reclassifyMode: opts.reclassifyMode,
-            customDestDir: opts.customDestDir ? String(opts.customDestDir) : undefined
-          }
+      const classifyOpts: ClassifyDestOptions | undefined = opts?.customDestDir
+        ? { customDestDir: String(opts.customDestDir) }
         : undefined
       if (classifyOpts?.customDestDir) {
         rememberAllowedPath(classifyOpts.customDestDir)

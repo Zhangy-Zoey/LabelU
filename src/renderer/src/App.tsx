@@ -405,8 +405,51 @@ type SessionModalSkipKey =
   | 'recover'
   | 'update'
   | 'importChoice'
-  | 'save'
-  | 'batch'
+
+/** 无画面裁切、无时间裁剪、且无已导出片段时：应移动原文件而非复制/重编码 */
+function isWholeFileClassifySave(opts: {
+  isImage: boolean
+  start: number
+  end: number
+  duration: number
+  cropActive: boolean
+  crop: CropRect
+  exportCount: number
+  stepFps: number
+}): boolean {
+  if (opts.exportCount > 0) return false
+  if (opts.cropActive && isMeaningfulCrop(opts.crop)) return false
+  if (opts.isImage) return true
+  const dur = opts.duration
+  if (!(dur > 0)) return false
+  const tol = Math.max(0.05, selectionTolerance(opts.stepFps))
+  return opts.start <= tol && opts.end >= dur - tol
+}
+
+/** 导出件路径为 根目录/类别名/文件 → 取分类根目录 */
+function classifyRootFromExportPath(exportPath: string): string {
+  const p = String(exportPath || '').trim()
+  if (!p) return ''
+  return mediaDirname(mediaDirname(p)).trim()
+}
+
+/** 撤销/复原再导出时解析分类根：历史 dest → 导出路径反推 → 会话记忆 → 默认 */
+function resolveClassifyDestForReexport(
+  dest: ClassifyDestApiOpts | undefined,
+  exportPathHint: string,
+  sourcePath: string,
+  sessionRoot?: string | null
+): ClassifyDestApiOpts {
+  const root = (
+    dest?.customDestDir?.trim() ||
+    classifyRootFromExportPath(exportPathHint) ||
+    String(sessionRoot || '').trim() ||
+    loadPersistedSaveRoot() ||
+    defaultSaveRootDir(sourcePath)
+  ).trim()
+  if (!root) throw new Error('请选择分类根目录')
+  return { customDestDir: root }
+}
 
 
 type PendingSaveClip = {
@@ -621,9 +664,7 @@ export default function App(): React.JSX.Element {
     confirm: false,
     recover: false,
     update: false,
-    importChoice: false,
-    save: false,
-    batch: false
+    importChoice: false
   })
   /** 当前打开弹窗上「不再询问」勾选草稿 */
   const [modalDontAskDraft, setModalDontAskDraft] = useState<
@@ -664,36 +705,6 @@ export default function App(): React.JSX.Element {
   const [thumbSize, setThumbSize] = useState(() =>
     loadStoredNumber(LS_THUMB, THUMB_SIZE_DEFAULT, THUMB_SIZE_MIN, THUMB_SIZE_MAX)
   )
-  /** 缩略图宽高比（宽/高），按路径缓存；竖图 < 1，横图 > 1 */
-  const [thumbAspectByPath, setThumbAspectByPath] = useState<Record<string, number>>({})
-  const rememberThumbAspect = useCallback((filePath: string, width: number, height: number) => {
-    if (!(width > 0) || !(height > 0)) return
-    const key = normMediaPath(filePath)
-    const ar = width / height
-    if (!(ar > 0.05) || !(ar < 40)) return
-    setThumbAspectByPath((prev) => {
-      const old = prev[key]
-      if (old != null && Math.abs(old - ar) < 0.002) return prev
-      return { ...prev, [key]: ar }
-    })
-  }, [])
-  /** finish/_done 改名后迁移缩略图比例缓存，避免短暂回落到 16:10 */
-  const migrateThumbAspectKey = useCallback((fromPath: string, toPath: string) => {
-    const from = normMediaPath(fromPath)
-    const to = normMediaPath(toPath)
-    if (!from || !to || from === to) return
-    setThumbAspectByPath((prev) => {
-      if (!(from in prev)) return prev
-      if (prev[to] === prev[from]) {
-        const next = { ...prev }
-        delete next[from]
-        return next
-      }
-      const next = { ...prev, [to]: prev[from] }
-      delete next[from]
-      return next
-    })
-  }, [])
   const [sidebarWidth, setSidebarWidth] = useState(() =>
     loadStoredNumber(LS_SIDEBAR, SIDEBAR_WIDTH_DEFAULT, 0, 4000)
   )
@@ -710,9 +721,6 @@ export default function App(): React.JSX.Element {
   /** 最近一次批量移动的列表项，供 UI 一次撤回 */
   const [batchResultModal, setBatchResultModal] = useState<BatchResultModal | null>(null)
   const lastClassifyOptsRef = useRef<ClassifyDestApiOpts | undefined>(undefined)
-  /** 勾选「不再询问」后，下次保存/批量直接沿用的类别 */
-  const lastSaveCategoryRef = useRef('')
-  const lastBatchCategoryRef = useRef('')
   /** 更新说明弹窗关闭后再展示「恢复未完成会话」 */
   const pendingRecoverSessionsRef = useRef<SessionState[] | null>(null)
   /** 更新重启后的工作区快照；whatsNew 关闭后再恢复 */
@@ -1797,100 +1805,39 @@ export default function App(): React.JSX.Element {
 
   const thumbVirtual = useMemo(() => {
     const gap = 10
-    // name 两行 + meta + padding，略留余量（含选中加粗边框）
-    const caption = 52
+    const caption = 44
     const pad = 12
+    const itemH = thumbSize + caption + gap
     // 对齐 .thumb-virtual-window 的 repeat(auto-fill, minmax(thumbSize, 1fr))
     const cols = Math.max(1, Math.floor((thumbContentW + gap) / (thumbSize + gap)))
-    const cellW = Math.max(thumbSize, (thumbContentW - gap * (cols - 1)) / cols)
     const indices = visibleIndices
-    const defaultAr = 16 / 10
-    const mediaHFor = (videoIndex: number): number => {
-      const v = videos[videoIndex]
-      const ar =
-        (v && thumbAspectByPath[normMediaPath(v.path)]) || defaultAr
-      const safe = ar > 0.05 && ar < 40 ? ar : defaultAr
-      return cellW / safe
-    }
-    const rows = Math.ceil(indices.length / cols) || 0
-    const rowYs: number[] = []
-    const rowHs: number[] = []
-    let y = 0
-    for (let r = 0; r < rows; r++) {
-      let maxMediaH = 0
-      for (let c = 0; c < cols; c++) {
-        const li = r * cols + c
-        if (li >= indices.length) break
-        maxMediaH = Math.max(maxMediaH, mediaHFor(indices[li]))
-      }
-      if (!(maxMediaH > 0)) maxMediaH = cellW / defaultAr
-      const rowH = maxMediaH + caption + gap
-      rowYs.push(y)
-      rowHs.push(rowH)
-      y += rowH
-    }
-    const totalH = Math.max(cellW / defaultAr + caption + gap, y)
-    let startRow = 0
-    while (startRow < rows - 1 && rowYs[startRow] + rowHs[startRow] < thumbScrollTop) {
-      startRow++
-    }
-    startRow = Math.max(0, startRow - 1)
-    let endRow = startRow
-    while (endRow < rows && rowYs[endRow] < thumbScrollTop + thumbViewportH) {
-      endRow++
-    }
-    endRow = Math.min(rows, endRow + 1)
+    const rows = Math.ceil(indices.length / cols)
+    const totalH = Math.max(itemH, rows * itemH)
+    const startRow = Math.max(0, Math.floor(thumbScrollTop / itemH) - 1)
+    const endRow = Math.min(rows, Math.ceil((thumbScrollTop + thumbViewportH) / itemH) + 1)
     const start = startRow * cols
     const end = Math.min(indices.length, endRow * cols)
     const slice = indices.slice(start, end).map((videoIndex, local) => ({
       videoIndex,
       offset: start + local
     }))
-    const offsetY = rowYs[startRow] ?? 0
-    // 兼容旧拖选字段：单行等高时的近似行高
-    const itemH = rowHs[0] ?? cellW / defaultAr + caption + gap
-    return {
-      cols,
-      itemH,
-      totalH,
-      start,
-      slice,
-      gap,
-      pad,
-      caption,
-      cellW,
-      offsetY,
-      rowYs,
-      rowHs
-    }
-  }, [
-    visibleIndices,
-    videos,
-    thumbSize,
-    thumbContentW,
-    thumbScrollTop,
-    thumbViewportH,
-    thumbAspectByPath
-  ])
+    return { cols, itemH, totalH, start, slice, gap, pad, caption }
+  }, [visibleIndices, thumbSize, thumbContentW, thumbScrollTop, thumbViewportH])
 
   /** 拖选命中用：含滚出视口项的布局参数 */
   const thumbLayoutRef = useRef({
     cols: 1,
+    itemH: 180,
     gap: 10,
     pad: 12,
-    cellW: 128,
-    rowYs: [] as number[],
-    rowHs: [] as number[],
     visibleIndices: [] as number[],
     videos: [] as VideoItem[]
   })
   thumbLayoutRef.current = {
     cols: thumbVirtual.cols,
+    itemH: thumbVirtual.itemH,
     gap: thumbVirtual.gap,
     pad: thumbVirtual.pad,
-    cellW: thumbVirtual.cellW,
-    rowYs: thumbVirtual.rowYs,
-    rowHs: thumbVirtual.rowHs,
     visibleIndices,
     videos
   }
@@ -2728,7 +2675,6 @@ export default function App(): React.JSX.Element {
     async (paths: string[], category: string, opts?: ClassifyDestApiOpts) => {
       if (busy || paths.length === 0) return
       const destOpts: ClassifyDestApiOpts = {
-        reclassifyMode: 'customRoot',
         customDestDir: (
           opts?.customDestDir ||
           sessionCustomSaveRootRef.current ||
@@ -2900,13 +2846,11 @@ export default function App(): React.JSX.Element {
       showToast('请选择分类根目录')
       return
     }
-    lastBatchCategoryRef.current = category
-    commitModalDontAsk('batch')
     setBatchModal(false)
     await runBatchClassify(
       batchTargetVideos.map((v) => v.path),
       category,
-      { reclassifyMode: 'customRoot', customDestDir: root }
+      { customDestDir: root }
     )
   }, [
     batchCategory,
@@ -2914,8 +2858,7 @@ export default function App(): React.JSX.Element {
     busy,
     batchTargetVideos,
     showToast,
-    runBatchClassify,
-    commitModalDontAsk
+    runBatchClassify
   ])
 
   const openBatchModal = useCallback(async () => {
@@ -2929,38 +2872,14 @@ export default function App(): React.JSX.Element {
       return
     }
     const first = batchTargetVideos[0]
-    const category =
-      (lastBatchCategoryRef.current || defaultCategoryFromDir(first.parentDirName)).trim()
+    setBatchCategory(defaultCategoryFromDir(first.parentDirName))
     const root =
       sessionCustomSaveRootRef.current?.trim() ||
       loadPersistedSaveRoot() ||
       defaultSaveRootDir(first.path)
-    setBatchCategory(category)
     setBatchDestRoot(root)
-    if (sessionModalSkipRef.current.batch) {
-      if (!category) {
-        showToast('请先设置类别')
-        resetModalDontAsk('batch')
-        setBatchModal(true)
-        return
-      }
-      if (!root) {
-        showToast('请选择分类根目录')
-        resetModalDontAsk('batch')
-        setBatchModal(true)
-        return
-      }
-      lastBatchCategoryRef.current = category
-      await runBatchClassify(
-        batchTargetVideos.map((v) => v.path),
-        category,
-        { reclassifyMode: 'customRoot', customDestDir: root }
-      )
-      return
-    }
-    resetModalDontAsk('batch')
     setBatchModal(true)
-  }, [batchTargetVideos, secondarySelectMode, showToast, resetModalDontAsk, runBatchClassify])
+  }, [batchTargetVideos, secondarySelectMode, showToast])
 
   const runSaveClipExport = useCallback(
     async (payload: PendingSaveClip, opts?: ClassifyDestApiOpts): Promise<void> => {
@@ -2972,22 +2891,149 @@ export default function App(): React.JSX.Element {
       const { category, isImage, saveModal: modal, sourcePath, duration: mediaDuration } = payload
       ignoreEnterOpenUntilRef.current = performance.now() + 600
       setSaveModal(null)
-      setStatus(isImage ? '正在保存图片…' : '正在导出片段…')
       const remBefore = remainingRef.current.map((r) => ({ ...r }))
+      const exportCount = clipExports.filter((e) => !e.approx).length
+      const moveOriginal = isWholeFileClassifySave({
+        isImage,
+        start: modal.start,
+        end: modal.end,
+        duration: mediaDuration,
+        cropActive: modal.cropActive,
+        crop: modal.crop,
+        exportCount,
+        stepFps
+      })
+
       try {
-        const classifyFields = opts
-          ? {
-              reclassifyMode: opts.reclassifyMode,
-              customDestDir: opts.customDestDir
+        /** 无裁切/裁剪：移动原文件到类别目录（与批量分类一致） */
+        if (moveOriginal) {
+          setStatus('正在移动原文件…')
+          await releaseMediaForPaths([sourcePath])
+          const destOpts: ClassifyDestApiOpts = {
+            customDestDir: (
+              opts?.customDestDir ||
+              sessionCustomSaveRootRef.current ||
+              loadPersistedSaveRoot() ||
+              defaultSaveRootDir(sourcePath)
+            ).trim()
+          }
+          if (!destOpts.customDestDir) {
+            showToast('请选择分类根目录')
+            return
+          }
+          persistSaveRoot(destOpts.customDestDir)
+          sessionCustomSaveRootRef.current = destOpts.customDestDir
+          lastClassifyOptsRef.current = destOpts
+
+          const snap =
+            videos.find((v) => sameMediaIdentity(v.path, sourcePath)) ||
+            videos[index] ||
+            null
+          const { results, moves } = await window.api.batchClassify(
+            [sourcePath],
+            category,
+            destOpts
+          )
+          const r = results[0]
+          if (!r?.ok) {
+            throw new Error(r?.error || '移动失败')
+          }
+          const moveList =
+            moves?.length
+              ? moves
+              : r.exportPath
+                ? [{ originalPath: sourcePath, newPath: r.exportPath }]
+                : []
+          const itemsForHistory: VideoItem[] = moveList.map((m) => {
+            const kind: 'image' | 'video' =
+              snap?.mediaKind === 'image' || isImagePath(m.originalPath) ? 'image' : 'video'
+            return {
+              id: snap?.id || m.originalPath,
+              path: m.originalPath,
+              name: fileNameOf(m.originalPath),
+              completed: false,
+              mediaKind: kind,
+              parentDirName:
+                snap?.parentDirName || mediaBasename(mediaDirname(m.originalPath)) || '',
+              dirPath: snap?.dirPath || mediaDirname(m.originalPath),
+              isCategoryCopy: snap?.isCategoryCopy
             }
-          : {}
+          })
+          if (moveList.length > 0) {
+            void pushOpHistory({
+              kind: 'batchClassify',
+              label: isImage ? `整图分类→${category}` : `整段分类→${category}`,
+              undo: { moves: moveList, items: itemsForHistory, category, dest: destOpts },
+              redo: { moves: moveList, items: itemsForHistory, category, dest: destOpts },
+              detail: {
+                category,
+                dest: destOpts,
+                moves: moveList,
+                results,
+                via: 'save-whole-file'
+              }
+            }).then(() => refreshHistoryState())
+          }
+
+          const movedKey = normMediaPath(sourcePath)
+          const nextList = videos.filter((v) => normMediaPath(v.path) !== movedKey)
+          setVideos(nextList)
+          setSelectedIds(new Set())
+          setSecondaryIds(new Set())
+          setSecondarySelectMode(false)
+          selectAnchorRef.current = null
+          setThumbPreviewIds((prev) => {
+            if (!snap || !prev.has(snap.id)) return prev
+            const next = new Set(prev)
+            next.delete(snap.id)
+            return next
+          })
+          dirtyRef.current = false
+          setClipExports([])
+          setRemaining([])
+          syncRemainingHint(sourcePath, 0)
+          clearTimelineFocus()
+          showToast(
+            r.exportPath
+              ? `已移动原文件到：${r.exportPath}`
+              : '已分类（文件已在目标目录）'
+          )
+          setStatus('分类完成')
+
+          if (nextList.length === 0) {
+            setIndex(0)
+            setMediaUrl('')
+            setStatus('列表已空')
+          } else {
+            const nextIdx = Math.min(index, nextList.length - 1)
+            await loadVideoAt(nextIdx, nextList)
+          }
+          return
+        }
+
+        setStatus(isImage ? '正在保存图片…' : '正在导出片段…')
+        const exportDest: ClassifyDestApiOpts = {
+          customDestDir: (
+            opts?.customDestDir ||
+            sessionCustomSaveRootRef.current ||
+            loadPersistedSaveRoot() ||
+            defaultSaveRootDir(sourcePath)
+          ).trim()
+        }
+        if (!exportDest.customDestDir) {
+          showToast('请选择分类根目录')
+          return
+        }
+        persistSaveRoot(exportDest.customDestDir)
+        sessionCustomSaveRootRef.current = exportDest.customDestDir
+        lastClassifyOptsRef.current = exportDest
         const result = isImage
           ? await window.api.exportImage({
               sourcePath,
               category,
               crop: modal.crop,
               cropActive: modal.cropActive,
-              ...classifyFields
+              ...exportDest
             })
           : await window.api.exportClip({
               sourcePath,
@@ -2997,7 +3043,7 @@ export default function App(): React.JSX.Element {
               crop: modal.crop,
               cropActive: modal.cropActive,
               duration: mediaDuration,
-              ...classifyFields
+              ...exportDest
             })
         const session = result.session
         const precise = session.exports.filter((e) => !e.approx)
@@ -3031,7 +3077,7 @@ export default function App(): React.JSX.Element {
             crop: modal.crop,
             cropActive: modal.cropActive,
             duration: mediaDuration,
-            dest: opts,
+            dest: exportDest,
             remainingBefore: remBefore,
             remainingAfter: rem
           },
@@ -3046,7 +3092,7 @@ export default function App(): React.JSX.Element {
             crop: modal.crop,
             cropActive: modal.cropActive,
             duration: mediaDuration,
-            dest: opts,
+            dest: exportDest,
             remainingBefore: remBefore,
             remainingAfter: rem
           },
@@ -3058,7 +3104,7 @@ export default function App(): React.JSX.Element {
             cropActive: modal.cropActive,
             start: modal.start,
             end: modal.end,
-            dest: opts,
+            dest: exportDest,
             ui: snapshotUi({
               sourcePath,
               selStart: selStartRef.current,
@@ -3098,7 +3144,19 @@ export default function App(): React.JSX.Element {
         savingRef.current = false
       }
     },
-    [busy, showToast, syncRemainingHint, clearTimelineFocus, refreshHistoryState]
+    [
+      busy,
+      showToast,
+      syncRemainingHint,
+      clearTimelineFocus,
+      refreshHistoryState,
+      clipExports,
+      stepFps,
+      releaseMediaForPaths,
+      videos,
+      index,
+      loadVideoAt
+    ]
   )
 
 
@@ -3114,7 +3172,6 @@ export default function App(): React.JSX.Element {
 
         const currentPath = videos[index]?.path
         const destOpts: ClassifyDestApiOpts = lastClassifyOptsRef.current || {
-          reclassifyMode: 'customRoot',
           customDestDir:
             sessionCustomSaveRootRef.current?.trim() ||
             loadPersistedSaveRoot() ||
@@ -3359,7 +3416,6 @@ export default function App(): React.JSX.Element {
           )
         )
         if (newPath !== oldPath) {
-          migrateThumbAspectKey(oldPath, newPath)
           const oldSec = remainingByPathRef.current.get(oldPath)
           remainingByPathRef.current.delete(oldPath)
           if (oldSec !== undefined) remainingByPathRef.current.set(newPath, oldSec)
@@ -3408,8 +3464,7 @@ export default function App(): React.JSX.Element {
       showToast,
       syncRemainingHint,
       releaseMediaForPaths,
-      reloadPlayableMedia,
-      migrateThumbAspectKey
+      reloadPlayableMedia
     ]
   )
 
@@ -3442,7 +3497,6 @@ export default function App(): React.JSX.Element {
           )
         )
         if (newPath !== oldPath) {
-          migrateThumbAspectKey(oldPath, newPath)
           const oldSec = remainingByPathRef.current.get(oldPath)
           remainingByPathRef.current.delete(oldPath)
           if (oldSec !== undefined) remainingByPathRef.current.set(newPath, oldSec)
@@ -3480,7 +3534,7 @@ export default function App(): React.JSX.Element {
     })
     clearCompletedInflightRef.current = p
     return p
-  }, [current, releaseMediaForPaths, reloadPlayableMedia, migrateThumbAspectKey])
+  }, [current, releaseMediaForPaths, reloadPlayableMedia])
 
   const dismissWhatsNew = useCallback(() => {
     const modal = whatsNewModal
@@ -4270,9 +4324,7 @@ export default function App(): React.JSX.Element {
         setSelEnd(end)
       }
     }
-    const initialCat = (
-      lastSaveCategoryRef.current || defaultCategoryFromDir(current.parentDirName)
-    ).trim()
+    const initialCat = defaultCategoryFromDir(current.parentDirName)
     setCategoryInput(initialCat)
     const root =
       sessionCustomSaveRootRef.current?.trim() ||
@@ -4286,44 +4338,13 @@ export default function App(): React.JSX.Element {
     }
     setSavePreviewLocal(0)
     const cropOn = cropActive && cropCommitted && isMeaningfulCrop(crop)
-    const modal: SaveModal = {
+    setSaveModal({
       start,
       end,
       crop: cropOn ? crop : FULL_CROP,
       cropActive: cropOn,
       previewUrl: mediaUrl
-    }
-    if (sessionModalSkipRef.current.save) {
-      if (!initialCat) {
-        showToast('请先设置类别')
-        resetModalDontAsk('save')
-        setSaveModal(modal)
-        return
-      }
-      if (!root) {
-        showToast('请填写或选择保存路径')
-        resetModalDontAsk('save')
-        setSaveModal(modal)
-        return
-      }
-      lastSaveCategoryRef.current = initialCat
-      const isImage = current.mediaKind === 'image' || isImagePath(current.path)
-      await runSaveClipExport(
-        {
-          category: initialCat,
-          isImage,
-          saveModal: modal,
-          sourcePath: current.path,
-          duration
-        },
-        { reclassifyMode: 'customRoot', customDestDir: root }
-      )
-      persistSaveRoot(root)
-      sessionCustomSaveRootRef.current = root
-      return
-    }
-    resetModalDontAsk('save')
-    setSaveModal(modal)
+    })
   }, [
     current,
     busy,
@@ -4340,9 +4361,7 @@ export default function App(): React.JSX.Element {
     stepFps,
     showToast,
     clearCompletedMark,
-    openConfirmModal,
-    resetModalDontAsk,
-    runSaveClipExport
+    openConfirmModal
   ])
 
   /** 保存弹窗预览：必须先落到选区起点再播，不能 autoPlay 从片头开跑 */
@@ -4438,8 +4457,6 @@ export default function App(): React.JSX.Element {
     }
     if (categoryOverride) setCategoryInput(category)
     setSaveDestRoot(root)
-    lastSaveCategoryRef.current = category
-    commitModalDontAsk('save')
     const isImage = current.mediaKind === 'image' || isImagePath(current.path)
     const pending: PendingSaveClip = {
       category,
@@ -4449,7 +4466,6 @@ export default function App(): React.JSX.Element {
       duration
     }
     await runSaveClipExport(pending, {
-      reclassifyMode: 'customRoot',
       customDestDir: root
     })
     persistSaveRoot(root)
@@ -4614,7 +4630,12 @@ export default function App(): React.JSX.Element {
           const category = String(payload.category || '')
           const crop = (payload.crop as CropRect | null) ?? null
           const cropActive = Boolean(payload.cropActive)
-          const dest = payload.dest as ClassifyDestApiOpts | undefined
+          const dest = resolveClassifyDestForReexport(
+            payload.dest as ClassifyDestApiOpts | undefined,
+            String(payload.exportPath || ''),
+            pathForExport,
+            sessionCustomSaveRootRef.current
+          )
           await releaseMediaForPaths([pathForExport])
           let outputPath = ''
           if (mediaKind === 'image') {
@@ -4623,7 +4644,7 @@ export default function App(): React.JSX.Element {
               category,
               crop,
               cropActive,
-              ...(dest || {})
+              ...dest
             })
             outputPath = result.outputPath
             applySessionIfCurrent(result.session)
@@ -4637,7 +4658,7 @@ export default function App(): React.JSX.Element {
               crop,
               cropActive,
               duration: Number(payload.duration) || 0,
-              ...(dest || {})
+              ...dest
             })
             outputPath = result.outputPath
             applySessionIfCurrent(result.session)
@@ -4700,7 +4721,12 @@ export default function App(): React.JSX.Element {
           const category = String(payload.category || '')
           const crop = (payload.crop as CropRect | null) ?? null
           const cropActive = Boolean(payload.cropActive)
-          const dest = payload.dest as ClassifyDestApiOpts | undefined
+          const dest = resolveClassifyDestForReexport(
+            payload.dest as ClassifyDestApiOpts | undefined,
+            String(payload.exportPath || ''),
+            pathForExport,
+            sessionCustomSaveRootRef.current
+          )
           await releaseMediaForPaths([pathForExport])
           let outputPath = ''
           if (mediaKind === 'image') {
@@ -4709,7 +4735,7 @@ export default function App(): React.JSX.Element {
               category,
               crop,
               cropActive,
-              ...(dest || {})
+              ...dest
             })
             outputPath = result.outputPath
             applySessionIfCurrent(result.session)
@@ -4723,7 +4749,7 @@ export default function App(): React.JSX.Element {
               crop,
               cropActive,
               duration: Number(payload.duration) || 0,
-              ...(dest || {})
+              ...dest
             })
             outputPath = result.outputPath
             applySessionIfCurrent(result.session)
@@ -4733,7 +4759,8 @@ export default function App(): React.JSX.Element {
             undo: {
               ...(typeof entry.undo === 'object' && entry.undo ? entry.undo : {}),
               sourcePath: pathForExport,
-              exportPath: outputPath
+              exportPath: outputPath,
+              dest
             }
           })
           showToast('已复原保存')
@@ -5048,7 +5075,13 @@ export default function App(): React.JSX.Element {
       const isImage = current.mediaKind === 'image' || isImagePath(current.path)
       const crop = exp.crop ?? null
       const cropActive = Boolean(crop && isMeaningfulCrop(crop))
-      const dest: ClassifyDestApiOpts | undefined = lastClassifyOptsRef.current
+      const dest = resolveClassifyDestForReexport(
+        lastClassifyOptsRef.current,
+        selectedExportPath,
+        pathAfter,
+        sessionCustomSaveRootRef.current
+      )
+      lastClassifyOptsRef.current = dest
       const session = await window.api.deleteExport(pathAfter, selectedExportPath)
       applySessionFromMain(session)
       void pushOpHistory({
@@ -6339,7 +6372,7 @@ export default function App(): React.JSX.Element {
               <div
                 className="thumb-virtual-window"
                 style={{
-                  transform: `translateY(${thumbVirtual.offsetY}px)`
+                  transform: `translateY(${Math.floor(thumbVirtual.start / thumbVirtual.cols) * thumbVirtual.itemH}px)`
                 }}
               >
                 {thumbVirtual.slice.map(({ videoIndex }) => {
@@ -6355,7 +6388,6 @@ export default function App(): React.JSX.Element {
                       completed={v.completed}
                       isCategoryCopy={v.isCategoryCopy}
                       mediaKind={v.mediaKind}
-                      aspectRatio={thumbAspectByPath[normMediaPath(v.path)]}
                       active={videoIndex === index}
                       selected={selectedIds.has(v.id)}
                       secondaryPicked={secondaryIds.has(v.id)}
@@ -6367,7 +6399,6 @@ export default function App(): React.JSX.Element {
                       onToggleSelect={() => toggleSelect(v.id, videoIndex)}
                       onRangeSelect={() => rangeSelect(videoIndex)}
                       onPlayClick={() => handleThumbPlay(v.id)}
-                      onAspectRatio={rememberThumbAspect}
                     />
                   )
                 })}
@@ -7358,16 +7389,6 @@ export default function App(): React.JSX.Element {
             <p className="save-dest-hint">
               自定义的是类别文件夹的源目录，实际保存到「源目录/类别名/」。与批量分类共用，跨重启记住
             </p>
-            <label className="checkbox-row">
-              <input
-                type="checkbox"
-                checked={Boolean(modalDontAskDraft.save)}
-                onChange={(e) =>
-                  setModalDontAskDraft((prev) => ({ ...prev, save: e.target.checked }))
-                }
-              />
-              本次运行不再询问（下次直接按本次类别与路径保存）
-            </label>
             <div className="modal-actions">
               <button type="button" onClick={() => setSaveModal(null)}>
                 取消
@@ -7457,16 +7478,6 @@ export default function App(): React.JSX.Element {
             <p className="save-dest-hint">
               与保存分类相同：自选根目录后按「根目录/类别名/」落盘，并跨重启记住
             </p>
-            <label className="checkbox-row">
-              <input
-                type="checkbox"
-                checked={Boolean(modalDontAskDraft.batch)}
-                onChange={(e) =>
-                  setModalDontAskDraft((prev) => ({ ...prev, batch: e.target.checked }))
-                }
-              />
-              本次运行不再询问（下次直接按本次类别与路径归类）
-            </label>
             <div className="modal-actions">
               <button onClick={() => setBatchModal(false)}>取消</button>
               <button className="primary" disabled={busy} onClick={() => void confirmBatchClassify()}>

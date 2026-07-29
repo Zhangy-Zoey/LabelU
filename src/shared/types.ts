@@ -87,8 +87,7 @@ export interface ExportRequest {
   /** true if user has modified crop from full frame */
   cropActive: boolean
   duration: number
-  /** 源已在类别目录内时的二次分类落点 */
-  reclassifyMode?: 'originalRoot' | 'underCurrent' | 'custom' | 'customRoot'
+  /** 分类根目录；实际写入 {customDestDir}/{category}/ */
   customDestDir?: string
 }
 
@@ -98,6 +97,6 @@ export interface ImageExportRequest {
   category: string
   crop: CropRect | null
   cropActive: boolean
-  reclassifyMode?: 'originalRoot' | 'underCurrent' | 'custom' | 'customRoot'
+  /** 分类根目录；实际写入 {customDestDir}/{category}/ */
   customDestDir?: string
 }

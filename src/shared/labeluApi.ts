@@ -15,11 +15,8 @@ export type CustomCategoryMap = {
   removedBuiltins?: string[]
 }
 
-/** 二次分类落点；与 main/exportPaths.ReclassifyDestMode 一致 */
-export type ReclassifyDestMode = 'originalRoot' | 'underCurrent' | 'custom' | 'customRoot'
-
+/** 分类落点：类别文件夹写在 customDestDir/{类别名}/ 下 */
 export type ClassifyDestApiOpts = {
-  reclassifyMode?: ReclassifyDestMode
   customDestDir?: string
 }
 

@@ -570,23 +570,17 @@ export async function nextExportPath(
   const cat = sanitizeName(category)
   if (!cat) throw new Error('类别名无效')
 
-  // 落点与整片归类同一套规则；custom 时直接写入所选最终目录（不套类别名）
   const categoryDir = resolveClassifyDestDir(sourcePath, cat, opts)
-  const mode = opts?.reclassifyMode ?? 'originalRoot'
-  const customFinal = mode === 'custom'
-
-  if (!customFinal) {
-    const root = path.dirname(categoryDir)
-    const resolvedRoot = path.resolve(root)
-    const resolvedCat = path.resolve(categoryDir)
-    const catOk =
-      process.platform === 'win32'
-        ? resolvedCat.toLowerCase() === resolvedRoot.toLowerCase() ||
-          resolvedCat.toLowerCase().startsWith(resolvedRoot.toLowerCase() + path.sep)
-        : resolvedCat === resolvedRoot || resolvedCat.startsWith(resolvedRoot + path.sep)
-    if (!catOk) {
-      throw new Error('类别名无效')
-    }
+  const root = path.dirname(categoryDir)
+  const resolvedRoot = path.resolve(root)
+  const resolvedCat = path.resolve(categoryDir)
+  const catOk =
+    process.platform === 'win32'
+      ? resolvedCat.toLowerCase() === resolvedRoot.toLowerCase() ||
+        resolvedCat.toLowerCase().startsWith(resolvedRoot.toLowerCase() + path.sep)
+      : resolvedCat === resolvedRoot || resolvedCat.startsWith(resolvedRoot + path.sep)
+  if (!catOk) {
+    throw new Error('类别名无效')
   }
 
   fs.mkdirSync(categoryDir, { recursive: true })

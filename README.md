@@ -14,7 +14,7 @@ npm run dev
 ## 打包
 
 ```bash
-npm run dist:win   # Windows x64（nsis / portable）
+npm run dist:win   # Windows x64（NSIS Setup）
 npm run dist:mac   # macOS Apple Silicon（arm64 dmg/zip）
 ```
 
