@@ -68,13 +68,21 @@ const removedBuiltins = new Set<string>()
 
 let knownTagSet = new Set(CATEGORY_GROUPS.flatMap((g) => g.tags))
 
+/**
+ * 标签查找键：统一小写。
+ * Windows / 默认 macOS 卷均为大小写不敏感；避免目录「Run」与标签「run」对不上。
+ */
+function categoryLookupKey(name: string): string {
+  return name.trim().toLowerCase()
+}
+
 function addTagVariants(set: Set<string>, tag: string): void {
   const t = tag.trim()
   if (!t) return
-  set.add(t)
+  set.add(categoryLookupKey(t))
   // 与 sanitizeName 一致：目录名里 / 等会变成 _（如 蹦跳/跑酷 → 蹦跳_跑酷）
   const dirAlias = sanitizeName(t)
-  if (dirAlias) set.add(dirAlias)
+  if (dirAlias) set.add(categoryLookupKey(dirAlias))
 }
 
 function rebuildKnownTagSet(): void {
@@ -210,7 +218,7 @@ export function tryAddCustomCategoryTag(
     rebuildKnownTagSet()
     return { ok: true, name }
   }
-  if (knownTagSet.has(name)) return { ok: false, error: '该标签已存在' }
+  if (knownTagSet.has(categoryLookupKey(name))) return { ok: false, error: '该标签已存在' }
   customByGroup[groupId].push(name)
   rebuildKnownTagSet()
   return { ok: true, name }
@@ -288,7 +296,7 @@ const CATEGORY_PALETTE = [
 
 /** 预设或用户手动添加的标签 */
 export function isPresetCategory(name: string): boolean {
-  return knownTagSet.has(name.trim())
+  return knownTagSet.has(categoryLookupKey(name))
 }
 
 function categoryGroupOf(name: string): CategoryGroupId | null {

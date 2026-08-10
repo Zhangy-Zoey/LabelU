@@ -1,5 +1,5 @@
 import type { CropRect, TimeRange } from './types'
-import { MIN_SELECTION_SECONDS } from './types'
+import { EDIT_UNIT_SECONDS, MIN_SELECTION_SECONDS } from './types'
 
 /** Remove [cutStart, cutEnd] from a list of remaining ranges. */
 function subtractRange(ranges: TimeRange[], cutStart: number, cutEnd: number): TimeRange[] {
@@ -42,11 +42,30 @@ export function totalDuration(ranges: TimeRange[]): number {
 /** 选区与剩余段边界容差（秒） */
 export const SELECTION_TOLERANCE = 0.05
 
-/** 入出点最小间距（秒）；与步进 fps 无关 */
-export function minSelectionGap(hostLen: number): number {
+/** 规范化源视频帧率；无效时回退 25 */
+export function normalizeSourceFps(fps: number | undefined | null): number {
+  return Number.isFinite(fps) && (fps as number) >= 1 && (fps as number) <= 240
+    ? (fps as number)
+    : 25
+}
+
+/**
+ * 入出点最小间距（秒）：约一帧，下限 0.04s。
+ * 编辑用帧率按至少 25fps 计，避免错误/过低的 probe 帧率把最短抬到 0.1～0.2s。
+ * sourceFps 用片源帧率，勿用步进 fps。
+ */
+export function minSelectionGap(hostLen: number, sourceFps?: number | null): number {
+  const editFps = Math.max(normalizeSourceFps(sourceFps), 1 / MIN_SELECTION_SECONDS)
+  const want = Math.max(1 / editFps, MIN_SELECTION_SECONDS)
   const host = Math.max(0, hostLen)
-  if (host <= 0) return MIN_SELECTION_SECONDS
-  return Math.min(host, MIN_SELECTION_SECONDS)
+  if (host <= 0) return want
+  return Math.min(host, want)
+}
+
+/** 错误提示用的最小选区秒数文案 */
+export function formatMinSelectionSeconds(minGap: number): string {
+  const g = Math.max(0, minGap)
+  return (Math.round(g * 100) / 100).toFixed(2)
 }
 
 export function selectionTolerance(stepFps: number): number {
@@ -65,37 +84,46 @@ export function validateClipSelection(
   end: number,
   remaining: TimeRange[],
   exports: ExportSpan[],
-  stepFps = 25
+  stepFps = 25,
+  sourceFps?: number | null
 ): SelectionValidateResult {
-  const a = snapToFrame(Math.min(start, end), stepFps)
-  let b = snapToFrame(Math.max(start, end), stepFps)
+  const rawA = Math.min(start, end)
+  const rawB = Math.max(start, end)
   const tol = selectionTolerance(stepFps)
   let host =
-    remaining.find((r) => a >= r.start - tol && b <= r.end + tol) ?? null
+    remaining.find((r) => rawA >= r.start - tol && rawB <= r.end + tol) ?? null
   if (!host) {
-    // 入点在段内、出点因吸附略超出段尾时收紧出点，避免误报
+    // 入点在段内、出点因吸附略超出段尾时先锁定宿主段，再由 snapSelectionEdges 贴齐边界
     for (const r of remaining) {
-      if (a < r.start - tol || a > r.end + tol) continue
-      if (b > r.end + tol) {
-        b = snapToFrame(Math.min(b, r.end), stepFps, 'floor')
-      }
-      if (b >= a - 1e-6 && b <= r.end + tol) {
-        host = r
-        break
-      }
+      if (rawA < r.start - tol || rawA > r.end + tol) continue
+      host = r
+      break
     }
   }
+  let a: number
+  let b: number
+  if (host) {
+    const snapped = snapSelectionEdges(rawA, rawB, stepFps, host)
+    a = snapped.start
+    b = snapped.end
+  } else {
+    a = snapToFrame(rawA, stepFps)
+    b = snapToFrame(rawB, stepFps)
+  }
   if (!host) {
-    const suggested = clampSelectionToRemaining(a, b, remaining, stepFps)
+    const suggested = clampSelectionToRemaining(a, b, remaining, stepFps, sourceFps)
     return {
       ok: false,
       reason: '选区超出可剪的未分类时段',
       suggested: suggested ?? undefined
     }
   }
-  const minGap = minSelectionGap(host.end - host.start)
+  const minGap = minSelectionGap(host.end - host.start, sourceFps)
   if (b - a < minGap - 1e-6) {
-    return { ok: false, reason: `选区不能短于 ${MIN_SELECTION_SECONDS} 秒` }
+    return {
+      ok: false,
+      reason: `选区不能短于 ${formatMinSelectionSeconds(minGap)} 秒`
+    }
   }
   const hit = exports.find(
     (e) => !e.approx && a < e.end - tol && b > e.start + tol
@@ -116,19 +144,21 @@ export function resolveClipSelection(
   end: number,
   remaining: TimeRange[],
   exports: ExportSpan[],
-  stepFps = 25
+  stepFps = 25,
+  sourceFps?: number | null
 ): SelectionValidateResult {
-  const check = validateClipSelection(start, end, remaining, exports, stepFps)
+  const check = validateClipSelection(start, end, remaining, exports, stepFps, sourceFps)
   if (check.ok) return check
   const suggested =
-    check.suggested ?? clampSelectionToRemaining(start, end, remaining, stepFps)
+    check.suggested ?? clampSelectionToRemaining(start, end, remaining, stepFps, sourceFps)
   if (!suggested) return check
   const again = validateClipSelection(
     suggested.start,
     suggested.end,
     remaining,
     exports,
-    stepFps
+    stepFps,
+    sourceFps
   )
   if (again.ok) return again
   return check
@@ -139,19 +169,21 @@ export function clampSelectionToRemaining(
   start: number,
   end: number,
   remaining: TimeRange[],
-  stepFps: number
+  stepFps: number,
+  sourceFps?: number | null
 ): { start: number; end: number } | null {
   if (remaining.length === 0) return null
   let a = Math.min(start, end)
   let b = Math.max(start, end)
-  const len = Math.max(MIN_SELECTION_SECONDS, b - a)
+  const floorGap = minSelectionGap(Number.POSITIVE_INFINITY, sourceFps)
+  const len = Math.max(floorGap, b - a)
   const mid = (a + b) / 2
   let host =
     remaining.find((r) => a >= r.start - 0.05 && b <= r.end + 0.05) ??
     remaining.find((r) => mid >= r.start && mid <= r.end) ??
     remaining[0]
   if (!host) return null
-  const minGap = minSelectionGap(host.end - host.start)
+  const minGap = minSelectionGap(host.end - host.start, sourceFps)
   const useLen = Math.min(Math.max(len, minGap), host.end - host.start)
   let ns = clamp(a, host.start, Math.max(host.start, host.end - useLen))
   let ne = ns + useLen
@@ -159,10 +191,7 @@ export function clampSelectionToRemaining(
     ne = host.end
     ns = Math.max(host.start, ne - useLen)
   }
-  return {
-    start: snapToFrame(ns, stepFps),
-    end: snapToFrame(ne, stepFps)
-  }
+  return snapSelectionEdges(ns, ne, stepFps, host)
 }
 
 /** 以片长与已导出片段为准，重算剩余可剪区间（主进程权威） */
@@ -207,6 +236,53 @@ export function snapToFrame(
   return Math.max(0, frame / f)
 }
 
+/** 按最小剪辑单位（默认 0.01 秒）吸附 */
+export function snapToEditUnit(time: number, unit = EDIT_UNIT_SECONDS): number {
+  const u = Number.isFinite(unit) && unit > 0 ? unit : EDIT_UNIT_SECONDS
+  if (!Number.isFinite(time)) return 0
+  return Math.max(0, Math.round(time / u) * u)
+}
+
+/** 将 Node/系统磁盘错误转成可操作的中文提示 */
+export function friendlyFsError(err: unknown, fallback = '文件操作失败'): Error {
+  const code = (err as { code?: string } | null)?.code
+  const raw = err instanceof Error ? err.message : String(err || '')
+  if (
+    code === 'ENAMETOOLONG' ||
+    /ENAMETOOLONG|file name too long|path too long|文件名.*过长|路径.*过长/i.test(raw)
+  ) {
+    return new Error('路径过长，无法写入。请缩短分类根目录、类别名或源文件名后再试。')
+  }
+  if (err instanceof Error) return err
+  return new Error(raw || fallback)
+}
+
+/**
+ * 对选区入/出点按 0.01 秒吸附；若已贴近剩余段边界则保留精确边界，
+ * 避免片头/片尾被对齐「咬掉」一小截。
+ * fps 仅用于边界容差（selectionTolerance），不参与时间吸附。
+ */
+export function snapSelectionEdges(
+  start: number,
+  end: number,
+  fps: number,
+  host?: TimeRange | null
+): { start: number; end: number } {
+  const rawA = Math.min(start, end)
+  const rawB = Math.max(start, end)
+  let a = snapToEditUnit(rawA)
+  let b = snapToEditUnit(rawB)
+  if (host && host.end > host.start) {
+    const tol = selectionTolerance(fps)
+    if (Math.abs(rawA - host.start) <= tol || Math.abs(a - host.start) <= tol) a = host.start
+    if (Math.abs(rawB - host.end) <= tol || Math.abs(b - host.end) <= tol) b = host.end
+    a = clamp(a, host.start, host.end)
+    b = clamp(b, host.start, host.end)
+    if (b < a) b = a
+  }
+  return { start: a, end: b }
+}
+
 export function frameIndex(time: number, fps: number): number {
   const f = Number.isFinite(fps) && fps >= 1 && fps <= 240 ? fps : 25
   return Math.round(snapToFrame(time, fps) * f)
@@ -223,13 +299,13 @@ export function formatTime(seconds: number): string {
   const h = Math.floor(seconds / 3600)
   const m = Math.floor((seconds % 3600) / 60)
   const s = Math.floor(seconds % 60)
-  const ms = Math.floor((seconds % 1) * 10)
+  const cs = Math.floor((seconds % 1) * 100 + 1e-9)
   if (h > 0) {
     const base = `${h}:${String(m).padStart(2, '0')}:${String(s).padStart(2, '0')}`
-    return ms > 0 ? `${base}.${ms}` : base
+    return cs > 0 ? `${base}.${String(cs).padStart(2, '0')}` : base
   }
   const base = `${m}:${String(s).padStart(2, '0')}`
-  return ms > 0 ? `${base}.${ms}` : base
+  return cs > 0 ? `${base}.${String(cs).padStart(2, '0')}` : base
 }
 
 /** 时间码（按步进 fps）；省略前导 0 与无意义的尾零 */
@@ -257,14 +333,14 @@ export function formatTimecode(seconds: number, fps: number): string {
   return String(s)
 }
 
-/** 时间轴底部时间显示：始终保留一位小数 */
+/** 时间轴底部时间显示：保留到百分之一秒 */
 export function formatTimelineTime(seconds: number): string {
-  if (!Number.isFinite(seconds) || seconds < 0) return '0.0'
-  const t = Math.round(seconds * 10) / 10
+  if (!Number.isFinite(seconds) || seconds < 0) return '0.00'
+  const t = Math.round(seconds * 100) / 100
   const h = Math.floor(t / 3600)
   const m = Math.floor((t % 3600) / 60)
-  const s = Math.round((t - h * 3600 - m * 60) * 10) / 10
-  const sStr = s.toFixed(1)
+  const s = Math.round((t - h * 3600 - m * 60) * 100) / 100
+  const sStr = s.toFixed(2)
   const secPart = s < 10 ? `0${sStr}` : sStr
   if (h > 0) return `${h}:${String(m).padStart(2, '0')}:${secPart}`
   if (m > 0) return `${m}:${secPart}`

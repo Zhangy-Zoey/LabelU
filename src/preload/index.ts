@@ -1,5 +1,5 @@
 import { contextBridge, ipcRenderer, webUtils } from 'electron'
-import type { ExportRequest, ImageExportRequest, SessionState, VideoItem } from '../shared/types'
+import type { ExportRequest, ImageExportRequest, VideoItem } from '../shared/types'
 import type { LabeluApi } from '../shared/labeluApi'
 
 const api: LabeluApi = {

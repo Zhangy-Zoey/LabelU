@@ -10,7 +10,8 @@ import {
   sourceStemForExport,
   formatClipExportFileName,
   parseClipExportIndex,
-  isMeaningfulCrop
+  isMeaningfulCrop,
+  friendlyFsError
 } from '../shared/utils'
 import { exportRootDirFor, resolveClassifyDestDir, type ClassifyDestOptions } from './exportPaths'
 
@@ -333,7 +334,19 @@ export async function probeVideo(filePath: string): Promise<ProbeInfo> {
   const avgRate = videoStream?.avg_frame_rate || '0/0'
   const rRate = videoStream?.r_frame_rate || '0/0'
   const isVfr = avgRate !== rRate && avgRate !== '0/0' && rRate !== '0/0'
-  const fps = parseFrameRate(avgRate !== '0/0' ? avgRate : rRate)
+  const rFps = parseFrameRate(rRate)
+  const avgFps = parseFrameRate(avgRate)
+  // nb_frames / duration 作候选，纠正部分容器把 r/avg 写成 ~10 的情况
+  let countFps = 0
+  const nbFrames = Number(videoStream?.nb_frames)
+  if (Number.isFinite(nbFrames) && nbFrames > 1 && duration > 0.05) {
+    const fromCount = nbFrames / duration
+    if (fromCount > 1 && fromCount <= 240) countFps = fromCount
+  }
+  const candidates = [rFps, avgFps, countFps].filter((f) => f > 1 && f <= 240)
+  // 优先 ≥15fps 的候选；全偏低（如误报 10fps）则回退 25，避免最短选区被抬到 0.1s
+  const plausible = candidates.filter((f) => f >= 15)
+  const fps = plausible.length > 0 ? Math.max(...plausible) : 25
   const videoCodec = String(videoStream?.codec_name || '').trim()
   const info: ProbeInfo = {
     duration,
@@ -377,7 +390,7 @@ function cropFilter(crop: CropRect, width: number, height: number): string {
   return `crop=${safeW}:${safeH}:${x}:${y}`
 }
 
-/** 流拷贝裁切：秒级完成，优先使用 */
+/** 流拷贝裁切：秒级完成，优先使用（input -ss 落在关键帧） */
 async function tryCopyCut(
   sourcePath: string,
   start: number,
@@ -404,6 +417,13 @@ async function tryCopyCut(
     'copy',
     '-avoid_negative_ts',
     'make_zero',
+    // B 帧重排会使首帧 PTS>0，播放器从 0 起播会出现片头黑帧/冻屏；归零时间戳
+    '-bsf:v',
+    'setts=ts=PTS-STARTPTS',
+    '-bsf:a',
+    'setts=ts=PTS-STARTPTS',
+    '-movflags',
+    '+faststart',
     outputPath
   ]
   const { code } = await run(ffmpeg, args, undefined, 120_000)
@@ -416,7 +436,7 @@ async function tryCopyCut(
   }
 }
 
-type VideoEncodeMode = 'videotoolbox' | 'libx264'
+type VideoEncodeMode = 'videotoolbox' | 'nvenc' | 'amf' | 'qsv' | 'libx264'
 
 let cachedEncodeMode: VideoEncodeMode | null = null
 
@@ -426,17 +446,44 @@ async function resolveEncodeMode(): Promise<VideoEncodeMode> {
     cachedEncodeMode = 'videotoolbox'
     return cachedEncodeMode
   }
+  // Windows：导出时按硬编 → 软编尝试；首次成功的模式会缓存
+  if (process.platform === 'win32') {
+    cachedEncodeMode = 'nvenc'
+    return cachedEncodeMode
+  }
   cachedEncodeMode = 'libx264'
   return cachedEncodeMode
+}
+
+function winExportEncodeLadder(): VideoEncodeMode[] {
+  return ['nvenc', 'amf', 'qsv', 'libx264']
 }
 
 function pushVideoEncodeArgs(args: string[], mode: VideoEncodeMode): void {
   if (mode === 'videotoolbox') {
     args.push('-c:v', 'h264_videotoolbox', '-b:v', '8M', '-allow_sw', '1')
+  } else if (mode === 'nvenc') {
+    args.push('-c:v', 'h264_nvenc', '-preset', 'p4', '-b:v', '8M', '-pix_fmt', 'yuv420p')
+  } else if (mode === 'amf') {
+    args.push('-c:v', 'h264_amf', '-quality', 'balanced', '-b:v', '8M', '-pix_fmt', 'yuv420p')
+  } else if (mode === 'qsv') {
+    args.push('-c:v', 'h264_qsv', '-preset', 'medium', '-b:v', '8M', '-pix_fmt', 'yuv420p')
   } else {
     args.push('-c:v', 'libx264', '-preset', 'veryfast', '-crf', '20', '-pix_fmt', 'yuv420p')
   }
 }
+
+function encodeModeLabel(mode: VideoEncodeMode): string {
+  if (mode === 'videotoolbox') return '已使用硬件加速导出'
+  if (mode === 'nvenc' || mode === 'amf' || mode === 'qsv') return '已使用硬件加速导出'
+  return '已使用快速软件编码导出'
+}
+
+/**
+ * 重编码定位：先 input -ss 跳到入点附近，再 output -ss 丢掉 preroll。
+ * 比「-i 后再 -ss」快得多（不必从片头硬解到入点），同时保持帧级入点。
+ */
+const REENCODE_SEEK_PREROLL_SECONDS = 2
 
 async function reencodeCut(
   sourcePath: string,
@@ -445,20 +492,25 @@ async function reencodeCut(
   outputPath: string,
   crop: CropRect | null,
   probe: ProbeInfo,
-  mode: VideoEncodeMode
+  mode: VideoEncodeMode,
+  audio: 'copy' | 'aac' = 'copy'
 ): Promise<void> {
+  const duration = Math.max(0, end - start)
+  const preroll = Math.min(REENCODE_SEEK_PREROLL_SECONDS, Math.max(0, start))
   const args = [
     '-hide_banner',
     '-loglevel',
     'error',
     '-y',
-    '-i',
-    sourcePath,
     '-ss',
-    String(start),
-    '-to',
-    String(end)
+    String(start - preroll),
+    '-i',
+    sourcePath
   ]
+  if (preroll > 0) {
+    args.push('-ss', String(preroll))
+  }
+  args.push('-t', String(duration))
   if (crop) {
     args.push('-vf', cropFilter(crop, probe.width, probe.height))
   }
@@ -467,16 +519,26 @@ async function reencodeCut(
     args.push('-pix_fmt', 'yuv420p')
   }
   if (probe.hasAudio) {
-    args.push('-map', '0:v:0', '-map', '0:a?', '-c:a', 'copy')
+    if (audio === 'aac') {
+      args.push('-map', '0:v:0', '-map', '0:a?', '-c:a', 'aac', '-b:a', '160k')
+    } else {
+      args.push('-map', '0:v:0', '-map', '0:a?', '-c:a', 'copy')
+    }
   } else {
     args.push('-an')
   }
   args.push('-movflags', '+faststart', outputPath)
   const { code, stderr } = await run(ffmpeg, args, undefined, 600_000)
   if (code !== 0) {
-    throw new Error(stderr.slice(-500) || '重编码失败')
+    throw new Error(stderr.slice(-500) || `编码失败 (${mode})`)
   }
 }
+
+/**
+ * 短于此时长（秒）的选区不走流拷贝：关键帧对齐会导致时长/入点严重偏离。
+ * 长于此时长且无裁切时优先 -c copy，失败再重编码。
+ */
+const COPY_MIN_DURATION_SECONDS = 0.5
 
 export async function exportClip(options: {
   sourcePath: string
@@ -489,65 +551,90 @@ export async function exportClip(options: {
 }): Promise<{ usedReencode: boolean; message?: string }> {
   ensureBins()
   const probe = await probeVideo(options.sourcePath)
-  fs.mkdirSync(path.dirname(options.outputPath), { recursive: true })
+  try {
+    fs.mkdirSync(path.dirname(options.outputPath), { recursive: true })
+  } catch (err) {
+    throw friendlyFsError(err)
+  }
 
-  // 无画面裁切时优先流拷贝（含 VFR）；Mac 上流拷贝易片头黑屏，直接重编码
-  if (!options.forceReencode && !options.cropActive && process.platform !== 'darwin') {
+  const clipLen = Math.max(0, options.end - options.start)
+  const preferCopy =
+    !options.forceReencode &&
+    !options.cropActive &&
+    clipLen >= COPY_MIN_DURATION_SECONDS
+
+  if (preferCopy) {
     const ok = await tryCopyCut(options.sourcePath, options.start, options.end, options.outputPath)
     if (ok) {
       return { usedReencode: false }
     }
   }
 
-  let mode = await resolveEncodeMode()
-  try {
-    await reencodeCut(
-      options.sourcePath,
-      options.start,
-      options.end,
-      options.outputPath,
-      options.cropActive ? options.crop : null,
-      probe,
-      mode
-    )
-    return {
-      usedReencode: true,
-      message: mode === 'videotoolbox' ? '已使用硬件加速导出' : undefined
-    }
-  } catch (err) {
-    // 音频 copy 失败（如裁切后时间戳问题）时：改 AAC；硬件失败则回退软件
-    const mustSoft = mode === 'videotoolbox'
-    if (mustSoft) cachedEncodeMode = 'libx264'
-    mode = 'libx264'
+  const modes: VideoEncodeMode[] =
+    process.platform === 'darwin'
+      ? ['videotoolbox', 'libx264']
+      : process.platform === 'win32'
+        ? winExportEncodeLadder()
+        : ['libx264']
+  const cached = await resolveEncodeMode()
+  const ordered = [cached, ...modes.filter((m) => m !== cached)]
 
-    const args = [
-      '-hide_banner',
-      '-loglevel',
-      'error',
-      '-y',
-      '-i',
-      options.sourcePath,
-      '-ss',
-      String(options.start),
-      '-to',
-      String(options.end)
-    ]
-    if (options.cropActive && options.crop) {
-      args.push('-vf', cropFilter(options.crop, probe.width, probe.height))
+  let lastErr: unknown
+  for (const mode of ordered) {
+    try {
+      try {
+        if (fs.existsSync(options.outputPath)) fs.unlinkSync(options.outputPath)
+      } catch {
+        /* ignore */
+      }
+      await reencodeCut(
+        options.sourcePath,
+        options.start,
+        options.end,
+        options.outputPath,
+        options.cropActive ? options.crop : null,
+        probe,
+        mode
+      )
+      cachedEncodeMode = mode
+      return { usedReencode: true, message: encodeModeLabel(mode) }
+    } catch (err) {
+      lastErr = err
+      if (mode !== 'libx264') continue
+      try {
+        if (fs.existsSync(options.outputPath)) fs.unlinkSync(options.outputPath)
+      } catch {
+        /* ignore */
+      }
+      try {
+        await reencodeCut(
+          options.sourcePath,
+          options.start,
+          options.end,
+          options.outputPath,
+          options.cropActive ? options.crop : null,
+          probe,
+          'libx264',
+          'aac'
+        )
+        cachedEncodeMode = 'libx264'
+        return { usedReencode: true, message: '已使用快速软件编码导出' }
+      } catch (softErr) {
+        const hint =
+          clipLen < COPY_MIN_DURATION_SECONDS
+            ? '极短选区导出失败，可略加长选区后重试。'
+            : ''
+        const detail =
+          softErr instanceof Error
+            ? softErr.message
+            : err instanceof Error
+              ? err.message
+              : String(softErr || err)
+        throw new Error(`导出失败: ${detail}${hint ? ` ${hint}` : ''}`)
+      }
     }
-    pushVideoEncodeArgs(args, 'libx264')
-    if (probe.hasAudio) {
-      args.push('-map', '0:v:0', '-map', '0:a?', '-c:a', 'aac', '-b:a', '160k')
-    } else {
-      args.push('-an')
-    }
-    args.push('-movflags', '+faststart', options.outputPath)
-    const { code, stderr } = await run(ffmpeg, args, undefined, 600_000)
-    if (code !== 0) {
-      throw new Error(`导出失败: ${stderr.slice(-500) || (err instanceof Error ? err.message : String(err))}`)
-    }
-    return { usedReencode: true, message: '已使用快速软件编码导出' }
   }
+  throw lastErr instanceof Error ? lastErr : new Error(String(lastErr || '导出失败'))
 }
 
 /** 图片裁切导出使用的扩展名（尽量保留无损/透明） */
@@ -583,7 +670,11 @@ export async function nextExportPath(
     throw new Error('类别名无效')
   }
 
-  fs.mkdirSync(categoryDir, { recursive: true })
+  try {
+    fs.mkdirSync(categoryDir, { recursive: true })
+  } catch (err) {
+    throw friendlyFsError(err)
+  }
 
   // 文件名前缀仍按「导出根目录名_源文件名」，便于回看匹配
   const namingRoot = exportRootDirFor(sourcePath)
@@ -592,8 +683,10 @@ export async function nextExportPath(
   const ext = fileExt.startsWith('.') ? fileExt.toLowerCase() : `.${fileExt.toLowerCase()}`
   const prefix = `${parentDirName}_${stem}_`
   let max = 0
+  const prefixKey = process.platform === 'win32' ? prefix.toLowerCase() : prefix
   for (const name of fs.readdirSync(categoryDir)) {
-    if (!name.startsWith(prefix)) continue
+    const nameKey = process.platform === 'win32' ? name.toLowerCase() : name
+    if (!nameKey.startsWith(prefixKey)) continue
     const n = parseClipExportIndex(name, prefix)
     if (n != null) max = Math.max(max, n)
   }
@@ -611,14 +704,22 @@ export async function exportImageCrop(options: {
   cropActive: boolean
 }): Promise<{ message?: string }> {
   ensureBins()
-  fs.mkdirSync(path.dirname(options.outputPath), { recursive: true })
+  try {
+    fs.mkdirSync(path.dirname(options.outputPath), { recursive: true })
+  } catch (err) {
+    throw friendlyFsError(err)
+  }
 
   const outExt = path.extname(options.outputPath).toLowerCase()
   const srcExt = path.extname(options.sourcePath).toLowerCase()
   const needCrop = options.cropActive && options.crop && isMeaningfulCrop(options.crop)
 
   if (!needCrop && outExt === srcExt) {
-    await fs.promises.copyFile(options.sourcePath, options.outputPath)
+    try {
+      await fs.promises.copyFile(options.sourcePath, options.outputPath)
+    } catch (err) {
+      throw friendlyFsError(err)
+    }
     return { message: '已保存原图到类别目录' }
   }
 
@@ -888,13 +989,10 @@ async function buildPreviewProxy(
   // 扩展名必须以 .mp4 结尾；`.mp4.part` 在 Windows 上会报 Invalid argument / muxer 初始化失败
   const stem = path.basename(out, '.mp4')
   const tmp = path.join(path.dirname(out), `${stem}.part.mp4`)
-  const legacyTmp = path.join(path.dirname(out), `${stem}.mp4.part`)
-  for (const p of [tmp, legacyTmp]) {
-    try {
-      if (fs.existsSync(p)) fs.unlinkSync(p)
-    } catch {
-      /* ignore */
-    }
+  try {
+    if (fs.existsSync(tmp)) fs.unlinkSync(tmp)
+  } catch {
+    /* ignore */
   }
 
   const runProxy = async (

@@ -44,7 +44,12 @@ function isClipExportArtifact(filePath: string): boolean {
   if (!isPresetCategory(parent)) return false
   const grandParent = sanitizeName(path.basename(path.dirname(path.dirname(filePath))))
   const base = path.basename(filePath)
-  if (!base.startsWith(`${grandParent}_`)) return false
+  const expected = `${grandParent}_`
+  const nameOk =
+    process.platform === 'win32'
+      ? base.toLowerCase().startsWith(expected.toLowerCase())
+      : base.startsWith(expected)
+  if (!nameOk) return false
   return isClipExportFileName(base)
 }
 
@@ -259,20 +264,7 @@ export async function refreshCompletedFlags(
   }
 }
 
-async function pathExistsAsync(p: string): Promise<boolean> {
-  try {
-    await fs.promises.access(p)
-    return true
-  } catch {
-    return false
-  }
-}
-
-/** 异步版：exists 走线程池，避免 Windows 大批量 existsSync 堵死主进程 */
 async function isSourceClassifiedAsync(sourcePath: string): Promise<boolean> {
-  if (isCompletedFileName(sourcePath)) return true
-  if (await pathExistsAsync(sourcePath + '.labelu.done')) return true
-  if (await pathExistsAsync(sourcePath + '.labelu.json')) return true
-  // 类别目录列表已缓存时仅为内存前缀匹配
-  return listCategoryExportFiles(sourcePath).length > 0
+  // 与 session.isSourceClassified 同一规则（同步版已收紧）
+  return isSourceClassified(sourcePath)
 }

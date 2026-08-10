@@ -5,6 +5,7 @@ import type { CropRect, ExportRecord, SessionState, UndoEntry } from '../shared/
 import { MEDIA_EXTENSIONS } from '../shared/types'
 import {
   computeRemainingFromExports,
+  friendlyFsError,
   isCompletedFileName,
   sanitizeName,
   parseClipExportMeta,
@@ -39,17 +40,6 @@ function sessionFileFor(sourcePath: string): string {
   const keySource = process.platform === 'win32' ? resolved.toLowerCase() : resolved
   const key = Buffer.from(keySource).toString('base64url')
   return path.join(SESSION_DIR(), `${key}.json`)
-}
-
-/** 旧版会话键（未 resolve / 未做 Windows 大小写归一），仅用于读取迁移 */
-function legacySessionFileFor(sourcePath: string): string {
-  const key = Buffer.from(sourcePath).toString('base64url')
-  return path.join(SESSION_DIR(), `${key}.json`)
-}
-
-/** 旧版旁路路径（仅读取兼容，新流程不再写入） */
-function sidecarPath(sourcePath: string): string {
-  return sourcePath + '.labelu.json'
 }
 
 function ensureSessionDir(): void {
@@ -164,165 +154,33 @@ export function saveSession(state: SessionState): void {
   saveExportCatalog(state.sourcePath, state.exports || [])
 }
 
-type SidecarExport = {
-  start: number
-  end: number
-  category: string
-  file: string
-  crop?: CropRect | null
-}
-
-type SidecarFile = {
-  version: 1
-  duration: number
-  updatedAt: string
-  exports: SidecarExport[]
-}
-
-type ClipSidecarFile = {
-  version: 1
-  start: number
-  end: number
-  category: string
-  crop?: CropRect | null
-  sourceName?: string
-}
-
-function isUnderDir(absFile: string, dir: string): boolean {
-  const root = path.resolve(dir)
-  const target = path.resolve(absFile)
-  if (process.platform === 'win32') {
-    const r = root.toLowerCase()
-    const t = target.toLowerCase()
-    return t === r || t.startsWith(r + path.sep)
-  }
-  return target === root || target.startsWith(root + path.sep)
-}
-
-export function clipSidecarPath(exportFilePath: string): string {
-  return exportFilePath + '.labelu-clip.json'
-}
-
-/** @deprecated 新导出把时段写进文件名；仅用于读取旧版旁路 */
-function loadClipSidecar(exportFilePath: string): ClipSidecarFile | null {
-  const file = clipSidecarPath(exportFilePath)
-  if (!fs.existsSync(file)) return null
-  try {
-    const raw = JSON.parse(fs.readFileSync(file, 'utf8')) as ClipSidecarFile
-    if (!raw || raw.version !== 1 || !(raw.end > raw.start)) return null
-    return raw
-  } catch {
-    return null
-  }
-}
-
-/** 优先从文件名解析时段/类别，其次读旧版 .labelu-clip.json */
-function resolveClipTiming(
-  exportFilePath: string
-): { start: number; end: number; category?: string; crop?: CropRect | null } | null {
-  const fromName = parseClipExportMeta(exportFilePath)
-  if (fromName) {
-    return {
-      start: fromName.start,
-      end: fromName.end,
-      category: fromName.category || undefined,
-      crop: fromName.crop ?? null
-    }
-  }
-  const clip = loadClipSidecar(exportFilePath)
-  if (!clip) return null
-  return {
-    start: clip.start,
-    end: clip.end,
-    category: clip.category,
-    crop: clip.crop ?? null
-  }
-}
-
-function readSidecarRaw(sourcePath: string): SidecarFile | null {
-  const file = sidecarPath(sourcePath)
-  if (!fs.existsSync(file)) return null
-  try {
-    const raw = JSON.parse(fs.readFileSync(file, 'utf8')) as SidecarFile
-    if (!raw || raw.version !== 1 || !Array.isArray(raw.exports)) return null
-    return raw
-  } catch {
-    return null
-  }
-}
-
-/** 旁路 .labelu.json 仅读取旧数据；新流程用文件名自描述，不再写入 */
-
-export function clearSidecar(sourcePath: string): void {
-  const file = sidecarPath(sourcePath)
-  if (fs.existsSync(file)) {
-    try {
-      fs.unlinkSync(file)
-    } catch {
-      /* ignore */
-    }
-  }
-}
-
 function categoryFromExportPath(exportPath: string): string {
   return path.basename(path.dirname(exportPath)) || '未命名'
 }
 
-/** 把无时间记录的历史片段，尽量塞进源片剩余空隙以便时间轴可见 */
-function placeApproxExports(
-  duration: number,
-  known: ExportRecord[],
-  orphans: { path: string; category: string; clipDur: number }[]
-): ExportRecord[] {
-  const placed: ExportRecord[] = []
-  let occupied = [...known]
-  for (const o of orphans) {
-    const need = Math.max(0.05, Math.min(o.clipDur, Math.max(0.05, duration)))
-    let ranges = computeRemainingFromExports(duration, occupied)
-    ranges = [...ranges].sort((a, b) => b.end - b.start - (a.end - a.start))
-    const gap = ranges.find((r) => r.end - r.start >= need - 0.05) || ranges[0]
-    if (!gap || gap.end - gap.start < 0.05) continue
-    const len = Math.min(need, gap.end - gap.start)
-    const rec: ExportRecord = {
-      path: o.path,
-      start: gap.start,
-      end: gap.start + len,
-      category: o.category,
-      approx: true
-    }
-    placed.push(rec)
-    occupied = [...occupied, rec]
+/** 仅从导出文件名解析时段/类别/裁切（无文件名时段则忽略该文件） */
+function resolveClipTiming(
+  exportFilePath: string
+): { start: number; end: number; category?: string; crop?: CropRect | null } | null {
+  const fromName = parseClipExportMeta(exportFilePath)
+  if (!fromName || !(fromName.end > fromName.start)) return null
+  return {
+    start: fromName.start,
+    end: fromName.end,
+    category: fromName.category || undefined,
+    crop: fromName.crop ?? null
   }
-  return placed
 }
 
 /**
- * 从旁路 JSON + 导出文件名时段（或旧版 .labelu-clip.json）+ 类别目录文件，重建完整分类会话。
- * 无时间记录的历史文件会标 approx 并放入剩余空隙，避免「磁盘有片、轴上看不见」。
+ * 从导出文件名时段 + 导出目录索引 + 类别目录文件，重建回看用会话。
+ * 无 `_s…_e…_` 时段的文件不会进入时间轴。
  */
-async function loadSidecarSession(sourcePath: string): Promise<SessionState | null> {
-  const dir = path.dirname(sourcePath)
+async function loadDiskSession(sourcePath: string): Promise<SessionState | null> {
   const byPath = new Map<string, ExportRecord>()
 
-  const raw = readSidecarRaw(sourcePath)
-  for (const item of raw?.exports || []) {
-    if (!item || !(item.end > item.start) || !item.file) continue
-    const abs = path.resolve(dir, item.file)
-    if (!isUnderDir(abs, dir) || !fs.existsSync(abs)) continue
-    byPath.set(path.resolve(abs), {
-      path: abs,
-      start: item.start,
-      end: item.end,
-      category: String(item.category || '').trim() || '未命名',
-      crop: item.crop ?? null
-    })
-  }
-
-  // 导出目录索引（含源树外的自选根目录落点）
   for (const e of loadExportCatalog(sourcePath)) {
-    const key = path.resolve(e.path)
-    if (byPath.has(key)) continue
-    byPath.set(key, e)
+    byPath.set(path.resolve(e.path), e)
   }
 
   const diskFiles = listCategoryExportFiles(sourcePath)
@@ -330,68 +188,38 @@ async function loadSidecarSession(sourcePath: string): Promise<SessionState | nu
     const key = path.resolve(abs)
     if (byPath.has(key)) continue
     const timing = resolveClipTiming(abs)
-    if (timing && timing.end > timing.start) {
-      byPath.set(key, {
-        path: abs,
-        start: timing.start,
-        end: timing.end,
-        category: timing.category || categoryFromExportPath(abs),
-        crop: timing.crop ?? null
-      })
-    }
+    if (!timing) continue
+    byPath.set(key, {
+      path: abs,
+      start: timing.start,
+      end: timing.end,
+      category: timing.category || categoryFromExportPath(abs),
+      crop: timing.crop ?? null
+    })
   }
 
   const known = Array.from(byPath.values()).filter((e) => e.end > e.start)
-  const orphanPaths = diskFiles.filter((p) => !byPath.has(path.resolve(p)))
-  const orphans: { path: string; category: string; clipDur: number }[] = []
+  if (known.length === 0) return null
 
-  if (orphanPaths.length > 0) {
-    for (const abs of orphanPaths) {
-      try {
-        const p = await probeVideo(abs)
-        const dur = p.duration > 0 ? p.duration : 2
-        orphans.push({
-          path: abs,
-          category: categoryFromExportPath(abs),
-          clipDur: dur
-        })
-      } catch {
-        orphans.push({
-          path: abs,
-          category: categoryFromExportPath(abs),
-          clipDur: 2
-        })
-      }
-    }
+  // 必须以源片 probe 时长为准；勿用 max(export.end)，否则续剪时主进程会按偏短片长拒选区
+  let duration = 0
+  try {
+    const p = await probeVideo(sourcePath)
+    if (p.duration > 0) duration = p.duration
+  } catch {
+    /* ignore */
+  }
+  if (!(duration > 0)) {
+    duration = Math.max(...known.map((e) => e.end), 0)
   }
 
-  let duration =
-    (typeof raw?.duration === 'number' && raw.duration > 0
-      ? raw.duration
-      : known.length
-        ? Math.max(...known.map((e) => e.end))
-        : 0) || 0
-
-  if (!(duration > 0) && (known.length || orphans.length)) {
-    try {
-      const p = await probeVideo(sourcePath)
-      if (p.duration > 0) duration = p.duration
-    } catch {
-      /* ignore */
-    }
-  }
-
-  const approx = duration > 0 ? placeApproxExports(duration, known, orphans) : []
-  const exports = [...known, ...approx].sort((a, b) => a.start - b.start || a.end - b.end)
-  if (exports.length === 0) return null
-
+  const exports = [...known].sort((a, b) => a.start - b.start || a.end - b.end)
   return {
     version: 1,
     sourcePath,
-    updatedAt: raw?.updatedAt || new Date().toISOString(),
+    updatedAt: new Date().toISOString(),
     duration,
     exports,
-    // 剩余可剪区间只按精确段计算，推算段不占用可剪空间
     remainingRanges: computeRemainingFromExports(duration, known),
     undoStack: []
   }
@@ -400,47 +228,22 @@ async function loadSidecarSession(sourcePath: string): Promise<SessionState | nu
 /** 仅工作区会话（未完成编辑） */
 export function loadWorkspaceSession(sourcePath: string): SessionState | null {
   const file = sessionFileFor(sourcePath)
-  if (fs.existsSync(file)) {
-    try {
-      return JSON.parse(fs.readFileSync(file, 'utf8')) as SessionState
-    } catch {
-      return null
-    }
+  if (!fs.existsSync(file)) return null
+  try {
+    return JSON.parse(fs.readFileSync(file, 'utf8')) as SessionState
+  } catch {
+    return null
   }
-  // 迁移：旧版未 resolve / 未做 Windows 大小写归一的会话文件
-  const legacy = legacySessionFileFor(sourcePath)
-  if (legacy !== file && fs.existsSync(legacy)) {
-    try {
-      const state = JSON.parse(fs.readFileSync(legacy, 'utf8')) as SessionState
-      try {
-        fs.renameSync(legacy, file)
-      } catch {
-        /* ignore migrate failure; still return state */
-      }
-      return state
-    } catch {
-      return null
-    }
-  }
-  return null
 }
 
-/** 优先工作区会话，否则读源视频旁路（已完成可回看分类） */
+/** 优先工作区会话，否则从磁盘导出重建（已完成可回看分类） */
 export async function loadSession(sourcePath: string): Promise<SessionState | null> {
-  return loadWorkspaceSession(sourcePath) || (await loadSidecarSession(sourcePath))
+  return loadWorkspaceSession(sourcePath) || (await loadDiskSession(sourcePath))
 }
 
 export function clearSession(sourcePath: string): void {
   const file = sessionFileFor(sourcePath)
   if (fs.existsSync(file)) fs.unlinkSync(file)
-  const legacy = legacySessionFileFor(sourcePath)
-  if (legacy !== file && fs.existsSync(legacy)) {
-    try {
-      fs.unlinkSync(legacy)
-    } catch {
-      /* ignore */
-    }
-  }
 }
 
 export function listPendingSessions(): SessionState[] {
@@ -467,7 +270,6 @@ export async function removeFromWorkspace(
   deleteSourceFile: boolean
 ): Promise<void> {
   clearSession(sourcePath)
-  clearSidecar(sourcePath)
   clearExportCatalog(sourcePath)
   const cleared = await clearCompletedFlag(sourcePath)
   if (!deleteSourceFile) return
@@ -475,7 +277,10 @@ export async function removeFromWorkspace(
   try {
     if (fs.existsSync(toDelete)) fs.unlinkSync(toDelete)
   } catch (err) {
-    throw new Error(`无法删除原文件：${err instanceof Error ? err.message : String(err)}`)
+    throw friendlyFsError(
+      err,
+      `无法删除原文件：${err instanceof Error ? err.message : String(err)}`
+    )
   }
 }
 
@@ -487,17 +292,10 @@ export function discardSession(state: SessionState, deleteExports: boolean): voi
       } catch {
         /* ignore */
       }
-      try {
-        const clipMeta = clipSidecarPath(exp.path)
-        if (fs.existsSync(clipMeta)) fs.unlinkSync(clipMeta)
-      } catch {
-        /* ignore */
-      }
     }
     clearExportCatalog(state.sourcePath)
   }
   clearSession(state.sourcePath)
-  clearSidecar(state.sourcePath)
 }
 
 export function pushUndo(stack: UndoEntry[], entry: UndoEntry, max = 20): UndoEntry[] {
@@ -506,26 +304,11 @@ export function pushUndo(stack: UndoEntry[], entry: UndoEntry, max = 20): UndoEn
   return next
 }
 
-/** 旧版旁路完成标记（仅兼容读取/清理，不再新建） */
-function completedFlagPath(sourcePath: string): string {
-  return sourcePath + '.labelu.done'
-}
-
-function removeLegacyCompletedFlag(sourcePath: string): void {
-  const p = completedFlagPath(sourcePath)
-  try {
-    if (fs.existsSync(p)) fs.unlinkSync(p)
-  } catch {
-    /* ignore */
-  }
-}
-
 /**
  * 标记已完成：在源文件名 stem 末尾加 `_done`（不写新文件）。
  * @returns 标记后的路径（可能已重命名）
  */
 export async function markCompleted(sourcePath: string): Promise<string> {
-  removeLegacyCompletedFlag(sourcePath)
   if (isCompletedFileName(sourcePath)) return sourcePath
   const dest = withCompletedFileName(sourcePath)
   if (pathsEqualResolved(dest, sourcePath)) return sourcePath
@@ -535,39 +318,31 @@ export async function markCompleted(sourcePath: string): Promise<string> {
       throw new Error(`无法标记完成：已存在 ${path.basename(dest)}`)
     }
     await renameWithRetry(sourcePath, dest)
-    removeLegacyCompletedFlag(dest)
     return dest
   } catch (err) {
     if (err instanceof Error && err.message.startsWith('无法标记完成')) throw err
-    throw new Error(`无法标记完成：${err instanceof Error ? err.message : String(err)}`)
+    throw friendlyFsError(
+      err,
+      `无法标记完成：${err instanceof Error ? err.message : String(err)}`
+    )
   }
 }
 
-/** 文件名带 `_done`，或仍残留旧版 `.labelu.done` */
+/** 文件名带 `_done` */
 export function isCompleted(sourcePath: string): boolean {
-  if (isCompletedFileName(sourcePath)) return true
-  try {
-    return fs.existsSync(completedFlagPath(sourcePath))
-  } catch {
-    return false
-  }
-}
-
-function hasSidecarRecord(sourcePath: string): boolean {
-  try {
-    return fs.existsSync(sidecarPath(sourcePath))
-  } catch {
-    return false
-  }
+  return isCompletedFileName(sourcePath)
 }
 
 /**
- * 源视频旁是否已有分类结果：完成标记 / 旁路 JSON / 类别子目录中的导出片段。
- * 用于重开文件夹时自动识别「已处理过」的视频。
+ * 源视频旁是否已有分类结果：完成标记，或可解析时段的导出 / 导出目录索引。
  */
 export function isSourceClassified(sourcePath: string): boolean {
-  if (isCompleted(sourcePath) || hasSidecarRecord(sourcePath)) return true
-  return listCategoryExportFiles(sourcePath).length > 0
+  if (isCompleted(sourcePath)) return true
+  if (loadExportCatalog(sourcePath).length > 0) return true
+  for (const abs of listCategoryExportFiles(sourcePath)) {
+    if (parseClipExportMeta(abs)) return true
+  }
+  return false
 }
 
 /** 同一次扫描内复用「父目录 → 类别子目录文件列表」，避免每个源视频重复 readdir */
@@ -641,8 +416,11 @@ export function listCategoryExportFiles(sourcePath: string): string[] {
   const catLists = loadCategoryListsForDir(dir)
   for (const { cat, files } of catLists) {
     const catDir = path.join(dir, cat)
+    const prefixKey =
+      process.platform === 'win32' ? prefix.toLowerCase() : prefix
     for (const f of files) {
-      if (!f.startsWith(prefix)) continue
+      const nameKey = process.platform === 'win32' ? f.toLowerCase() : f
+      if (!nameKey.startsWith(prefixKey)) continue
       const ext = path.extname(f).toLowerCase()
       if (!(MEDIA_EXTENSIONS as readonly string[]).includes(ext)) continue
       add(path.join(catDir, f))
@@ -657,11 +435,10 @@ export function listCategoryExportFiles(sourcePath: string): string[] {
 }
 
 /**
- * 撤销已完成：去掉文件名中的 `_done`，并清理旧版旁路标记。
+ * 撤销已完成：去掉文件名中的 `_done`。
  * @returns 撤销后的路径（可能已重命名）
  */
 export async function clearCompletedFlag(sourcePath: string): Promise<string> {
-  removeLegacyCompletedFlag(sourcePath)
   if (!isCompletedFileName(sourcePath)) return sourcePath
   const dest = withoutCompletedFileName(sourcePath)
   if (pathsEqualResolved(dest, sourcePath)) return sourcePath
@@ -671,11 +448,13 @@ export async function clearCompletedFlag(sourcePath: string): Promise<string> {
       throw new Error(`无法撤销完成：已存在 ${path.basename(dest)}`)
     }
     await renameWithRetry(sourcePath, dest)
-    removeLegacyCompletedFlag(dest)
     return dest
   } catch (err) {
     if (err instanceof Error && err.message.startsWith('无法撤销完成')) throw err
-    throw new Error(`无法撤销完成：${err instanceof Error ? err.message : String(err)}`)
+    throw friendlyFsError(
+      err,
+      `无法撤销完成：${err instanceof Error ? err.message : String(err)}`
+    )
   }
 }
 
@@ -707,14 +486,15 @@ async function renameWithRetry(src: string, dest: string): Promise<void> {
     } catch (err) {
       lastErr = err
       const code = (err as NodeJS.ErrnoException)?.code
+      if (code === 'ENAMETOOLONG') throw friendlyFsError(err)
       if (code === 'EBUSY' || code === 'EPERM' || code === 'EACCES') {
         await sleepMs(40 + i * 35)
         continue
       }
-      throw err
+      throw friendlyFsError(err)
     }
   }
-  throw lastErr instanceof Error ? lastErr : new Error(String(lastErr))
+  throw friendlyFsError(lastErr)
 }
 
 /** 异步流式复制（避免大文件卡死主线程），并校验大小 */
@@ -749,11 +529,16 @@ export async function moveFileVerified(src: string, dest: string): Promise<void>
     return
   } catch (err) {
     const code = (err as NodeJS.ErrnoException)?.code
+    if (code === 'ENAMETOOLONG') throw friendlyFsError(err)
     // 占用类错误不再误走「跨盘复制」，直接抛出
     if (code === 'EBUSY' || code === 'EPERM' || code === 'EACCES') throw err
     /* EXDEV 等：回退为复制后删除 */
   }
-  await copyFileVerified(src, dest)
+  try {
+    await copyFileVerified(src, dest)
+  } catch (err) {
+    throw friendlyFsError(err)
+  }
   {
     let lastUnlink: unknown
     const attempts = process.platform === 'win32' ? 24 : 12
@@ -778,7 +563,7 @@ export async function moveFileVerified(src: string, dest: string): Promise<void>
       } catch {
         /* ignore */
       }
-      throw lastUnlink instanceof Error ? lastUnlink : new Error(String(lastUnlink))
+      throw friendlyFsError(lastUnlink)
     }
   }
 }
@@ -794,16 +579,6 @@ function uniqueDestPath(categoryDir: string, base: string): string {
 }
 
 export type BatchClassifyMove = { originalPath: string; newPath: string }
-
-/** 清除旧版落盘撤回文件（已改用统一 op-history，不再使用内存批量撤回栈） */
-export function initBatchUndoStore(): void {
-  try {
-    const f = path.join(app.getPath('userData'), 'batch-classify-undo.json')
-    if (fs.existsSync(f)) fs.unlinkSync(f)
-  } catch {
-    /* ignore */
-  }
-}
 
 export async function undoBatchClassifyMoves(
   moves: BatchClassifyMove[]
@@ -860,18 +635,20 @@ export async function classifyWholeFileAsync(
   const baseName = path.basename(withoutCompletedFileName(sourcePath))
   let dest = path.join(categoryDir, baseName)
 
-  if (pathsEqualResolved(dest, sourcePath)) {
-    clearSession(sourcePath)
-    clearSidecar(sourcePath)
-    await clearCompletedFlag(sourcePath)
-    return { sourcePath, exportPath: sourcePath }
-  }
+  try {
+    if (pathsEqualResolved(dest, sourcePath)) {
+      clearSession(sourcePath)
+      await clearCompletedFlag(sourcePath)
+      return { sourcePath, exportPath: sourcePath }
+    }
 
-  dest = uniqueDestPath(categoryDir, baseName)
-  clearSession(sourcePath)
-  clearSidecar(sourcePath)
-  const fromPath = await clearCompletedFlag(sourcePath)
-  await moveFileVerified(fromPath, dest)
-  await clearCompletedFlag(dest)
-  return { sourcePath: fromPath, exportPath: dest }
+    dest = uniqueDestPath(categoryDir, baseName)
+    clearSession(sourcePath)
+    const fromPath = await clearCompletedFlag(sourcePath)
+    await moveFileVerified(fromPath, dest)
+    await clearCompletedFlag(dest)
+    return { sourcePath: fromPath, exportPath: dest }
+  } catch (err) {
+    throw friendlyFsError(err)
+  }
 }

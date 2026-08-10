@@ -1,5 +1,4 @@
-import type { CropRect, TimeRange } from './types'
-import type { ClassifyDestApiOpts } from './labeluApi'
+import type { CropRect } from './types'
 
 /** 操作日志 / 统一历史共用类型（可序列化落盘） */
 export type OpKind =
@@ -22,42 +21,6 @@ export type OpUiTimelineState = {
   cropActive: boolean
   selectedIds: string[]
   secondaryIds: string[]
-}
-
-export type OpExportPayload = {
-  mediaKind: 'video' | 'image'
-  sourcePath: string
-  exportPath: string
-  category: string
-  range: TimeRange
-  crop: CropRect | null
-  cropActive: boolean
-  duration: number
-  dest?: ClassifyDestApiOpts
-  remainingBefore: TimeRange[]
-  remainingAfter: TimeRange[]
-}
-
-export type OpBatchClassifyPayload = {
-  category: string
-  dest?: ClassifyDestApiOpts
-  moves: { originalPath: string; newPath: string }[]
-  /** 批量前列表中的路径，便于复原后刷新 */
-  requestPaths: string[]
-}
-
-export type OpDeleteExportPayload = {
-  sourcePath: string
-  exportPath: string
-  record: {
-    path: string
-    start: number
-    end: number
-    category: string
-    crop?: CropRect | null
-  }
-  remainingBefore: TimeRange[]
-  remainingAfter: TimeRange[]
 }
 
 export type OpHistoryEntry = {

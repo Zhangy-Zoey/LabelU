@@ -24,15 +24,13 @@ import {
   toMediaUrl,
   setFfmpegCancelChecker,
   killActiveFfmpeg,
-  ensurePreviewProxy
+  ensurePreviewProxy,
 } from './ffmpeg'
 import {
   saveSession,
   loadSession,
   loadWorkspaceSession,
   clearSession,
-  clearSidecar,
-  clipSidecarPath,
   listPendingSessions,
   discardSession,
   removeFromWorkspace,
@@ -42,7 +40,6 @@ import {
   isCompleted,
   classifyWholeFileAsync,
   undoBatchClassifyMoves,
-  initBatchUndoStore,
   moveFileVerified,
   beginCategoryScanCache,
   endCategoryScanCache,
@@ -63,7 +60,15 @@ import type {
   VideoItem
 } from '../shared/types'
 import { IMAGE_TIMELINE_SECONDS, isImagePath } from '../shared/types'
-import { computeRemainingFromExports, isMeaningfulCrop, totalDuration, validateClipSelection } from '../shared/utils'
+import {
+  computeRemainingFromExports,
+  formatMinSelectionSeconds,
+  friendlyFsError,
+  isMeaningfulCrop,
+  minSelectionGap,
+  totalDuration,
+  validateClipSelection
+} from '../shared/utils'
 import {
   applyCategoryTagsPersistPayload,
   getCategoryTagsPersistPayload,
@@ -749,6 +754,8 @@ app.whenReady().then(() => {
     if (ext === '.mov') return 'video/quicktime'
     if (ext === '.mkv') return 'video/x-matroska'
     if (ext === '.avi') return 'video/x-msvideo'
+    if (ext === '.wmv') return 'video/x-ms-wmv'
+    if (ext === '.flv') return 'video/x-flv'
     if (ext === '.jpg' || ext === '.jpeg') return 'image/jpeg'
     if (ext === '.png') return 'image/png'
     if (ext === '.webp') return 'image/webp'
@@ -858,9 +865,8 @@ app.whenReady().then(() => {
 
   createWindow()
   setupApplicationMenu()
-  // 窗口创建后再清理旧撤回缓存 / 加载自定义标签 / 白名单种子，不挡首屏
+  // 窗口创建后再加载自定义标签 / 白名单种子，不挡首屏
   setImmediate(() => {
-    initBatchUndoStore()
     loadCustomCategoriesFromDisk()
     seedAllowedRootsFromDisk()
   })
@@ -1179,9 +1185,10 @@ function setupIpc(): void {
         }
         const session = await loadSession(sourcePath)
         const probe = await probeVideo(sourcePath)
-        const dur =
-          (session?.duration && session.duration > 0 ? session.duration : 0) ||
-          (probe.duration > 0 ? probe.duration : 0)
+        const dur = Math.max(
+          session?.duration && session.duration > 0 ? session.duration : 0,
+          probe.duration > 0 ? probe.duration : 0
+        )
         if (!session || !session.exports?.length) {
           result[sourcePath] = dur
           continue
@@ -1240,14 +1247,18 @@ function setupIpc(): void {
       const classifyOpts = req.customDestDir
         ? { customDestDir: req.customDestDir }
         : undefined
-      outputPath = await nextExportPath(
-        req.sourcePath,
-        req.category,
-        range,
-        cropForName,
-        ext,
-        classifyOpts
-      )
+      try {
+        outputPath = await nextExportPath(
+          req.sourcePath,
+          req.category,
+          range,
+          cropForName,
+          ext,
+          classifyOpts
+        )
+      } catch (err) {
+        throw friendlyFsError(err)
+      }
       const result = await exportImageCrop({
         sourcePath: req.sourcePath,
         outputPath,
@@ -1298,7 +1309,7 @@ function setupIpc(): void {
           /* ignore */
         }
       }
-      throw err instanceof Error ? err : new Error(String(err))
+      throw friendlyFsError(err instanceof Error ? err : new Error(String(err)))
     } finally {
       setBusy(false)
     }
@@ -1316,20 +1327,33 @@ function setupIpc(): void {
 
       const probe = await probeVideo(req.sourcePath)
       const prev = await loadSession(req.sourcePath)
-      const duration =
-        (prev?.duration && prev.duration > 0 ? prev.duration : 0) ||
-        (req.duration > 0 ? req.duration : 0) ||
-        probe.duration
+      // 取最大值：磁盘重建会话若曾偏短，不能压过 probe / 渲染进程上报的时长
+      const duration = Math.max(
+        prev?.duration && prev.duration > 0 ? prev.duration : 0,
+        req.duration > 0 ? req.duration : 0,
+        probe.duration > 0 ? probe.duration : 0
+      )
       if (!(duration > 0)) throw new Error('无法确定视频时长')
 
       const cutStart = Math.min(req.start, req.end)
       const cutEnd = Math.max(req.start, req.end)
-      if (cutEnd - cutStart < 0.05) throw new Error('选区过短')
+      const sourceFps = probe.fps
+      const minGap = minSelectionGap(duration, sourceFps)
+      if (cutEnd - cutStart < minGap - 1e-6) {
+        throw new Error(`选区过短（至少 ${formatMinSelectionSeconds(minGap)} 秒）`)
+      }
 
       // 主进程权威重算剩余区间；忽略 approx 推算段
       const prevPrecise = preciseExports(prev?.exports || [])
       const baseRemaining = computeRemainingFromExports(duration, prevPrecise)
-      const check = validateClipSelection(cutStart, cutEnd, baseRemaining, prevPrecise, 25)
+      const check = validateClipSelection(
+        cutStart,
+        cutEnd,
+        baseRemaining,
+        prevPrecise,
+        sourceFps,
+        sourceFps
+      )
       if (!check.ok) {
         throw new Error(check.reason)
       }
@@ -1339,14 +1363,18 @@ function setupIpc(): void {
       const classifyOpts = req.customDestDir
         ? { customDestDir: req.customDestDir }
         : undefined
-      outputPath = await nextExportPath(
-        req.sourcePath,
-        req.category,
-        { start: cutStart, end: cutEnd },
-        cropForName,
-        '.mp4',
-        classifyOpts
-      )
+      try {
+        outputPath = await nextExportPath(
+          req.sourcePath,
+          req.category,
+          { start: cutStart, end: cutEnd },
+          cropForName,
+          '.mp4',
+          classifyOpts
+        )
+      } catch (err) {
+        throw friendlyFsError(err)
+      }
       const result = await exportClip({
         sourcePath: req.sourcePath,
         start: cutStart,
@@ -1405,7 +1433,7 @@ function setupIpc(): void {
           /* ignore partial cleanup */
         }
       }
-      throw err instanceof Error ? err : new Error(String(err))
+      throw friendlyFsError(err instanceof Error ? err : new Error(String(err)))
     } finally {
       setBusy(false)
     }
@@ -1425,12 +1453,6 @@ function setupIpc(): void {
       if (fs.existsSync(entry.exportPath)) {
         fs.unlinkSync(entry.exportPath)
       }
-      try {
-        const meta = clipSidecarPath(entry.exportPath)
-        if (fs.existsSync(meta)) fs.unlinkSync(meta)
-      } catch {
-        /* ignore */
-      }
       const exports = preciseExports(
         state.exports.filter((x) => !pathsEqualKey(x.path, entry.exportPath))
       )
@@ -1445,7 +1467,6 @@ function setupIpc(): void {
       }
       if (exports.length === 0) {
         clearSession(sourcePath)
-        clearSidecar(sourcePath)
         clearExportCatalog(sourcePath)
       } else {
         saveSession(next)
@@ -1469,12 +1490,6 @@ function setupIpc(): void {
       if (fs.existsSync(exportPath)) {
         fs.unlinkSync(exportPath)
       }
-      try {
-        const meta = clipSidecarPath(exportPath)
-        if (fs.existsSync(meta)) fs.unlinkSync(meta)
-      } catch {
-        /* ignore */
-      }
       const exports = preciseExports(state.exports.filter((x) => !pathsEqualKey(x.path, exportPath)))
       const undoStack = state.undoStack.filter((u) => !pathsEqualKey(u.exportPath, exportPath))
       const remaining = computeRemainingFromExports(state.duration, exports)
@@ -1487,7 +1502,6 @@ function setupIpc(): void {
       }
       if (exports.length === 0) {
         clearSession(sourcePath)
-        clearSidecar(sourcePath)
         clearExportCatalog(sourcePath)
         return {
           ...next,
@@ -1522,7 +1536,7 @@ function setupIpc(): void {
       setBusy(true)
       emitProgress('正在完成…')
       try {
-        // 完成必须以工作区会话为准；旁路只用于回看
+        // 完成必须以工作区会话为准；无会话时从磁盘导出重建回看
         const session =
           loadWorkspaceSession(sourcePath) || (await loadSession(sourcePath))
         const precise = preciseExports(session?.exports || [])
@@ -1530,7 +1544,6 @@ function setupIpc(): void {
         if (exportCount === 0 || !session) {
           if (markDone) {
             emitProgress('标记完成…')
-            clearSidecar(sourcePath)
             clearExportCatalog(sourcePath)
             const donePath = await markCompleted(sourcePath)
             rememberAllowedPath(donePath)
@@ -1557,11 +1570,10 @@ function setupIpc(): void {
           throw new Error('找不到剪辑会话记录，请重新打开该视频后再完成')
         }
 
-        // 分类信息已写在导出文件名 / 导出目录索引中；清掉旧旁路与工作区会话
+        // 分类信息已写在导出文件名 / 导出目录索引中；清掉工作区会话
         emitProgress('标记完成…')
         saveExportCatalog(sourcePath, precise)
         for (const e of precise) rememberAllowedPath(e.path)
-        clearSidecar(sourcePath)
         const donePath = await markCompleted(sourcePath)
         rememberAllowedPath(donePath)
         clearSession(sourcePath)

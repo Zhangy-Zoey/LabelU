@@ -109,7 +109,15 @@ function copyFfprobeFallback(platform, arch, destFile) {
 
 async function main() {
   const platform = process.argv[2] || process.platform
-  const arch = process.argv[3] || (process.arch === 'arm64' ? 'arm64' : 'x64')
+  // 交叉准备 Windows 包时默认 x64（与 dist:win 一致），避免 Apple Silicon 宿主误写成 arm64
+  let arch = process.argv[3]
+  if (!arch) {
+    if (platform === 'win32' && process.platform !== 'win32') {
+      arch = 'x64'
+    } else {
+      arch = process.arch === 'arm64' ? 'arm64' : 'x64'
+    }
+  }
   if (!['win32', 'darwin', 'linux'].includes(platform)) {
     throw new Error(`unsupported platform: ${platform}`)
   }

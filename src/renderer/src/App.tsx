@@ -2,7 +2,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import type { CropRect, ExportRecord, SessionState, TimeRange, VideoItem } from '../../shared/types'
 import type { WorkspaceResumeSnapshot, ClassifyDestApiOpts } from '../../shared/labeluApi'
 import { IMAGE_TIMELINE_SECONDS, MIN_SELECTION_SECONDS, isImagePath } from '../../shared/types'
-import { clamp, computeRemainingFromExports, formatTime, formatTimecode, formatTimelineTime, frameDuration, frameIndex, isMeaningfulCrop, minSelectionGap, resolveClipSelection, selectionTolerance, snapToFrame, stepByFrames, totalDuration, sanitizeName, compareMediaPaths, joinMediaDir, mediaDirname, mediaBasename, withoutCompletedFileName } from '../../shared/utils'
+import { clamp, computeRemainingFromExports, formatTime, formatTimecode, formatTimelineTime, formatMinSelectionSeconds, frameDuration, frameIndex, isMeaningfulCrop, minSelectionGap, resolveClipSelection, SELECTION_TOLERANCE, selectionTolerance, snapSelectionEdges, snapToFrame, stepByFrames, totalDuration, sanitizeName, compareMediaPaths, joinMediaDir, mediaDirname, mediaBasename, withoutCompletedFileName } from '../../shared/utils'
 import { isPresetCategory, applyCategoryTagsPersistPayload, getCategoryTagsPersistPayload, loadCustomCategoryTags, saveCustomCategoryTags, categoryShadeStyle, tryRemoveCategoryTag, findVisibleCategoryGroup } from '../../shared/categories'
 import { filmstripOrder, seekAndCaptureFrame, seekVideo } from './frameCapture'
 import { codecMayNeedProxyFallback, waitForDecodedFrame } from './playbackHealth'
@@ -11,6 +11,32 @@ import { VideoThumb } from './VideoThumb'
 import { hitTestThumbMarquee } from './thumbMarquee'
 import { pushOpHistory, logOp, patchOpHistory, snapshotUi } from './opHistory'
 import type { OpHistoryEntry } from '../../shared/opTypes'
+import {
+  LS_THUMB,
+  LS_SIDEBAR,
+  LS_STEP_FPS,
+  LS_TIMELINE_ZOOM,
+  LS_LOOP_SELECTION,
+  LS_PLAYBACK_RATE,
+  LS_ONLY_INCOMPLETE,
+  LS_SAVE_ROOT,
+  LS_FILMSTRIP_HEIGHT,
+  LS_HEVC_PREWARM,
+  loadStoredBool,
+  loadStoredNumber,
+  loadStepFps,
+  loadStoredPlaybackRate,
+  loadPersistedSaveRoot,
+  persistSaveRoot,
+  persistBool
+} from './appPrefs'
+import {
+  tryMoveSelectionEdge,
+  validateSelectionRange,
+  exportBlockingSelection
+} from './selectionModel'
+import { enqueueExportJob, clearPendingExportJobs, subscribeExportQueue } from './exportQueue'
+import { startHevcPrewarm, cancelHevcPrewarm } from './hevcPrewarm'
 import appIcon from './assets/app-icon.png'
 /** 仅当上级目录名属于预设行为标签时，才作为默认分类名 */
 function defaultCategoryFromDir(dirName: string | undefined | null): string {
@@ -49,7 +75,6 @@ const MAIN_COLLAPSE_SNAP = 72
 const FILMSTRIP_RADIUS = 5
 /** 微调步进（fps）：数值=每秒几帧；1=按1下←→走1秒，8=按8下走1秒；选帧区按此间距抽帧 */
 const STEP_FPS_OPTIONS = [1, 8, 16, 22] as const
-const STEP_FPS_DEFAULT = 8
 const VIEW_ZOOM_MIN = 1
 const VIEW_ZOOM_MAX = 5
 const PLAYBACK_RATES = [0.5, 1, 2, 4] as const
@@ -59,19 +84,6 @@ const IS_MAC = /Mac|Macintosh/i.test(navigator.userAgent)
 const IS_WIN = /Windows/i.test(navigator.userAgent)
 /** Windows 上杀毒/索引常更久占用句柄；松开媒体后多等一会再 rename */
 const MEDIA_RELEASE_MS = IS_WIN ? 280 : 60
-const LS_THUMB = 'labelu.thumbSize'
-const LS_SIDEBAR = 'labelu.sidebarWidth'
-const LS_STEP_FPS = 'labelu.stepFps'
-const LS_TIMELINE_ZOOM = 'labelu.timelineZoomOnSelect'
-const LS_LOOP_SELECTION = 'labelu.loopSelection'
-const LS_PLAYBACK_RATE = 'labelu.playbackRate'
-const LS_ONLY_INCOMPLETE = 'labelu.onlyIncomplete'
-/** 分类保存根目录（跨重启）；批量与保存共用「根目录/类别名」 */
-const LS_SAVE_ROOT = 'labelu.categorySaveRoot'
-/** @deprecated 旧二次分类偏好，启动时迁移到 LS_SAVE_ROOT */
-const LS_RECLASSIFY_CUSTOM_DIR = 'labelu.reclassifyCustomDir'
-/** 选帧区高度：可拖大（占用播放区空间）；剪辑区按内容撑开且不可折叠 */
-const LS_FILMSTRIP_HEIGHT = 'labelu.filmstripHeight'
 const FILMSTRIP_HEIGHT_DEFAULT = 148
 const FILMSTRIP_HEIGHT_MIN = 96
 /** 播放区最小高度；选帧区最大高度 = 剩余空间，不另设硬顶 */
@@ -83,164 +95,6 @@ type FilmstripState = {
   which: 'in' | 'out'
   centerTime: number
   items: FilmstripItem[]
-}
-
-function loadStoredBool(key: string, fallback: boolean): boolean {
-  try {
-    const v = localStorage.getItem(key)
-    if (v === '1' || v === 'true') return true
-    if (v === '0' || v === 'false') return false
-  } catch {
-    /* ignore */
-  }
-  return fallback
-}
-
-function loadStoredNumber(key: string, fallback: number, min: number, max: number): number {
-  try {
-    const n = Number(localStorage.getItem(key))
-    if (Number.isFinite(n)) return clamp(n, min, max)
-  } catch {
-    /* ignore */
-  }
-  return fallback
-}
-
-function loadStepFps(): number {
-  const raw = loadStoredNumber(LS_STEP_FPS, STEP_FPS_DEFAULT, 1, 120)
-  if ((STEP_FPS_OPTIONS as readonly number[]).includes(raw)) return raw
-  return STEP_FPS_OPTIONS.reduce((best, opt) =>
-    Math.abs(opt - raw) < Math.abs(best - raw) ? opt : best
-  )
-}
-
-function loadStoredPlaybackRate(): number {
-  const raw = loadStoredNumber(LS_PLAYBACK_RATE, 1, 0.25, 8)
-  if ((PLAYBACK_RATES as readonly number[]).includes(raw)) return raw
-  return 1
-}
-
-type EdgeMoveResult =
-  | { ok: true; start: number; end: number }
-  | { ok: false; reason: string }
-
-function exportBlockingSelection(
-  start: number,
-  end: number,
-  clipExports: ExportRecord[]
-): ExportRecord | null {
-  const a = Math.min(start, end)
-  const b = Math.max(start, end)
-  return (
-    clipExports.find((e) => !e.approx && a < e.end - 0.02 && b > e.start + 0.02) ?? null
-  )
-}
-
-function explainPointerOutsideRemaining(
-  pointerTime: number,
-  remaining: TimeRange[],
-  clipExports: ExportRecord[]
-): string {
-  const hitExp = clipExports.find(
-    (e) => !e.approx && pointerTime >= e.start - 0.02 && pointerTime <= e.end + 0.02
-  )
-  if (hitExp) {
-    return `指针落在已分类片段「${hitExp.category}」（${formatTime(hitExp.start)}–${formatTime(hitExp.end)}），请拖到未分类灰色区域`
-  }
-  if (remaining.length === 0) return '没有可剪的未分类时段'
-  return '指针不在可剪的未分类时段内'
-}
-
-/**
- * 拖动/微调入出点：拖出点时锁定入点，拖入点时锁定出点；仅拖入点可跨剩余段跳转。
- */
-function tryMoveSelectionEdge(
-  which: 'in' | 'out',
-  pointerTime: number,
-  liveStart: number,
-  liveEnd: number,
-  remaining: TimeRange[],
-  stepFps: number,
-  clipExports: ExportRecord[]
-): EdgeMoveResult {
-  const tol = selectionTolerance(stepFps)
-  let ns = Math.min(liveStart, liveEnd)
-  let ne = Math.max(liveStart, liveEnd)
-
-  const ptrHost =
-    remaining.find((r) => pointerTime >= r.start - tol && pointerTime <= r.end + tol) ?? null
-  if (!ptrHost || !(ptrHost.end > ptrHost.start)) {
-    return {
-      ok: false,
-      reason: explainPointerOutsideRemaining(pointerTime, remaining, clipExports)
-    }
-  }
-
-  if (which === 'in') {
-    const neHost =
-      remaining.find((r) => ne >= r.start - tol && ne <= r.end + tol) ?? null
-    if (neHost && neHost !== ptrHost) {
-      const lo = ptrHost.start
-      const hi = ptrHost.end
-      const minGap = minSelectionGap(hi - lo)
-      const prefer = Math.min(Math.max(minGap, ne - ns, MIN_SELECTION_SECONDS), hi - lo)
-      ns = clamp(pointerTime, lo, Math.max(lo, hi - minGap))
-      ne = clamp(ns + prefer, ns + minGap, hi)
-    } else {
-      const host = ptrHost
-      const lo = host.start
-      const hi = host.end
-      const minGap = minSelectionGap(hi - lo)
-      ns = clamp(pointerTime, lo, Math.max(lo, ne - minGap))
-      if (ne - ns < minGap - 1e-6) ns = Math.max(lo, ne - minGap)
-    }
-  } else {
-    const nsHost =
-      remaining.find((r) => ns >= r.start - tol && ns <= r.end + tol) ?? null
-    if (!nsHost) {
-      return { ok: false, reason: '入点不在可剪区域内，请先调整入点' }
-    }
-    if (nsHost !== ptrHost) {
-      return {
-        ok: false,
-        reason: explainPointerOutsideRemaining(pointerTime, remaining, clipExports)
-      }
-    }
-    const lo = nsHost.start
-    const hi = nsHost.end
-    const minGap = minSelectionGap(hi - lo)
-    ne = clamp(pointerTime, Math.min(hi, ns + minGap), hi)
-    if (ne - ns < minGap - 1e-6) ne = Math.min(hi, ns + minGap)
-  }
-
-  if (ne - ns < MIN_SELECTION_SECONDS - 1e-6) {
-    return {
-      ok: false,
-      reason: `选区不能短于 ${MIN_SELECTION_SECONDS} 秒（当前可剪时段过短或入/出点过近）`
-    }
-  }
-
-  const hit = exportBlockingSelection(ns, ne, clipExports)
-  if (hit) {
-    return {
-      ok: false,
-      reason: `选区与已分类片段「${hit.category}」（${formatTime(hit.start)}–${formatTime(hit.end)}）重叠`
-    }
-  }
-
-  return { start: ns, end: ne, ok: true }
-}
-
-function validateSelectionRange(
-  start: number,
-  end: number,
-  remaining: TimeRange[],
-  clipExports: ExportRecord[],
-  stepFps: number
-): EdgeMoveResult {
-  const result = resolveClipSelection(start, end, remaining, clipExports, stepFps)
-  if (!result.ok) return { ok: false, reason: result.reason }
-  return { ok: true, start: result.start, end: result.end }
 }
 
 /** 默认选区：从可剪段起点到段尾（新视频即入点在片头、出点在片尾） */
@@ -460,32 +314,6 @@ type PendingSaveClip = {
   duration: number
 }
 
-function loadPersistedSaveRoot(): string {
-  try {
-    const v = (localStorage.getItem(LS_SAVE_ROOT) || '').trim()
-    if (v) return v
-    // 迁移旧版批量自选目录
-    const legacy = (localStorage.getItem(LS_RECLASSIFY_CUSTOM_DIR) || '').trim()
-    if (legacy) {
-      localStorage.setItem(LS_SAVE_ROOT, legacy)
-      return legacy
-    }
-  } catch {
-    /* ignore */
-  }
-  return ''
-}
-
-function persistSaveRoot(root: string): void {
-  try {
-    const r = root.trim()
-    if (r) localStorage.setItem(LS_SAVE_ROOT, r)
-  } catch {
-    /* ignore */
-  }
-}
-
-
 type TimelineMarker = {
   id: string
   time: number
@@ -599,6 +427,8 @@ export default function App(): React.JSX.Element {
   mediaUrlRef.current = mediaUrl
   const [duration, setDuration] = useState(0)
   const [fps, setFps] = useState(25)
+  const fpsRef = useRef(fps)
+  fpsRef.current = fps
   const [currentTime, setCurrentTime] = useState(0)
   const [playbackRate, setPlaybackRate] = useState(() => loadStoredPlaybackRate())
   const completedRef = useRef(false)
@@ -621,9 +451,18 @@ export default function App(): React.JSX.Element {
   const remainingRef = useRef<TimeRange[]>([])
   remainingRef.current = remaining
   const [clipExports, setClipExports] = useState<ExportRecord[]>([])
+  const clipExportsRef = useRef<ExportRecord[]>([])
+  clipExportsRef.current = clipExports
   const [selectedExportPath, setSelectedExportPath] = useState<string | null>(null)
+  const exportQueueStateRef = useRef({ active: false, pending: 0, currentLabel: null as string | null })
   /** 选区循环预览（空格播放，到出点后回到入点） */
   const [loopSelection, setLoopSelection] = useState(() => loadStoredBool(LS_LOOP_SELECTION, false))
+  const [hevcPrewarm, setHevcPrewarm] = useState(() => loadStoredBool(LS_HEVC_PREWARM, false))
+  const [exportQueueState, setExportQueueState] = useState({
+    active: false,
+    pending: 0,
+    currentLabel: null as string | null
+  })
   const [edgeDragTime, setEdgeDragTime] = useState<number | null>(null)
   const [timelineMarkers, setTimelineMarkers] = useState<TimelineMarker[]>([])
   const [crop, setCrop] = useState<CropRect>(FULL_CROP)
@@ -892,12 +731,6 @@ export default function App(): React.JSX.Element {
 
   useEffect(() => {
     loadCustomCategoryTags()
-    try {
-      // 旧版按类别持久化源目录；现改为仅本次运行有效
-      localStorage.removeItem('labelu.categorySaveDirs')
-    } catch {
-      /* ignore */
-    }
     void window.api.getCustomCategories().then((map) => {
       const hasMain =
         Object.entries(map || {}).some(([k, v]) => {
@@ -927,6 +760,20 @@ export default function App(): React.JSX.Element {
       /* ignore */
     }
   }, [loopSelection])
+
+  useEffect(() => {
+    persistBool(LS_HEVC_PREWARM, hevcPrewarm)
+    if (!hevcPrewarm) cancelHevcPrewarm()
+  }, [hevcPrewarm])
+
+  useEffect(
+    () =>
+      subscribeExportQueue((snap) => {
+        exportQueueStateRef.current = snap
+        setExportQueueState(snap)
+      }),
+    []
+  )
 
   useEffect(() => {
     try {
@@ -1056,37 +903,61 @@ export default function App(): React.JSX.Element {
     (start: number, end: number) => {
       const a = Math.min(start, end)
       const b = Math.max(start, end)
-      const pad = Math.max(2 / Math.max(1, stepFpsRef.current), (b - a) * 0.15, 0.35)
+      const pad = Math.max(
+        2 / Math.max(1, stepFpsRef.current),
+        (b - a) * 0.2,
+        // 短选区用较小衬垫，避免视窗仍过宽导致拖不到 0.04
+        Math.min(0.35, Math.max(0.1, (b - a) * 3))
+      )
+      const focusStart = clamp(a - pad, 0, duration)
+      const focusEnd = clamp(b + pad, 0, duration)
+      // 同步更新 ref，避免拖拽当帧仍用旧全片视窗（1px≈0.2s）
+      timelineViewRef.current = {
+        start: focusStart,
+        end: focusEnd,
+        span: Math.max(0.05, focusEnd - focusStart)
+      }
       setTimelineFocus({
-        start: clamp(a - pad, 0, duration),
-        end: clamp(b + pad, 0, duration)
+        start: focusStart,
+        end: focusEnd
       })
     },
     [duration]
   )
 
   const clearTimelineFocus = useCallback(() => {
+    const span = Math.max(0.05, duration || 0.05)
+    timelineViewRef.current = { start: 0, end: Math.max(0, duration), span }
     setTimelineFocus(null)
-  }, [])
+  }, [duration])
 
   const timelineFocusRef = useRef(timelineFocus)
   timelineFocusRef.current = timelineFocus
   const timelineZoomOnSelectRef = useRef(timelineZoomOnSelect)
   timelineZoomOnSelectRef.current = timelineZoomOnSelect
 
-  /** 选区模式下：选段超出当前视窗时重载聚焦 */
+  /**
+   * 选区模式下保证时间轴视窗盖住选区；选区相对视窗过短时再放大。
+   * 拖手柄时的精密放大在 startDragHandle 内单独处理（长片全览约 1px≈0.2s）。
+   */
   const ensureTimelineFocusCovers = useCallback(
     (start: number, end: number) => {
       if (!timelineZoomOnSelectRef.current) return
       const a = Math.min(start, end)
       const b = Math.max(start, end)
-      if (!(b - a >= 0.05)) return
+      const minLen = minSelectionGap(Number.POSITIVE_INFINITY, fpsRef.current)
+      if (!(b - a >= minLen - 1e-6)) return
       const focus = timelineFocusRef.current
-      if (!focus || a < focus.start - 1e-3 || b > focus.end + 1e-3) {
+      const selLen = b - a
+      const viewSpan = focus
+        ? Math.max(0.05, focus.end - focus.start)
+        : Math.max(0.05, duration)
+      const tooCoarse = viewSpan > Math.max(selLen * 8, minLen * 25, 0.8)
+      if (!focus || a < focus.start - 1e-3 || b > focus.end + 1e-3 || tooCoarse) {
         enterTimelineFocus(a, b)
       }
     },
-    [enterTimelineFocus]
+    [enterTimelineFocus, duration]
   )
 
   /** 选段完成：仅在「选区」模式下把时间轴放大到选段 */
@@ -1094,7 +965,8 @@ export default function App(): React.JSX.Element {
     (start: number, end: number) => {
       const a = Math.min(start, end)
       const b = Math.max(start, end)
-      if (!(b - a >= 0.05)) return
+      const minLen = minSelectionGap(Number.POSITIVE_INFINITY, fpsRef.current)
+      if (!(b - a >= minLen - 1e-6)) return
       if (!timelineZoomOnSelectRef.current) {
         clearTimelineFocus()
         return
@@ -1113,7 +985,8 @@ export default function App(): React.JSX.Element {
     setTimelineZoomOnSelect(true)
     const a = Math.min(selStartRef.current, selEndRef.current)
     const b = Math.max(selStartRef.current, selEndRef.current)
-    if (b - a >= 0.05) enterTimelineFocus(a, b)
+    const minLen = minSelectionGap(Number.POSITIVE_INFINITY, fpsRef.current)
+    if (b - a >= minLen - 1e-6) enterTimelineFocus(a, b)
   }, [enterTimelineFocus])
 
   const timeToPct = useCallback(
@@ -1138,16 +1011,6 @@ export default function App(): React.JSX.Element {
     },
     [timeToPct]
   )
-
-  const errText = (err: unknown): string => {
-    if (err instanceof Error) return err.message
-    if (typeof err === 'string') return err
-    try {
-      return JSON.stringify(err)
-    } catch {
-      return String(err)
-    }
-  }
 
   const toastTimerRef = useRef(0)
   const showToast = useCallback((msg: string) => {
@@ -1188,7 +1051,8 @@ export default function App(): React.JSX.Element {
       if (!Number.isFinite(rawA) || !Number.isFinite(rawB)) return
       const a = Math.min(rawA, rawB)
       const b = Math.max(rawA, rawB)
-      if (b - a < 0.05) {
+      const minLen = minSelectionGap(Number.POSITIVE_INFINITY, fpsRef.current)
+      if (b - a < minLen - 1e-6) {
         setStatus('选区过短，无法播放')
         return
       }
@@ -1293,7 +1157,7 @@ export default function App(): React.JSX.Element {
           ? `选区播放异常：目标 ${formatTime(a)}，实际 ${formatTime(landed)}`
           : loopSelectionRef.current
             ? `循环播放选区 ${formatTime(a)} → ${formatTime(b)}`
-            : `播放选区 ${formatTime(a)} → ${formatTime(b)}（${(b - a).toFixed(1)}秒）`
+            : `播放选区 ${formatTime(a)} → ${formatTime(b)}（${(b - a).toFixed(2)}秒）`
       )
 
       try {
@@ -1597,23 +1461,25 @@ export default function App(): React.JSX.Element {
       const refreshStrip = opts?.refreshStrip !== false
       // 方向键/步进变更时作废「播放结束后按旧边沿刷选帧」
       filmstripAfterPlayTokenRef.current++
-      let liveStart = snapToFrame(Math.min(selStartRef.current, selEndRef.current), stepFps)
-      let liveEnd = snapToFrame(Math.max(selStartRef.current, selEndRef.current), stepFps)
+      // 保留当前入/出点精度，勿整段吸到步进网格（默认步进 8 → 0.125s，会把 0.04s 短选区抬高）
+      const curA = Math.min(selStartRef.current, selEndRef.current)
+      const curB = Math.max(selStartRef.current, selEndRef.current)
       const moved = tryMoveSelectionEdge(
         which,
         nextTime,
-        liveStart,
-        liveEnd,
+        curA,
+        curB,
         remaining,
         stepFps,
-        clipExports
+        clipExports,
+        fps
       )
       if (!moved.ok) {
         if (opts?.toastOnFail) showToast(moved.reason)
         return null
       }
-      liveStart = snapToFrame(moved.start, stepFps)
-      liveEnd = snapToFrame(moved.end, stepFps)
+      const liveStart = moved.start
+      const liveEnd = moved.end
       selStartRef.current = liveStart
       selEndRef.current = liveEnd
       setSelStart(liveStart)
@@ -1648,6 +1514,7 @@ export default function App(): React.JSX.Element {
       seekPreviewFrame,
       scheduleFilmstrip,
       stepFps,
+      fps,
       ensureTimelineFocusCovers,
       ensureScrubReady,
       showToast
@@ -1657,12 +1524,11 @@ export default function App(): React.JSX.Element {
   /** 点击选帧区：立刻用缩略图盖住播放区，并同步底层 currentTime（不自动播放） */
   const selectFilmstripFrame = useCallback(
     (which: 'in' | 'out', time: number, thumbUrl: string | null) => {
-      const snapped = snapToFrame(time, stepFpsRef.current)
-      // 1) 立刻换画面：用已有缩略图覆盖播放区
+      // 中心格是精确入/出点，邻格已在步进点上；此处勿再 snapToFrame，否则短选区会被吸宽
       if (thumbUrl) setStillFrameUrl(thumbUrl)
 
-      const edge = applyFineTuneEdge(which, snapped, { preview: false, refreshStrip: false })
-      const showAt = edge ?? snapped
+      const edge = applyFineTuneEdge(which, time, { preview: false, refreshStrip: false })
+      const showAt = edge ?? time
 
       void (async () => {
         const gen = ++playbackGenRef.current
@@ -1738,9 +1604,9 @@ export default function App(): React.JSX.Element {
     const which = fineTuneWhichRef.current
     if (!which) return
     const edge = which === 'in' ? selStartRef.current : selEndRef.current
-    // 按新步进重吸附，并同步播放画面 + 选帧间距
-    applyFineTuneEdge(which, snapToFrame(edge, stepFps))
-    // 仅在步进变化时重同步；不要因 applyFineTuneEdge 引用变化误触发
+    // 只刷新选帧间距，不重吸附入/出点（否则短选区会被步进网格吸宽）
+    ensureScrubReady()
+    scheduleFilmstrip(which, edge)
     // eslint-disable-next-line react-hooks/exhaustive-deps -- stepFps only
   }, [stepFps])
 
@@ -2358,6 +2224,12 @@ export default function App(): React.JSX.Element {
       }
       const merged = Array.from(byPath.values()).sort((a, b) => compareMediaPaths(a.path, b.path))
       setVideos(merged)
+      if (hevcPrewarm) {
+        startHevcPrewarm(
+          window.api,
+          merged.filter((v) => !itemIsImage(v)).map((v) => v.path)
+        )
+      }
 
       if (added > 0) {
         showToast(`已追加 ${added} 个新媒体${prevSnapshot.length ? `（列表共 ${merged.length} 个）` : ''}`)
@@ -2408,7 +2280,7 @@ export default function App(): React.JSX.Element {
       })
       void refreshRemainingHints(merged)
     },
-    [loadVideoAt, showToast, videos, index, refreshRemainingHints]
+    [loadVideoAt, showToast, videos, index, refreshRemainingHints, hevcPrewarm]
   )
 
   /** 对话框 / 拖放导入：若同时含视频与图片，先询问加载范围 */
@@ -2883,16 +2755,18 @@ export default function App(): React.JSX.Element {
 
   const runSaveClipExport = useCallback(
     async (payload: PendingSaveClip, opts?: ClassifyDestApiOpts): Promise<void> => {
-      if (savingRef.current || busy) {
-        showToast('正在保存，请稍候…')
-        return
+      if (savingRef.current) {
+        throw new Error('正在保存，请稍候…')
       }
       savingRef.current = true
+      // 导出优先：停掉后台预热，避免与 ffmpeg 抢槽位
+      cancelHevcPrewarm()
       const { category, isImage, saveModal: modal, sourcePath, duration: mediaDuration } = payload
       ignoreEnterOpenUntilRef.current = performance.now() + 600
       setSaveModal(null)
       const remBefore = remainingRef.current.map((r) => ({ ...r }))
-      const exportCount = clipExports.filter((e) => !e.approx).length
+      // 用 ref：排队任务可能在前一次导出更新 clipExports 之后才执行
+      const exportCount = clipExportsRef.current.filter((e) => !e.approx).length
       const moveOriginal = isWholeFileClassifySave({
         isImage,
         start: modal.start,
@@ -2918,16 +2792,17 @@ export default function App(): React.JSX.Element {
             ).trim()
           }
           if (!destOpts.customDestDir) {
-            showToast('请选择分类根目录')
-            return
+            throw new Error('请选择分类根目录')
           }
           persistSaveRoot(destOpts.customDestDir)
           sessionCustomSaveRootRef.current = destOpts.customDestDir
           lastClassifyOptsRef.current = destOpts
 
+          const listNow = videosRef.current
+          const idxNow = indexRef.current
           const snap =
-            videos.find((v) => sameMediaIdentity(v.path, sourcePath)) ||
-            videos[index] ||
+            listNow.find((v) => sameMediaIdentity(v.path, sourcePath)) ||
+            listNow[idxNow] ||
             null
           const { results, moves } = await window.api.batchClassify(
             [sourcePath],
@@ -2976,7 +2851,7 @@ export default function App(): React.JSX.Element {
           }
 
           const movedKey = normMediaPath(sourcePath)
-          const nextList = videos.filter((v) => normMediaPath(v.path) !== movedKey)
+          const nextList = listNow.filter((v) => normMediaPath(v.path) !== movedKey)
           setVideos(nextList)
           setSelectedIds(new Set())
           setSecondaryIds(new Set())
@@ -3005,7 +2880,7 @@ export default function App(): React.JSX.Element {
             setMediaUrl('')
             setStatus('列表已空')
           } else {
-            const nextIdx = Math.min(index, nextList.length - 1)
+            const nextIdx = Math.min(idxNow, nextList.length - 1)
             await loadVideoAt(nextIdx, nextList)
           }
           return
@@ -3021,8 +2896,7 @@ export default function App(): React.JSX.Element {
           ).trim()
         }
         if (!exportDest.customDestDir) {
-          showToast('请选择分类根目录')
-          return
+          throw new Error('请选择分类根目录')
         }
         persistSaveRoot(exportDest.customDestDir)
         sessionCustomSaveRootRef.current = exportDest.customDestDir
@@ -3119,9 +2993,21 @@ export default function App(): React.JSX.Element {
           }
         }).then(() => refreshHistoryState())
 
-        if (!isImage && totalDuration(rem) <= 0.05) {
-          const ok = await finishCurrentRef.current()
-          if (ok) await goRelativeRef.current(1)
+        if (!isImage && totalDuration(rem) < minSelectionGap(Number.POSITIVE_INFINITY, fpsRef.current)) {
+          // 仍有排队导出时不要标记完成/切片，否则源路径可能被改成 _done，后续任务会失败
+          const waiting = exportQueueStateRef.current.pending
+          if (waiting > 0) {
+            showToast('可剪剩余已不足最短选区；仍有导出排队，请处理完后再点完成')
+            const span = selectionSpanFromRemaining(rem)
+            setSelStart(span.start)
+            setSelEnd(span.end)
+            setCrop(FULL_CROP)
+            setCropActive(false)
+            setCropCommitted(false)
+          } else {
+            const ok = await finishCurrentRef.current()
+            if (ok) await goRelativeRef.current(1)
+          }
         } else {
           const span = selectionSpanFromRemaining(rem)
           setSelStart(span.start)
@@ -3131,6 +3017,11 @@ export default function App(): React.JSX.Element {
           setCropCommitted(false)
         }
       } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err)
+        setStatus('导出失败')
+        if (msg === '请选择分类根目录' || msg === '正在保存，请稍候…' || msg === '导出队列已取消') {
+          throw err
+        }
         reportAndToast(
           showToast,
           isImage ? 'exportImage' : 'exportClip',
@@ -3139,22 +3030,17 @@ export default function App(): React.JSX.Element {
           { path: sourcePath, category },
           { forceMail: true }
         )
-        setStatus('导出失败')
       } finally {
         savingRef.current = false
       }
     },
     [
-      busy,
       showToast,
       syncRemainingHint,
       clearTimelineFocus,
       refreshHistoryState,
-      clipExports,
       stepFps,
       releaseMediaForPaths,
-      videos,
-      index,
       loadVideoAt
     ]
   )
@@ -4020,6 +3906,7 @@ export default function App(): React.JSX.Element {
         )
       }
       loadGenRef.current++
+      cancelHevcPrewarm()
       setVideos([])
       setIndex(0)
       setMediaUrl('')
@@ -4295,7 +4182,9 @@ export default function App(): React.JSX.Element {
   applyOneClickUpdateRef.current = applyOneClickUpdate
 
   const openSaveModal = useCallback(async () => {
-    if (!current || busy) return
+    if (!current) return
+    // 与 canSave 一致：仅导出队列占用 busy 时仍可打开弹窗继续排队
+    if (busy && !exportQueueStateRef.current.active) return
     if (selectedExportPath) {
       showToast('正在查看已分类结果，请先按 Delete 删除后再裁剪，或取消选中后继续')
       return
@@ -4305,7 +4194,7 @@ export default function App(): React.JSX.Element {
     let start = isImage ? 0 : Math.min(selStart, selEnd)
     let end = isImage ? Math.max(duration, IMAGE_TIMELINE_SECONDS) : Math.max(selStart, selEnd)
     if (!isImage) {
-      const check = resolveClipSelection(start, end, remaining, clipExports, stepFps)
+      const check = resolveClipSelection(start, end, remaining, clipExports, stepFps, fps)
       if (!check.ok) {
         openConfirmModal({
           title: '无法保存片段',
@@ -4359,6 +4248,7 @@ export default function App(): React.JSX.Element {
     mediaUrl,
     duration,
     stepFps,
+    fps,
     showToast,
     clearCompletedMark,
     openConfirmModal
@@ -4437,10 +4327,6 @@ export default function App(): React.JSX.Element {
 
   const confirmSave = async (categoryOverride?: string): Promise<void> => {
     if (!current || !saveModal) return
-    if (savingRef.current || busy) {
-      showToast('正在保存，请稍候…')
-      return
-    }
     const category = (categoryOverride ?? categoryInput).trim()
     if (!category) {
       showToast('请选择类别')
@@ -4461,15 +4347,25 @@ export default function App(): React.JSX.Element {
     const pending: PendingSaveClip = {
       category,
       isImage,
-      saveModal,
+      saveModal: { ...saveModal },
       sourcePath: current.path,
       duration
     }
-    await runSaveClipExport(pending, {
-      customDestDir: root
-    })
     persistSaveRoot(root)
     sessionCustomSaveRootRef.current = root
+    setSaveModal(null)
+    if (exportQueueState.active || exportQueueState.pending > 0) {
+      const ahead =
+        exportQueueState.pending + (exportQueueState.currentLabel ? 1 : 0)
+      showToast(`已加入导出队列（前方 ${ahead} 项）`)
+    }
+    void enqueueExportJob({
+      id: `save-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
+      label: isImage ? `保存图片→${category}` : `保存片段→${category}`,
+      run: () => runSaveClipExport(pending, { customDestDir: root })
+    }).catch((err) => {
+      showToast(err instanceof Error ? err.message : String(err))
+    })
   }
   confirmSaveRef.current = confirmSave
 
@@ -4964,7 +4860,8 @@ export default function App(): React.JSX.Element {
       selEndRef.current,
       remaining,
       clipExports,
-      stepFps
+      stepFps,
+      fps
     )
     if (!resolved.ok) return
     if (
@@ -4976,7 +4873,7 @@ export default function App(): React.JSX.Element {
       setSelStart(resolved.start)
       setSelEnd(resolved.end)
     }
-  }, [current, selectedExportPath, remaining, clipExports, stepFps])
+  }, [current, selectedExportPath, remaining, clipExports, stepFps, fps])
 
   useEffect(() => {
     syncSelectionToRemaining()
@@ -5007,8 +4904,10 @@ export default function App(): React.JSX.Element {
       const a = Math.min(selStartRef.current, selEndRef.current)
       const b = Math.max(selStartRef.current, selEndRef.current)
       // 空格播放：按当前选区播；区外或已到出点则从入点重播
-      if (b - a >= 0.05) {
-        if (v.currentTime < a - 0.02 || v.currentTime >= b - 0.05) {
+      // 出点容差用 SELECTION_TOLERANCE，勿与最小选区时长绑定（短选区否则会一直重播）
+      const minLen = minSelectionGap(Number.POSITIVE_INFINITY, fpsRef.current)
+      if (b - a >= minLen - 1e-6) {
+        if (v.currentTime < a - 0.02 || v.currentTime >= b - SELECTION_TOLERANCE) {
           void playSelection(a, b)
           return
         }
@@ -5478,12 +5377,13 @@ export default function App(): React.JSX.Element {
       }
       if (e.key === '[') {
         e.preventDefault()
-        applyFineTuneEdge('in', snapToFrame(currentTime, stepFps), { toastOnFail: true })
+        // 按片源帧对齐，避免步进网格（默认 0.125s）抬高短选区
+        applyFineTuneEdge('in', snapToFrame(currentTime, fps), { toastOnFail: true })
         return
       }
       if (e.key === ']') {
         e.preventDefault()
-        applyFineTuneEdge('out', snapToFrame(currentTime, stepFps), { toastOnFail: true })
+        applyFineTuneEdge('out', snapToFrame(currentTime, fps), { toastOnFail: true })
       }
     }
     window.addEventListener('keydown', onKey)
@@ -5532,9 +5432,6 @@ export default function App(): React.JSX.Element {
 
   const findExportAt = (t: number): ExportRecord | null =>
     clipExports.find((e) => t >= e.start - 0.02 && t <= e.end + 0.02) ?? null
-
-  const selectionHitsExport = (start: number, end: number): ExportRecord | null =>
-    exportBlockingSelection(start, end, clipExports)
 
   const onTrackPointer = (e: React.MouseEvent): void => {
     // 左键点轨道：移动白色播放头；入/出点仅通过拖拽两端手柄调整
@@ -5606,6 +5503,9 @@ export default function App(): React.JSX.Element {
     let lastPreviewAt = 0
     let lastDragToastReason: string | null = null
     let lastDragToastAt = 0
+    /** 拖短时曾碰上「每像素过粗」限制，松手后弹窗说明 */
+    let hitCoarseTimelineFloor = false
+    let coarseSecPerPx = 0
     const notifyEdgeDragBlocked = (reason: string): void => {
       lastFailReason = reason
       const now = performance.now()
@@ -5640,9 +5540,27 @@ export default function App(): React.JSX.Element {
       return view.start + ratio * view.span
     }
 
+    const timelineResolution = (): { secPerPx: number; trackW: number; minLen: number } => {
+      const trackW = Math.max(1, trackRef.current?.getBoundingClientRect().width ?? 800)
+      const view = timelineViewRef.current
+      const minLen = minSelectionGap(Number.POSITIVE_INFINITY, fpsRef.current)
+      return { secPerPx: view.span / trackW, trackW, minLen }
+    }
+
+    /** 1px 已接近或超过最短选区 → 拖不到约 0.04s */
+    const isTimelineTooCoarse = (secPerPx: number, minLen: number): boolean =>
+      secPerPx >= minLen * 0.5 - 1e-9
+
     const move = (ev: MouseEvent): void => {
       const t = timeFromPointer(ev.clientX)
       lastPointerTime = t
+      const { secPerPx, minLen } = timelineResolution()
+      const shrinking =
+        which === 'out' ? t < liveEnd - secPerPx * 0.25 : t > liveStart + secPerPx * 0.25
+      if (shrinking && isTimelineTooCoarse(secPerPx, minLen)) {
+        hitCoarseTimelineFloor = true
+        coarseSecPerPx = secPerPx
+      }
       const moved = tryMoveSelectionEdge(
         which,
         t,
@@ -5650,7 +5568,8 @@ export default function App(): React.JSX.Element {
         liveEnd,
         remaining,
         stepFps,
-        clipExports
+        clipExports,
+        fpsRef.current
       )
       if (!moved.ok) {
         notifyEdgeDragBlocked(moved.reason)
@@ -5661,9 +5580,10 @@ export default function App(): React.JSX.Element {
       liveEnd = moved.end
       setSelStart(liveStart)
       setSelEnd(liveEnd)
-      ensureTimelineFocusCovers(liveStart, liveEnd)
-      setEdgeDragTime(which === 'in' ? liveStart : liveEnd)
-      pendingSeek = which === 'in' ? liveStart : liveEnd
+
+      const edge = which === 'in' ? liveStart : liveEnd
+      setEdgeDragTime(edge)
+      pendingSeek = edge
       if (!seekRaf) seekRaf = requestAnimationFrame(flushSeek)
     }
 
@@ -5676,14 +5596,25 @@ export default function App(): React.JSX.Element {
       setEdgeDragTime(null)
 
       const fpsStep = stepFpsRef.current
-      liveStart = snapToFrame(liveStart, fpsStep)
-      liveEnd = snapToFrame(liveEnd, fpsStep)
-      const host =
-        remaining.find((r) => liveStart >= r.start - 0.05 && liveEnd <= r.end + 0.05) ||
-        findRemainingAt((liveStart + liveEnd) / 2)
+      const dragTol = selectionTolerance(fpsStep)
+      let host =
+        remaining.find(
+          (r) => liveStart >= r.start - dragTol && liveEnd <= r.end + dragTol
+        ) || findRemainingAt((liveStart + liveEnd) / 2)
+      ;({ start: liveStart, end: liveEnd } = snapSelectionEdges(
+        liveStart,
+        liveEnd,
+        fpsStep,
+        host
+      ))
+      host =
+        remaining.find(
+          (r) => liveStart >= r.start - dragTol && liveEnd <= r.end + dragTol
+        ) || host
       const lo = host?.start ?? 0
       const hi = host?.end ?? duration
-      const minGap = minSelectionGap(hi - lo)
+      const sourceFps = fpsRef.current
+      const minGap = minSelectionGap(hi - lo, sourceFps)
       if (which === 'in') {
         const hit = snapEdgeToNearbyMarker(liveStart, lo, liveEnd - minGap)
         liveStart = hit.time
@@ -5694,16 +5625,21 @@ export default function App(): React.JSX.Element {
       if (liveEnd - liveStart < minGap) {
         if (which === 'in') liveStart = clamp(liveEnd - minGap, lo, liveEnd)
         else liveEnd = clamp(liveStart + minGap, liveStart, hi)
-        liveStart = snapToFrame(liveStart, fpsStep)
-        liveEnd = snapToFrame(liveEnd, fpsStep)
       }
+      ;({ start: liveStart, end: liveEnd } = snapSelectionEdges(
+        liveStart,
+        liveEnd,
+        fpsStep,
+        host
+      ))
 
       const finalCheck = validateSelectionRange(
         liveStart,
         liveEnd,
         remaining,
         clipExports,
-        fpsStep
+        fpsStep,
+        sourceFps
       )
       const pointerMoved =
         Math.abs(lastPointerTime - startEdge) > frameDuration(fpsStep) * 0.25
@@ -5756,6 +5692,54 @@ export default function App(): React.JSX.Element {
       )
       refocusTimelineToSelection(liveStart, liveEnd)
       setFineTuneWhich(which)
+
+      let showedCoarseModal = false
+      if (hitCoarseTimelineFloor) {
+        const { secPerPx, trackW, minLen } = timelineResolution()
+        const stillCoarse = isTimelineTooCoarse(secPerPx, minLen)
+        const stillLong = liveEnd - liveStart > minLen + Math.max(secPerPx, coarseSecPerPx) * 1.5
+        if (stillCoarse || stillLong) {
+          showedCoarseModal = true
+          const px = stillCoarse ? secPerPx : coarseSecPerPx
+          const pxText = px >= 0.1 ? px.toFixed(2) : px.toFixed(3)
+          const minText = formatMinSelectionSeconds(minLen)
+          openConfirmModal({
+            title: '时间轴过粗，无法拖到最短',
+            message: [
+              `当前时间轴约每像素 ${pxText} 秒，而最短选区为 ${minText} 秒。`,
+              '长片全览时拖动手柄分辨率不够，所以拖不到更短。',
+              '',
+              '请先放大时间轴再拖：点「放大后继续」，或把下方「轴」切到「选区」。'
+            ].join('\n'),
+            confirmText: '放大后继续',
+            onConfirm: () => {
+              setTimelineZoomOnSelect(true)
+              const edge = which === 'in' ? liveStart : liveEnd
+              const precisionSpan = Math.max(0.8, (minLen * trackW) / 10)
+              const half = precisionSpan / 2
+              const focusStart = clamp(edge - half, 0, duration)
+              const focusEnd = clamp(edge + half, 0, duration)
+              timelineViewRef.current = {
+                start: focusStart,
+                end: focusEnd,
+                span: Math.max(0.05, focusEnd - focusStart)
+              }
+              setTimelineFocus({ start: focusStart, end: focusEnd })
+              setFineTuneWhich(which)
+              ensureScrubReady()
+              scheduleFilmstrip(which, edge)
+              showToast(`已放大手柄附近，可继续拖到约 ${minText} 秒`)
+            }
+          })
+        }
+      }
+
+      if (showedCoarseModal) {
+        ensureScrubReady()
+        scheduleFilmstrip(which, which === 'in' ? liveStart : liveEnd)
+        return
+      }
+
       const afterPlayToken = ++filmstripAfterPlayTokenRef.current
       if (which === 'in') {
         void playSelection(liveStart, liveEnd).finally(() => {
@@ -6028,15 +6012,22 @@ export default function App(): React.JSX.Element {
 
   const selLen = Math.abs(selEnd - selStart)
   const selectionMeta = useMemo(() => {
-    const a = snapToFrame(Math.min(selStart, selEnd), stepFps)
-    const b = snapToFrame(Math.max(selStart, selEnd), stepFps)
+    const rawA = Math.min(selStart, selEnd)
+    const rawB = Math.max(selStart, selEnd)
+    const tol = selectionTolerance(stepFps)
+    const host =
+      remaining.find((r) => rawA >= r.start - tol && rawB <= r.end + tol) ?? null
+    const { start: a, end: b } = snapSelectionEdges(rawA, rawB, stepFps, host)
     const len = Math.max(0, b - a)
-    const lenText = len.toFixed(1)
+    const lenText = len.toFixed(2)
     return { lenText, a, b }
-  }, [selStart, selEnd, stepFps])
+  }, [selStart, selEnd, stepFps, remaining])
+  const minSaveGap = minSelectionGap(duration > 0 ? duration : Number.POSITIVE_INFINITY, fps)
+  /** 导出队列占用 busy 时仍可再排队；其它 busy（批量等）则禁用保存 */
+  const saveBlockedByBusy = busy && !exportQueueState.active
   const canSave = currentIsImage
-    ? !busy && !!current && !selectedExportPath
-    : selLen >= MIN_SELECTION_SECONDS && !busy && !!current && !selectedExportPath
+    ? !saveBlockedByBusy && !!current && !selectedExportPath
+    : selLen >= minSaveGap - 1e-6 && !saveBlockedByBusy && !!current && !selectedExportPath
 
   const recoverCurrent = recoverModal?.sessions[recoverModal.index]
 
@@ -6055,19 +6046,38 @@ export default function App(): React.JSX.Element {
       }}
       onDrop={onDrop}
     >
-      {busy && (
+      {(busy || exportQueueState.active) && (
         <div className="busy-banner app-banner">
-          <span>{busyProgress || '正在处理，请勿切换或关闭…'}</span>
+          <span>
+            {busyProgress ||
+              (exportQueueState.currentLabel
+                ? `${exportQueueState.currentLabel}${
+                    exportQueueState.pending > 0
+                      ? `（队列剩余 ${exportQueueState.pending}）`
+                      : ''
+                  }`
+                : '正在处理，请勿切换或关闭…')}
+          </span>
           <button
             type="button"
             className="busy-cancel-btn"
             onClick={() => {
+              cancelHevcPrewarm()
+              const cleared = clearPendingExportJobs()
               void window.api.cancelBusyWork().then((r) => {
-                if (r.ok) {
+                if (r.ok && cleared > 0) {
+                  showToast(
+                    `已请求取消当前任务，并丢弃排队 ${cleared} 项；批量移动已完成项可用 ${MOD_KEY}+Z 撤回`
+                  )
+                } else if (r.ok) {
                   showToast(
                     `已请求取消。导出会尽快中止；批量移动：已完成项可用 ${MOD_KEY}+Z 撤回`
                   )
-                } else showToast(r.message || '无法取消')
+                } else if (cleared > 0) {
+                  showToast(`已丢弃排队 ${cleared} 项`)
+                } else {
+                  showToast(r.message || '无法取消')
+                }
               })
             }}
           >
@@ -7048,6 +7058,14 @@ export default function App(): React.JSX.Element {
                   </button>
                   <button
                     type="button"
+                    className={hevcPrewarm ? 'active-toggle' : ''}
+                    title="导入后后台预生成 HEVC 兼容预览（可能占 CPU/磁盘）"
+                    onClick={() => setHevcPrewarm((v) => !v)}
+                  >
+                    {hevcPrewarm ? '预热开' : '预热关'}
+                  </button>
+                  <button
+                    type="button"
                     disabled={!mediaUrl}
                     title="在播放头添加标记（快捷键 M；Alt+M 清除）"
                     onClick={() => addTimelineMarker()}
@@ -7235,7 +7253,7 @@ export default function App(): React.JSX.Element {
                   : '全画面'
                 : `${formatTime(saveModal.start)} – ${formatTime(saveModal.end)}（${(
                     saveModal.end - saveModal.start
-                  ).toFixed(1)}秒）${saveModal.cropActive ? ' · 含画面裁切' : ' · 全画面'}`}
+                  ).toFixed(2)}秒）${saveModal.cropActive ? ' · 含画面裁切' : ' · 全画面'}`}
             </p>
             <div className="save-clip-preview">
               {(() => {

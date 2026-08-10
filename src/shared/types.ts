@@ -5,7 +5,14 @@ export const IMAGE_EXTENSIONS = ['.jpg', '.jpeg', '.png', '.webp', '.bmp', '.gif
 
 export const MEDIA_EXTENSIONS = [...VIDEO_EXTENSIONS, ...IMAGE_EXTENSIONS] as const
 
-export const MIN_SELECTION_SECONDS = 0.5
+/** 时间轴编辑吸附单位（秒）：入/出点松手与文件名毫秒对齐 */
+export const EDIT_UNIT_SECONDS = 0.01
+
+/**
+ * 最小选区时长下限（秒）。
+ * 实际可保存长度约 0.04s（编辑帧率按至少 25fps 计的一帧）。
+ */
+export const MIN_SELECTION_SECONDS = 0.04
 
 /** 图片在时间轴上的虚拟时长（满足最小选区，便于复用裁切保存流程） */
 export const IMAGE_TIMELINE_SECONDS = 2
