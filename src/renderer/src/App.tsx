@@ -3,7 +3,7 @@ import type { CropRect, ExportRecord, SessionState, TimeRange, VideoItem } from 
 import type { WorkspaceResumeSnapshot, ClassifyDestApiOpts } from '../../shared/labeluApi'
 import { IMAGE_TIMELINE_SECONDS, MIN_SELECTION_SECONDS, isImagePath } from '../../shared/types'
 import { clamp, computeRemainingFromExports, formatTime, formatTimecode, formatTimelineTime, formatMinSelectionSeconds, frameDuration, frameIndex, isMeaningfulCrop, minSelectionGap, resolveClipSelection, SELECTION_TOLERANCE, selectionTolerance, snapSelectionEdges, snapToFrame, stepByFrames, totalDuration, sanitizeName, compareMediaPaths, joinMediaDir, mediaDirname, mediaBasename, withoutCompletedFileName } from '../../shared/utils'
-import { isPresetCategory, applyCategoryTagsPersistPayload, getCategoryTagsPersistPayload, loadCustomCategoryTags, saveCustomCategoryTags, categoryShadeStyle, tryRemoveCategoryTag, findVisibleCategoryGroup } from '../../shared/categories'
+import { isPresetCategory, applyClassifyTasksPersistPayload, getClassifyTasksPersistPayload, loadClassifyTasks, saveClassifyTasks, categoryShadeStyle, tryRemoveCategoryTag, findVisibleCategoryGroup } from '../../shared/categories'
 import { filmstripOrder, seekAndCaptureFrame, seekVideo } from './frameCapture'
 import { codecMayNeedProxyFallback, waitForDecodedFrame } from './playbackHealth'
 import { CategoryChips } from './CategoryChips'
@@ -19,7 +19,6 @@ import {
   LS_LOOP_SELECTION,
   LS_PLAYBACK_RATE,
   LS_ONLY_INCOMPLETE,
-  LS_SAVE_ROOT,
   LS_FILMSTRIP_HEIGHT,
   LS_HEVC_PREWARM,
   loadStoredBool,
@@ -28,6 +27,7 @@ import {
   loadStoredPlaybackRate,
   loadPersistedSaveRoot,
   persistSaveRoot,
+  clearPersistedSaveRoot,
   persistBool
 } from './appPrefs'
 import {
@@ -60,6 +60,13 @@ function categoryDirUnderRoot(rootDir: string, category: string): string {
   if (!root) return cat && cat !== 'unnamed' ? cat : ''
   if (!cat || cat === 'unnamed') return root
   return joinMediaDir(root, cat)
+}
+
+/** 根目录是否相对该源文件的「当前文件夹」默认有改动 */
+function isCustomSaveRoot(root: string, sourcePath: string): boolean {
+  const r = root.trim()
+  if (!r || !sourcePath) return false
+  return normMediaPath(r) !== normMediaPath(defaultSaveRootDir(sourcePath))
 }
 
 const THUMB_SIZE_MIN = 64
@@ -488,6 +495,17 @@ export default function App(): React.JSX.Element {
   const [saveDestRoot, setSaveDestRoot] = useState('')
   /** 跨重启记住的分类根目录；空则按当前文件推算默认 */
   const sessionCustomSaveRootRef = useRef<string | null>(loadPersistedSaveRoot() || null)
+  /** 仅记住相对「当前文件夹」有改动的根目录；默认路径不落盘 */
+  const rememberOrClearSaveRoot = useCallback((root: string, sourcePath: string) => {
+    const r = root.trim()
+    if (!r || !isCustomSaveRoot(r, sourcePath)) {
+      clearPersistedSaveRoot()
+      sessionCustomSaveRootRef.current = null
+      return
+    }
+    persistSaveRoot(r)
+    sessionCustomSaveRootRef.current = r
+  }, [])
   const [batchDestRoot, setBatchDestRoot] = useState(() => loadPersistedSaveRoot())
   const [historyCanUndo, setHistoryCanUndo] = useState(false)
   const [historyCanRedo, setHistoryCanRedo] = useState(false)
@@ -527,7 +545,7 @@ export default function App(): React.JSX.Element {
     },
     [resetModalDontAsk]
   )
-  /** 自定义标签增删后刷新 CategoryChips */
+  /** 分类任务/标签变更后刷新 CategoryChips */
   const [categoryTagsRevision, setCategoryTagsRevision] = useState(0)
   const [dragOver, setDragOver] = useState(false)
   const [status, setStatus] = useState('')
@@ -593,8 +611,7 @@ export default function App(): React.JSX.Element {
     moved: boolean
     x0: number
     y0: number
-    additive: boolean
-    /** 拖选开始时的选中快照（additive 时合并） */
+    /** 拖选开始时的选中快照（与本次框选合并，保留已选） */
     baseSelected: Set<string>
     /** 二次选择模式：拖选写入 secondaryIds */
     secondaryMode: boolean
@@ -730,27 +747,20 @@ export default function App(): React.JSX.Element {
   const stepFpsBootRef = useRef(true)
 
   useEffect(() => {
-    loadCustomCategoryTags()
-    void window.api.getCustomCategories().then((map) => {
-      const hasMain =
-        Object.entries(map || {}).some(([k, v]) => {
-          if (k === 'removedBuiltins') return Array.isArray(v) && v.length > 0
-          return Array.isArray(v) && v.length > 0
-        })
-      if (hasMain) {
-        applyCategoryTagsPersistPayload(map)
-        saveCustomCategoryTags()
-      } else {
-        const local = getCategoryTagsPersistPayload()
-        const hasLocal =
-          Object.values(local).some((a) => Array.isArray(a) && a.length > 0) ||
-          (local.removedBuiltins && local.removedBuiltins.length > 0)
-        if (hasLocal) {
-          void window.api.setCustomCategories(local)
+    loadClassifyTasks()
+    setCategoryTagsRevision((n) => n + 1)
+    void window.api
+      .getClassifyTasks()
+      .then((payload) => {
+        if (Array.isArray(payload?.tasks) && payload.tasks.length > 0) {
+          applyClassifyTasksPersistPayload(payload)
+          saveClassifyTasks()
+          setCategoryTagsRevision((n) => n + 1)
         }
-      }
-      setCategoryTagsRevision((n) => n + 1)
-    })
+      })
+      .catch(() => {
+        /* 仅用 localStorage；revision 已在上方 bump */
+      })
   }, [])
 
   useEffect(() => {
@@ -2558,8 +2568,7 @@ export default function App(): React.JSX.Element {
         showToast('请选择分类根目录')
         return
       }
-      persistSaveRoot(destOpts.customDestDir)
-      sessionCustomSaveRootRef.current = destOpts.customDestDir
+      rememberOrClearSaveRoot(destOpts.customDestDir, paths[0] || '')
       lastClassifyOptsRef.current = destOpts
       setStatus(`正在批量分类 ${paths.length} 个…`)
       try {
@@ -2698,7 +2707,7 @@ export default function App(): React.JSX.Element {
         setStatus('批量分类失败')
       }
     },
-    [busy, videos, index, loadVideoAt, showToast, releaseMediaForPaths, refreshHistoryState, resetModalDontAsk]
+    [busy, videos, index, loadVideoAt, showToast, releaseMediaForPaths, refreshHistoryState, resetModalDontAsk, rememberOrClearSaveRoot]
   )
 
   const confirmBatchClassify = useCallback(async () => {
@@ -2794,8 +2803,7 @@ export default function App(): React.JSX.Element {
           if (!destOpts.customDestDir) {
             throw new Error('请选择分类根目录')
           }
-          persistSaveRoot(destOpts.customDestDir)
-          sessionCustomSaveRootRef.current = destOpts.customDestDir
+          rememberOrClearSaveRoot(destOpts.customDestDir, sourcePath)
           lastClassifyOptsRef.current = destOpts
 
           const listNow = videosRef.current
@@ -2898,8 +2906,7 @@ export default function App(): React.JSX.Element {
         if (!exportDest.customDestDir) {
           throw new Error('请选择分类根目录')
         }
-        persistSaveRoot(exportDest.customDestDir)
-        sessionCustomSaveRootRef.current = exportDest.customDestDir
+        rememberOrClearSaveRoot(exportDest.customDestDir, sourcePath)
         lastClassifyOptsRef.current = exportDest
         const result = isImage
           ? await window.api.exportImage({
@@ -3041,7 +3048,8 @@ export default function App(): React.JSX.Element {
       refreshHistoryState,
       stepFps,
       releaseMediaForPaths,
-      loadVideoAt
+      loadVideoAt,
+      rememberOrClearSaveRoot
     ]
   )
 
@@ -3686,7 +3694,6 @@ export default function App(): React.JSX.Element {
       y0: number,
       x1: number,
       y1: number,
-      additive: boolean,
       base: Set<string>,
       secondaryMode: boolean,
       primaryPool: Set<string>
@@ -3698,24 +3705,14 @@ export default function App(): React.JSX.Element {
         onlyInPool: secondaryMode ? primaryPool : undefined
       })
 
+      const merged = new Set(base)
+      hit.forEach((id) => merged.add(id))
       if (secondaryMode) {
-        if (additive) {
-          const merged = new Set(base)
-          hit.forEach((id) => merged.add(id))
-          setSecondaryIds(merged)
-        } else {
-          setSecondaryIds(hit)
-        }
+        setSecondaryIds(merged)
         return
       }
 
-      if (additive) {
-        const merged = new Set(base)
-        hit.forEach((id) => merged.add(id))
-        setSelectedIds(merged)
-      } else {
-        setSelectedIds(hit)
-      }
+      setSelectedIds(merged)
       if (hit.size === 1) {
         let only = ''
         hit.forEach((id) => {
@@ -3738,7 +3735,6 @@ export default function App(): React.JSX.Element {
       // Ctrl/⌘ 单击交给卡片切换，不拖选
       if (e.metaKey || e.ctrlKey) return
 
-      const additive = e.shiftKey
       const baseSelected = secondarySelectMode
         ? new Set(secondaryIds)
         : new Set(selectedIds)
@@ -3747,7 +3743,6 @@ export default function App(): React.JSX.Element {
         moved: false,
         x0: e.clientX,
         y0: e.clientY,
-        additive,
         baseSelected,
         secondaryMode: secondarySelectMode
       }
@@ -3765,7 +3760,6 @@ export default function App(): React.JSX.Element {
           drag.y0,
           ev.clientX,
           ev.clientY,
-          drag.additive,
           drag.baseSelected,
           drag.secondaryMode,
           selectedIds
@@ -3785,7 +3779,6 @@ export default function App(): React.JSX.Element {
             drag.y0,
             ev.clientX,
             ev.clientY,
-            drag.additive,
             drag.baseSelected,
             drag.secondaryMode,
             selectedIds
@@ -4351,8 +4344,7 @@ export default function App(): React.JSX.Element {
       sourcePath: current.path,
       duration
     }
-    persistSaveRoot(root)
-    sessionCustomSaveRootRef.current = root
+    rememberOrClearSaveRoot(root, current.path)
     setSaveModal(null)
     if (exportQueueState.active || exportQueueState.pending > 0) {
       const ahead =
@@ -4382,14 +4374,25 @@ export default function App(): React.JSX.Element {
         defaultPath
       })
       if (dir) {
-        sessionCustomSaveRootRef.current = dir
-        persistSaveRoot(dir)
+        rememberOrClearSaveRoot(dir, current.path)
         setSaveDestRoot(dir)
       }
     } catch (err) {
       showToast(String(err))
     }
-  }, [current, saveDestRoot, videos, showToast])
+  }, [current, saveDestRoot, videos, showToast, rememberOrClearSaveRoot])
+
+  /** 清除记住的自定义根目录，回到「当前文件夹」默认 */
+  const restoreDefaultSaveRoot = useCallback(
+    (sourcePath: string, setRoot: (root: string) => void) => {
+      clearPersistedSaveRoot()
+      sessionCustomSaveRootRef.current = null
+      const root = defaultSaveRootDir(sourcePath)
+      setRoot(root)
+      showToast('已恢复为当前文件夹默认')
+    },
+    [showToast]
+  )
 
   const onSaveCategorySelect = useCallback((tag: string) => {
     setCategoryInput(tag)
@@ -4402,14 +4405,32 @@ export default function App(): React.JSX.Element {
     if (san && san !== 'unnamed' && (mediaBasename(raw) === san || mediaBasename(raw) === cat)) {
       root = mediaDirname(raw) || raw
     }
-    sessionCustomSaveRootRef.current = root.trim() || null
-    if (root.trim()) persistSaveRoot(root.trim())
+    const sourcePath = current?.path || videos[0]?.path || ''
+    if (sourcePath) rememberOrClearSaveRoot(root, sourcePath)
+    else {
+      const r = root.trim()
+      if (r) {
+        persistSaveRoot(r)
+        sessionCustomSaveRootRef.current = r
+      } else {
+        clearPersistedSaveRoot()
+        sessionCustomSaveRootRef.current = null
+      }
+    }
     setSaveDestRoot(root)
-  }, [categoryInput])
+  }, [categoryInput, current, videos, rememberOrClearSaveRoot])
 
   const savePathDisplay = categoryInput.trim()
     ? categoryDirUnderRoot(saveDestRoot, categoryInput)
     : saveDestRoot
+
+  const saveRootIsCustom = Boolean(
+    current && isCustomSaveRoot(saveDestRoot, current.path)
+  )
+  const batchRootDefaultPath = batchTargetVideos[0]?.path
+  const batchRootIsCustom = Boolean(
+    batchRootDefaultPath && isCustomSaveRoot(batchDestRoot, batchRootDefaultPath)
+  )
 
   const applySessionFromMainRef = useRef<(session: SessionState) => void>(() => {})
 
@@ -4772,8 +4793,8 @@ export default function App(): React.JSX.Element {
       if (markers.length === 0) return { time: t, snapped: false }
       const trackW = Math.max(1, trackRef.current?.getBoundingClientRect().width ?? 1)
       const span = Math.max(0.05, timelineViewRef.current.span)
-      // 约 10px 或 1.5 步进格，取较大者
-      const threshold = Math.max(frameDuration(stepFpsRef.current) * 1.5, (10 / trackW) * span)
+      // 约 18px 或 2.5 步进格，取较大者
+      const threshold = Math.max(frameDuration(stepFpsRef.current) * 2.5, (18 / trackW) * span)
       let best = t
       let bestDist = threshold
       for (const m of markers) {
@@ -5115,12 +5136,11 @@ export default function App(): React.JSX.Element {
           showToast(result.error)
           return
         }
-        saveCustomCategoryTags()
-        void window.api.setCustomCategories(getCategoryTagsPersistPayload())
+        saveClassifyTasks()
+        void window.api.setClassifyTasks(getClassifyTasksPersistPayload())
         void logOp('categoryTagRemove', `删除标签「${name}」`, {
           name,
-          groupId: result.groupId,
-          source: result.source
+          groupId: result.groupId
         })
         setCategoryTagsRevision((n) => n + 1)
         if (categoryInput.trim() === name) setCategoryInput('')
@@ -5145,12 +5165,11 @@ export default function App(): React.JSX.Element {
       showToast(result.error)
       return
     }
-    saveCustomCategoryTags()
-    void window.api.setCustomCategories(getCategoryTagsPersistPayload())
+    saveClassifyTasks()
+    void window.api.setClassifyTasks(getClassifyTasksPersistPayload())
     void logOp('categoryTagRemove', `删除标签「${name}」`, {
       name,
-      groupId: result.groupId,
-      source: result.source
+      groupId: result.groupId
     })
     setCategoryTagsRevision((n) => n + 1)
     if (categoryInput.trim() === name) setCategoryInput('')
@@ -5615,22 +5634,33 @@ export default function App(): React.JSX.Element {
       const hi = host?.end ?? duration
       const sourceFps = fpsRef.current
       const minGap = minSelectionGap(hi - lo, sourceFps)
+      let preserveStart = false
+      let preserveEnd = false
       if (which === 'in') {
         const hit = snapEdgeToNearbyMarker(liveStart, lo, liveEnd - minGap)
         liveStart = hit.time
+        preserveStart = hit.snapped
       } else {
         const hit = snapEdgeToNearbyMarker(liveEnd, liveStart + minGap, hi)
         liveEnd = hit.time
+        preserveEnd = hit.snapped
       }
       if (liveEnd - liveStart < minGap) {
-        if (which === 'in') liveStart = clamp(liveEnd - minGap, lo, liveEnd)
-        else liveEnd = clamp(liveStart + minGap, liveStart, hi)
+        if (which === 'in') {
+          liveStart = clamp(liveEnd - minGap, lo, liveEnd)
+          preserveStart = false
+        } else {
+          liveEnd = clamp(liveStart + minGap, liveStart, hi)
+          preserveEnd = false
+        }
       }
+      const snapOpts = { preserveStart, preserveEnd }
       ;({ start: liveStart, end: liveEnd } = snapSelectionEdges(
         liveStart,
         liveEnd,
         fpsStep,
-        host
+        host,
+        snapOpts
       ))
 
       const finalCheck = validateSelectionRange(
@@ -5639,7 +5669,8 @@ export default function App(): React.JSX.Element {
         remaining,
         clipExports,
         fpsStep,
-        sourceFps
+        sourceFps,
+        snapOpts
       )
       const pointerMoved =
         Math.abs(lastPointerTime - startEdge) > frameDuration(fpsStep) * 0.25
@@ -7245,176 +7276,200 @@ export default function App(): React.JSX.Element {
       {saveModal && (
         <div className="modal-backdrop">
           <div className="modal modal-save">
-            <h2>{currentIsImage ? '保存图片' : '保存片段'}</h2>
-            <p>
-              {currentIsImage
-                ? saveModal.cropActive
-                  ? '含画面裁切'
-                  : '全画面'
-                : `${formatTime(saveModal.start)} – ${formatTime(saveModal.end)}（${(
-                    saveModal.end - saveModal.start
-                  ).toFixed(2)}秒）${saveModal.cropActive ? ' · 含画面裁切' : ' · 全画面'}`}
-            </p>
-            <div className="save-clip-preview">
-              {(() => {
-                const c = saveModal.crop
-                const cropOn =
-                  saveModal.cropActive &&
-                  c.width > 0.02 &&
-                  c.height > 0.02 &&
-                  !(c.x <= 0.001 && c.y <= 0.001 && c.width >= 0.999 && c.height >= 0.999)
-                const vw = videoNatural.w > 0 ? videoNatural.w : 16
-                const vh = videoNatural.h > 0 ? videoNatural.h : 9
-                const previewAr = cropOn
-                  ? `${vw * c.width} / ${vh * c.height}`
-                  : `${vw} / ${vh}`
-                return (
-                  <div
-                    className="save-clip-preview-stage"
-                    style={{ ['--preview-ar' as string]: previewAr } as React.CSSProperties}
-                  >
-                    <div
-                      className={`save-clip-preview-crop ${cropOn ? 'is-cropped' : ''}`}
-                      style={
-                        cropOn
-                          ? {
-                              width: `${100 / c.width}%`,
-                              height: `${100 / c.height}%`,
-                              left: `${(-c.x / c.width) * 100}%`,
-                              top: `${(-c.y / c.height) * 100}%`
-                            }
-                          : undefined
-                      }
-                    >
-                      {currentIsImage ? (
-                        <img
-                          key={`save-preview-img-${cropOn ? 'c' : 'f'}`}
-                          src={saveModal.previewUrl}
-                          alt=""
-                          draggable={false}
-                        />
-                      ) : (
-                      <video
-                        ref={savePreviewRef}
-                        key={`save-preview-${saveModal.start}-${saveModal.end}-${cropOn ? 'c' : 'f'}`}
-                        src={saveModal.previewUrl}
-                        playsInline
-                        onClick={() => {
-                          const v = savePreviewRef.current
-                          if (!v) return
-                          if (v.paused) {
-                            void v.play().catch(() => undefined)
-                          } else {
-                            v.pause()
+            <header className="save-modal-header">
+              <h2>{currentIsImage ? '保存图片' : '保存片段'}</h2>
+              <p>
+                {currentIsImage
+                  ? saveModal.cropActive
+                    ? '含画面裁切'
+                    : '全画面'
+                  : `${formatTime(saveModal.start)} – ${formatTime(saveModal.end)}（${(
+                      saveModal.end - saveModal.start
+                    ).toFixed(2)}秒）${saveModal.cropActive ? ' · 含画面裁切' : ' · 全画面'}`}
+              </p>
+            </header>
+            <div className="save-modal-body">
+              <div className="save-modal-media">
+                <div className="save-clip-preview">
+                  {(() => {
+                    const c = saveModal.crop
+                    const cropOn =
+                      saveModal.cropActive &&
+                      c.width > 0.02 &&
+                      c.height > 0.02 &&
+                      !(c.x <= 0.001 && c.y <= 0.001 && c.width >= 0.999 && c.height >= 0.999)
+                    const vw = videoNatural.w > 0 ? videoNatural.w : 16
+                    const vh = videoNatural.h > 0 ? videoNatural.h : 9
+                    const previewAr = cropOn
+                      ? `${vw * c.width} / ${vh * c.height}`
+                      : `${vw} / ${vh}`
+                    return (
+                      <div
+                        className="save-clip-preview-stage"
+                        style={{ ['--preview-ar' as string]: previewAr } as React.CSSProperties}
+                      >
+                        <div
+                          className={`save-clip-preview-crop ${cropOn ? 'is-cropped' : ''}`}
+                          style={
+                            cropOn
+                              ? {
+                                  width: `${100 / c.width}%`,
+                                  height: `${100 / c.height}%`,
+                                  left: `${(-c.x / c.width) * 100}%`,
+                                  top: `${(-c.y / c.height) * 100}%`
+                                }
+                              : undefined
                           }
-                        }}
-                        onTimeUpdate={(e) => {
-                          const v = e.currentTarget
-                          const a = saveModal.start
-                          const b = Math.min(
-                            saveModal.end,
-                            Number.isFinite(v.duration) ? v.duration : saveModal.end
-                          )
-                          const len = Math.max(0.05, b - a)
-                          if (savePreviewLoopGuardRef.current) return
-                          if (v.currentTime < a - 0.08) {
-                            v.currentTime = a
-                            setSavePreviewLocal(0)
-                            return
-                          }
-                          if (v.currentTime >= b - 0.04) {
-                            savePreviewLoopGuardRef.current = true
-                            try {
-                              v.pause()
-                            } catch {
-                              /* ignore */
-                            }
-                            try {
-                              v.currentTime = a
-                            } catch {
-                              /* ignore */
-                            }
-                            setSavePreviewLocal(0)
-                            window.setTimeout(() => {
-                              savePreviewLoopGuardRef.current = false
-                              if (savePreviewRef.current !== v) return
-                              void v.play().catch(() => undefined)
-                            }, 40)
-                            return
-                          }
-                          setSavePreviewLocal(clamp(v.currentTime - a, 0, len))
-                        }}
-                      />
-                      )}
-                    </div>
-                    {!currentIsImage && (
-                      <div className="save-clip-controls">
-                        <input
-                          className="save-clip-scrub"
-                          type="range"
-                          min={0}
-                          max={Math.max(0.05, saveModal.end - saveModal.start)}
-                          step={0.05}
-                          value={clamp(
-                            savePreviewLocal,
-                            0,
-                            Math.max(0.05, saveModal.end - saveModal.start)
+                        >
+                          {currentIsImage ? (
+                            <img
+                              key={`save-preview-img-${cropOn ? 'c' : 'f'}`}
+                              src={saveModal.previewUrl}
+                              alt=""
+                              draggable={false}
+                            />
+                          ) : (
+                            <video
+                              ref={savePreviewRef}
+                              key={`save-preview-${saveModal.start}-${saveModal.end}-${cropOn ? 'c' : 'f'}`}
+                              src={saveModal.previewUrl}
+                              playsInline
+                              onClick={() => {
+                                const v = savePreviewRef.current
+                                if (!v) return
+                                if (v.paused) {
+                                  void v.play().catch(() => undefined)
+                                } else {
+                                  v.pause()
+                                }
+                              }}
+                              onTimeUpdate={(e) => {
+                                const v = e.currentTarget
+                                const a = saveModal.start
+                                const b = Math.min(
+                                  saveModal.end,
+                                  Number.isFinite(v.duration) ? v.duration : saveModal.end
+                                )
+                                const len = Math.max(0.05, b - a)
+                                if (savePreviewLoopGuardRef.current) return
+                                if (v.currentTime < a - 0.08) {
+                                  v.currentTime = a
+                                  setSavePreviewLocal(0)
+                                  return
+                                }
+                                if (v.currentTime >= b - 0.04) {
+                                  savePreviewLoopGuardRef.current = true
+                                  try {
+                                    v.pause()
+                                  } catch {
+                                    /* ignore */
+                                  }
+                                  try {
+                                    v.currentTime = a
+                                  } catch {
+                                    /* ignore */
+                                  }
+                                  setSavePreviewLocal(0)
+                                  window.setTimeout(() => {
+                                    savePreviewLoopGuardRef.current = false
+                                    if (savePreviewRef.current !== v) return
+                                    void v.play().catch(() => undefined)
+                                  }, 40)
+                                  return
+                                }
+                                setSavePreviewLocal(clamp(v.currentTime - a, 0, len))
+                              }}
+                            />
                           )}
-                          onChange={(e) => {
-                            const v = savePreviewRef.current
-                            const len = Math.max(0.05, saveModal.end - saveModal.start)
-                            const local = clamp(Number(e.target.value), 0, len)
-                            setSavePreviewLocal(local)
-                            if (v) v.currentTime = saveModal.start + local
-                          }}
-                        />
-                        <span className="save-clip-time">
-                          {formatTime(savePreviewLocal)} /{' '}
-                          {formatTime(Math.max(0, saveModal.end - saveModal.start))}
-                        </span>
+                        </div>
+                        {!currentIsImage && (
+                          <div className="save-clip-controls">
+                            <input
+                              className="save-clip-scrub"
+                              type="range"
+                              min={0}
+                              max={Math.max(0.05, saveModal.end - saveModal.start)}
+                              step={0.05}
+                              value={clamp(
+                                savePreviewLocal,
+                                0,
+                                Math.max(0.05, saveModal.end - saveModal.start)
+                              )}
+                              onChange={(e) => {
+                                const v = savePreviewRef.current
+                                const len = Math.max(0.05, saveModal.end - saveModal.start)
+                                const local = clamp(Number(e.target.value), 0, len)
+                                setSavePreviewLocal(local)
+                                if (v) v.currentTime = saveModal.start + local
+                              }}
+                            />
+                            <span className="save-clip-time">
+                              {formatTime(savePreviewLocal)} /{' '}
+                              {formatTime(Math.max(0, saveModal.end - saveModal.start))}
+                            </span>
+                          </div>
+                        )}
                       </div>
-                    )}
-                  </div>
-                )
-              })()}
+                    )
+                  })()}
+                </div>
+              </div>
+              <div className="save-modal-classify">
+                <CategoryChips
+                  value={categoryInput}
+                  onSelect={onSaveCategorySelect}
+                  onConfirm={(tag) => void confirmSave(tag)}
+                  onRequestDelete={requestDeleteCategoryTag}
+                  refreshKey={categoryTagsRevision}
+                />
+              </div>
             </div>
-            <CategoryChips
-              value={categoryInput}
-              onSelect={onSaveCategorySelect}
-              onConfirm={(tag) => void confirmSave(tag)}
-              onRequestDelete={requestDeleteCategoryTag}
-              refreshKey={categoryTagsRevision}
-            />
-            <label className="save-dest-label">保存路径</label>
-            <div className="reclassify-custom-row save-dest-row">
-              <input
-                value={savePathDisplay}
-                onChange={(e) => onSaveDestRootChange(e.target.value)}
-                placeholder="选择类别后显示；可改源目录或点右侧选择"
-                title={savePathDisplay || undefined}
-                onKeyDown={(e) => {
-                  if (e.key === 'Enter') {
-                    e.preventDefault()
-                    e.stopPropagation()
-                    void confirmSave()
+            <footer className="save-modal-footer">
+              <label className="save-dest-label">保存路径</label>
+              <div className="reclassify-custom-row save-dest-row">
+                <input
+                  value={savePathDisplay}
+                  onChange={(e) => onSaveDestRootChange(e.target.value)}
+                  placeholder="选择类别后显示；可改源目录或点右侧选择"
+                  title={
+                    savePathDisplay
+                      ? `${savePathDisplay}\n默认「当前文件夹/类别名/」；可改根目录并跨重启记住`
+                      : '默认「当前文件夹/类别名/」；可改根目录并跨重启记住'
                   }
-                }}
-              />
-              <button type="button" onClick={() => void pickSaveDestDir()}>
-                选择…
-              </button>
-            </div>
-            <p className="save-dest-hint">
-              自定义的是类别文件夹的源目录，实际保存到「源目录/类别名/」。与批量分类共用，跨重启记住
-            </p>
-            <div className="modal-actions">
-              <button type="button" onClick={() => setSaveModal(null)}>
-                取消
-              </button>
-              <button type="button" className="primary" onClick={() => void confirmSave()}>
-                确认保存
-              </button>
-            </div>
+                  onKeyDown={(e) => {
+                    if (e.key === 'Enter') {
+                      e.preventDefault()
+                      e.stopPropagation()
+                      void confirmSave()
+                    }
+                  }}
+                />
+                <button type="button" onClick={() => void pickSaveDestDir()}>
+                  选择…
+                </button>
+                <button
+                  type="button"
+                  disabled={!current || !saveRootIsCustom}
+                  title={
+                    saveRootIsCustom
+                      ? '清除记住的自定义目录，回到当前文件夹'
+                      : '当前已是默认路径'
+                  }
+                  onClick={() => {
+                    if (!current) return
+                    restoreDefaultSaveRoot(current.path, setSaveDestRoot)
+                  }}
+                >
+                  恢复默认
+                </button>
+                <button type="button" onClick={() => setSaveModal(null)}>
+                  取消
+                </button>
+                <button type="button" className="primary" onClick={() => void confirmSave()}>
+                  确认保存
+                </button>
+              </div>
+            </footer>
           </div>
         </div>
       )}
@@ -7468,8 +7523,8 @@ export default function App(): React.JSX.Element {
                     root = mediaDirname(root) || root
                   }
                   setBatchDestRoot(root)
-                  sessionCustomSaveRootRef.current = root.trim() || null
-                  if (root.trim()) persistSaveRoot(root.trim())
+                  const sourcePath = batchTargetVideos[0]?.path || ''
+                  if (sourcePath) rememberOrClearSaveRoot(root, sourcePath)
                 }}
                 placeholder="源目录/类别名；可改源目录或点右侧选择"
                 title={batchDestRoot || undefined}
@@ -7484,17 +7539,32 @@ export default function App(): React.JSX.Element {
                     })
                     if (dir) {
                       setBatchDestRoot(dir)
-                      sessionCustomSaveRootRef.current = dir
-                      persistSaveRoot(dir)
+                      const sourcePath = batchTargetVideos[0]?.path || ''
+                      if (sourcePath) rememberOrClearSaveRoot(dir, sourcePath)
                     }
                   })()
                 }}
               >
                 选择…
               </button>
+              <button
+                type="button"
+                disabled={!batchRootDefaultPath || !batchRootIsCustom}
+                title={
+                  batchRootIsCustom
+                    ? '清除记住的自定义目录，回到当前文件夹'
+                    : '当前已是默认路径'
+                }
+                onClick={() => {
+                  if (!batchRootDefaultPath) return
+                  restoreDefaultSaveRoot(batchRootDefaultPath, setBatchDestRoot)
+                }}
+              >
+                恢复默认
+              </button>
             </div>
             <p className="save-dest-hint">
-              与保存分类相同：自选根目录后按「根目录/类别名/」落盘，并跨重启记住
+              默认「当前文件夹/类别名/」；可改根目录并跨重启记住，点「恢复默认」可清除记忆
             </p>
             <div className="modal-actions">
               <button onClick={() => setBatchModal(false)}>取消</button>

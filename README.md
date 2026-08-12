@@ -62,5 +62,6 @@ export LABELU_UPDATE_URL="https://your-bucket.example.com/labelu/"
 | 设入点 / 出点 | [ / ] |
 | 多选视频 | Ctrl+单击 |
 | 连选视频 | Shift+单击 |
+| 拖选追加 | 按住拖框（保留已选） |
 | 缩放缩略图 | Ctrl+滚轮 |
 | 退出编辑 | Esc |

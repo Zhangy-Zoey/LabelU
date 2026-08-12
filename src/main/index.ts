@@ -70,9 +70,9 @@ import {
   validateClipSelection
 } from '../shared/utils'
 import {
-  applyCategoryTagsPersistPayload,
-  getCategoryTagsPersistPayload,
-  type CategoryTagsPersistPayload
+  applyClassifyTasksPersistPayload,
+  getClassifyTasksPersistPayload,
+  type ClassifyTasksPersistPayload
 } from '../shared/categories'
 import { appendLog, getLogDir, getExceptionLogPath, initLogger, logError } from './logger'
 import { initOpLog, openOperationsLog } from './opLog'
@@ -863,11 +863,13 @@ app.whenReady().then(() => {
     }
   })
 
+  // 分类任务必须在开窗 / IPC 前从磁盘加载，避免首屏拿到出厂默认并写回覆盖用户数据
+  loadClassifyTasksFromDisk()
+
   createWindow()
   setupApplicationMenu()
-  // 窗口创建后再加载自定义标签 / 白名单种子，不挡首屏
+  // 白名单种子不挡首屏
   setImmediate(() => {
-    loadCustomCategoriesFromDisk()
     seedAllowedRootsFromDisk()
   })
 
@@ -879,26 +881,26 @@ app.whenReady().then(() => {
   setupUpdater()
 })
 
-function customCategoriesStorePath(): string {
-  return path.join(app.getPath('userData'), 'custom-category-tags.json')
+function classifyTasksStorePath(): string {
+  return path.join(app.getPath('userData'), 'classify-tasks.json')
 }
 
-function loadCustomCategoriesFromDisk(): void {
+function loadClassifyTasksFromDisk(): void {
   try {
-    const f = customCategoriesStorePath()
+    const f = classifyTasksStorePath()
     if (!fs.existsSync(f)) return
-    const raw = JSON.parse(fs.readFileSync(f, 'utf8')) as CategoryTagsPersistPayload
-    applyCategoryTagsPersistPayload(raw)
+    const raw = JSON.parse(fs.readFileSync(f, 'utf8')) as ClassifyTasksPersistPayload
+    applyClassifyTasksPersistPayload(raw)
   } catch {
     /* ignore */
   }
 }
 
-function persistCustomCategoriesToDisk(): void {
+function persistClassifyTasksToDisk(): void {
   try {
     fs.writeFileSync(
-      customCategoriesStorePath(),
-      JSON.stringify(getCategoryTagsPersistPayload(), null, 2),
+      classifyTasksStorePath(),
+      JSON.stringify(getClassifyTasksPersistPayload(), null, 2),
       'utf8'
     )
   } catch {
@@ -1217,13 +1219,13 @@ function setupIpc(): void {
     return true
   })
 
-  ipcMain.handle('set-custom-categories', (_e, map: CategoryTagsPersistPayload) => {
-    applyCategoryTagsPersistPayload(map)
-    persistCustomCategoriesToDisk()
+  ipcMain.handle('set-classify-tasks', (_e, payload: ClassifyTasksPersistPayload) => {
+    applyClassifyTasksPersistPayload(payload)
+    persistClassifyTasksToDisk()
     return true
   })
 
-  ipcMain.handle('get-custom-categories', () => getCategoryTagsPersistPayload())
+  ipcMain.handle('get-classify-tasks', () => getClassifyTasksPersistPayload())
 
   ipcMain.handle('export-image', async (_e, req: ImageExportRequest) => {
     assertCanWork()

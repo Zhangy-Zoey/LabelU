@@ -76,6 +76,12 @@ export type SelectionValidateResult =
   | { ok: true; start: number; end: number }
   | { ok: false; reason: string; suggested?: { start: number; end: number } }
 
+/** 选区边缘吸附选项（如已对齐标记时保留精确时间） */
+export type SnapSelectionOpts = {
+  preserveStart?: boolean
+  preserveEnd?: boolean
+}
+
 type ExportSpan = { start: number; end: number; approx?: boolean; category?: string }
 
 /** 选区是否落在可剪剩余段内（前后端共用） */
@@ -85,7 +91,8 @@ export function validateClipSelection(
   remaining: TimeRange[],
   exports: ExportSpan[],
   stepFps = 25,
-  sourceFps?: number | null
+  sourceFps?: number | null,
+  snapOpts?: SnapSelectionOpts
 ): SelectionValidateResult {
   const rawA = Math.min(start, end)
   const rawB = Math.max(start, end)
@@ -103,12 +110,12 @@ export function validateClipSelection(
   let a: number
   let b: number
   if (host) {
-    const snapped = snapSelectionEdges(rawA, rawB, stepFps, host)
+    const snapped = snapSelectionEdges(rawA, rawB, stepFps, host, snapOpts)
     a = snapped.start
     b = snapped.end
   } else {
-    a = snapToFrame(rawA, stepFps)
-    b = snapToFrame(rawB, stepFps)
+    a = snapOpts?.preserveStart ? rawA : snapToFrame(rawA, stepFps)
+    b = snapOpts?.preserveEnd ? rawB : snapToFrame(rawB, stepFps)
   }
   if (!host) {
     const suggested = clampSelectionToRemaining(a, b, remaining, stepFps, sourceFps)
@@ -145,13 +152,23 @@ export function resolveClipSelection(
   remaining: TimeRange[],
   exports: ExportSpan[],
   stepFps = 25,
-  sourceFps?: number | null
+  sourceFps?: number | null,
+  snapOpts?: SnapSelectionOpts
 ): SelectionValidateResult {
-  const check = validateClipSelection(start, end, remaining, exports, stepFps, sourceFps)
+  const check = validateClipSelection(
+    start,
+    end,
+    remaining,
+    exports,
+    stepFps,
+    sourceFps,
+    snapOpts
+  )
   if (check.ok) return check
   const suggested =
     check.suggested ?? clampSelectionToRemaining(start, end, remaining, stepFps, sourceFps)
   if (!suggested) return check
+  // 建议选区已重算，不再沿用标记保留标志
   const again = validateClipSelection(
     suggested.start,
     suggested.end,
@@ -261,21 +278,33 @@ export function friendlyFsError(err: unknown, fallback = '文件操作失败'): 
  * 对选区入/出点按 0.01 秒吸附；若已贴近剩余段边界则保留精确边界，
  * 避免片头/片尾被对齐「咬掉」一小截。
  * fps 仅用于边界容差（selectionTolerance），不参与时间吸附。
+ * preserveStart/End：保留该边精确时间（不做 0.01s 对齐，也不贴齐段边界）。
  */
 export function snapSelectionEdges(
   start: number,
   end: number,
   fps: number,
-  host?: TimeRange | null
+  host?: TimeRange | null,
+  opts?: SnapSelectionOpts
 ): { start: number; end: number } {
   const rawA = Math.min(start, end)
   const rawB = Math.max(start, end)
-  let a = snapToEditUnit(rawA)
-  let b = snapToEditUnit(rawB)
+  let a = opts?.preserveStart ? rawA : snapToEditUnit(rawA)
+  let b = opts?.preserveEnd ? rawB : snapToEditUnit(rawB)
   if (host && host.end > host.start) {
     const tol = selectionTolerance(fps)
-    if (Math.abs(rawA - host.start) <= tol || Math.abs(a - host.start) <= tol) a = host.start
-    if (Math.abs(rawB - host.end) <= tol || Math.abs(b - host.end) <= tol) b = host.end
+    if (
+      !opts?.preserveStart &&
+      (Math.abs(rawA - host.start) <= tol || Math.abs(a - host.start) <= tol)
+    ) {
+      a = host.start
+    }
+    if (
+      !opts?.preserveEnd &&
+      (Math.abs(rawB - host.end) <= tol || Math.abs(b - host.end) <= tol)
+    ) {
+      b = host.end
+    }
     a = clamp(a, host.start, host.end)
     b = clamp(b, host.start, host.end)
     if (b < a) b = a

@@ -88,3 +88,12 @@ export function persistSaveRoot(root: string): void {
     /* ignore */
   }
 }
+
+/** 清除记住的分类根目录，下次回退到「当前文件夹」默认 */
+export function clearPersistedSaveRoot(): void {
+  try {
+    localStorage.removeItem(LS_SAVE_ROOT)
+  } catch {
+    /* ignore */
+  }
+}

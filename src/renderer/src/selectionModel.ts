@@ -5,7 +5,8 @@ import {
   formatTime,
   minSelectionGap,
   resolveClipSelection,
-  selectionTolerance
+  selectionTolerance,
+  type SnapSelectionOpts
 } from '../../shared/utils'
 
 export type EdgeMoveResult =
@@ -130,9 +131,18 @@ export function validateSelectionRange(
   remaining: TimeRange[],
   clipExports: ExportRecord[],
   stepFps: number,
-  sourceFps: number
+  sourceFps: number,
+  snapOpts?: SnapSelectionOpts
 ): EdgeMoveResult {
-  const result = resolveClipSelection(start, end, remaining, clipExports, stepFps, sourceFps)
+  const result = resolveClipSelection(
+    start,
+    end,
+    remaining,
+    clipExports,
+    stepFps,
+    sourceFps,
+    snapOpts
+  )
   if (!result.ok) return { ok: false, reason: result.reason }
   return { ok: true, start: result.start, end: result.end }
 }

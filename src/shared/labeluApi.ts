@@ -6,14 +6,7 @@ import type {
 } from './types'
 
 /** 渲染进程 `window.api` 与 preload 共用的类型（勿从 preload 反引，web tsconfig 不包含 electron） */
-export type CustomCategoryMap = {
-  normal: string[]
-  abnormal: string[]
-  danger: string[]
-  other: string[]
-  /** 用户删除的内置标签（仅隐藏列表） */
-  removedBuiltins?: string[]
-}
+export type { ClassifyTasksPersistPayload } from './categories'
 
 /** 分类落点：类别文件夹写在 customDestDir/{类别名}/ 下 */
 export type ClassifyDestApiOpts = {
@@ -71,8 +64,8 @@ export type LabeluApi = {
   batchRemainingHints: (paths: string[]) => Promise<Record<string, number>>
   listPendingSessions: () => Promise<SessionState[]>
   discardSession: (state: SessionState, deleteExports: boolean) => Promise<boolean>
-  setCustomCategories: (map: Partial<CustomCategoryMap>) => Promise<boolean>
-  getCustomCategories: () => Promise<CustomCategoryMap>
+  setClassifyTasks: (payload: import('./categories').ClassifyTasksPersistPayload) => Promise<boolean>
+  getClassifyTasks: () => Promise<import('./categories').ClassifyTasksPersistPayload>
   exportClip: (req: ExportRequest) => Promise<{
     usedReencode?: boolean
     message?: string

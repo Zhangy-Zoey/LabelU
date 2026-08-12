@@ -14,8 +14,8 @@ const api: LabeluApi = {
   listPendingSessions: () => ipcRenderer.invoke('list-pending-sessions'),
   discardSession: (state, deleteExports) =>
     ipcRenderer.invoke('discard-session', state, deleteExports),
-  setCustomCategories: (map) => ipcRenderer.invoke('set-custom-categories', map),
-  getCustomCategories: () => ipcRenderer.invoke('get-custom-categories'),
+  setClassifyTasks: (payload) => ipcRenderer.invoke('set-classify-tasks', payload),
+  getClassifyTasks: () => ipcRenderer.invoke('get-classify-tasks'),
   exportClip: (req: ExportRequest) => ipcRenderer.invoke('export-clip', req),
   exportImage: (req: ImageExportRequest) => ipcRenderer.invoke('export-image', req),
   undoExport: (sourcePath) => ipcRenderer.invoke('undo-export', sourcePath),
