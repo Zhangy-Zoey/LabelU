@@ -390,25 +390,91 @@ function cropFilter(crop: CropRect, width: number, height: number): string {
   return `crop=${safeW}:${safeH}:${x}:${y}`
 }
 
-/** 流拷贝裁切：秒级完成，优先使用（input -ss 落在关键帧） */
+function formatSeekTime(t: number): string {
+  return Math.max(0, t).toFixed(6)
+}
+
+/**
+ * 短于此时长（秒）的选区不走流拷贝：关键帧对齐会导致时长/入点严重偏离。
+ * 长于此时长且无裁切时优先 -c copy，失败再重编码。
+ */
+const COPY_MIN_DURATION_SECONDS = 0.5
+
+/**
+ * 流拷贝入点：选区内第一个 pts >= start 的关键帧。
+ * FFmpeg input -ss 默认回退到上一关键帧，相邻段会把同一 GOP 打进两段输出；
+ * 改为「不早于 start」后接缝不再重复，代价是入点到该关键帧之间可能留白（最多约 1 个 GOP）。
+ * 仅扫描 [start, end) 关键帧，耗时可忽略。
+ */
+async function findCopySeekTime(
+  sourcePath: string,
+  start: number,
+  end: number
+): Promise<number | null> {
+  if (!(end > start)) return null
+  if (start <= 1e-3) return 0
+
+  const { ffprobe: probeBin } = ensureBins()
+  const from = Math.max(0, start)
+  const to = Math.max(from + 0.05, end)
+  const args = [
+    '-v',
+    'error',
+    '-skip_frame',
+    'nokey',
+    '-select_streams',
+    'v:0',
+    '-show_entries',
+    'frame=pts_time,best_effort_timestamp_time',
+    '-of',
+    'csv=p=0',
+    '-read_intervals',
+    `${formatSeekTime(from)}%${formatSeekTime(to)}`,
+    sourcePath
+  ]
+  const { code, stdout } = await run(probeBin, args, undefined, 60_000)
+  if (code !== 0) return null
+
+  const eps = 0.001
+  for (const line of stdout.split(/\r?\n/)) {
+    const parts = line
+      .split(',')
+      .map((s) => s.trim())
+      .filter(Boolean)
+    for (const p of parts) {
+      const t = Number(p)
+      if (!Number.isFinite(t)) continue
+      if (t + eps >= start && t < end - 1e-6) return Math.max(0, t)
+    }
+  }
+  return null
+}
+
+/** 流拷贝裁切：秒级完成，优先使用（入点对齐到 start 之后的关键帧） */
 async function tryCopyCut(
   sourcePath: string,
   start: number,
   end: number,
   outputPath: string
 ): Promise<boolean> {
-  const duration = end - start
+  const keyed = await findCopySeekTime(sourcePath, start, end)
+  // 未找到选区内关键帧时仍用逻辑 start（FFmpeg 会回退到上一关键帧），以保住速度
+  const rawSeek = keyed == null ? start : keyed
+  // input -ss 取 ≤ 目标的最近关键帧；对已定位的关键帧略加偏置，避免浮点略小又退回上一 GOP
+  const seek = keyed == null ? rawSeek : rawSeek <= 1e-3 ? 0 : rawSeek + 0.001
+  const duration = end - seek
+  if (duration < COPY_MIN_DURATION_SECONDS) return false
   const args = [
     '-hide_banner',
     '-loglevel',
     'error',
     '-y',
     '-ss',
-    String(start),
+    formatSeekTime(seek),
     '-i',
     sourcePath,
     '-t',
-    String(duration),
+    formatSeekTime(duration),
     '-map',
     '0:v:0',
     '-map',
@@ -533,12 +599,6 @@ async function reencodeCut(
     throw new Error(stderr.slice(-500) || `编码失败 (${mode})`)
   }
 }
-
-/**
- * 短于此时长（秒）的选区不走流拷贝：关键帧对齐会导致时长/入点严重偏离。
- * 长于此时长且无裁切时优先 -c copy，失败再重编码。
- */
-const COPY_MIN_DURATION_SECONDS = 0.5
 
 export async function exportClip(options: {
   sourcePath: string

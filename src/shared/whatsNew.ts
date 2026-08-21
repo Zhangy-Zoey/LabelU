@@ -6,6 +6,9 @@
  * （`npm run build` / dist / release 会跑 scripts/check-whats-new.js 校验）
  */
 export const WHATS_NEW: Record<string, string[]> = {
+  '1.2.2': [
+    '流拷贝导出改为对齐选区内首个关键帧，相邻片段接缝不再重复同一 GOP'
+  ],
   '1.2.1': [
     '标记吸附阈值放宽；吸到标记后保留精确时间，不再被 0.01 秒网格拉开',
     '缩略图拖选改为追加选中（多次拖选保留已选）',
